@@ -1,0 +1,4 @@
+9fca19ca3f463b7c13eb32d3b4717f59ff0239dc2832b0a20c72fefa31596281
+
+# You can get this by:
+# find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'

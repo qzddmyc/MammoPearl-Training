@@ -1,4 +1,8 @@
-/data/raw/images_png/
+/data/raw/images_png/*
+!/data/raw/images_png/dataset.sha256
+
+/data/processed/images_png/*
+!/data/processed/images_png/.gitkeep
 
 .vscode/
 
