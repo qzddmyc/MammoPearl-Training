@@ -58,7 +58,7 @@ def main():
     raw_data_dir = base_dir / 'data' / 'raw'
     csv_path = raw_data_dir / 'vindr_detection_folds.csv'
     raw_images_dir = raw_data_dir / 'images_png'
-    processed_images_dir = base_dir / 'data' / 'processed2' / 'images_png'
+    processed_images_dir = base_dir / 'data' / 'processed' / 'images_png'
 
     os.makedirs(processed_images_dir, exist_ok=True)
 
