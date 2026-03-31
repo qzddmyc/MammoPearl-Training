@@ -4,6 +4,8 @@
 /data/processed/images_png/*
 !/data/processed/images_png/.gitkeep
 
+/tmp/
+
 .vscode/
 
 .idea/
