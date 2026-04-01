@@ -36,8 +36,6 @@ MammoPearl-Training
 bash ./build_dataset.sh
 ```
 
-## 预处理
+## 数据训练
 
-```bash
-python ./src/data/pre-process.py
-```
+参考[此文档](./docs/train-process.md)
