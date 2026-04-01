@@ -21,7 +21,8 @@ MammoPearl-Training
 │   ├── init
 │   │   └── download-dataset.py   # 原始数据下载脚本
 │   └── data
-│       └── pre-process.py        # 数据预处理脚本
+│       ├── pre-process.py        # 数据预处理脚本
+│       └── pre-process-test.py   # 数据预处理测试脚本
 ├── README.md
 ├── build_dataset.sh        # 项目及数据集初始化脚本
 └── requirements.txt        # Python 依赖列表
@@ -29,13 +30,11 @@ MammoPearl-Training
 
 ## 依赖初始化
 
-请先依据[Kaggle API 配置说明](https://github.com/Kaggle/kagglehub/blob/main/README.md#usage)，创建用于下载数据集的配置文件或环境变量。
-
-初始化数据集：
+使用该脚本下载依赖与数据集：
 ```bash
 bash ./build_dataset.sh
 ```
 
 ## 数据训练
 
-参考[此文档](./docs/train-process.md)
+详见：[docs/train-process.md](./docs/train-process.md)。
