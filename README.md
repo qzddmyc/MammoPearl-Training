@@ -4,7 +4,7 @@ MammoPearl-IBCDS 训练数据集仓库，同时也作为《数字图像处理》
 
 本项目旨在实现：基于乳腺 X 光图像的乳腺癌筛查。
 
-该数据集来源于 [VinDr Mammogram 数据集](https://www.kaggle.com/datasets/shantanughosh/vindr-mammogram-dataset-dicom-to-png)。
+该数据集来源于 [VinDr Mammogram 数据集](https://www.kaggle.com/datasets/shantanughosh/vindr-mammogram-dataset-dicom-to-png)。其中，csv 标注文件经过了部分的修改。
 
 ## 项目结构
 

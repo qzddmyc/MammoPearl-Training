@@ -64,7 +64,7 @@ def preprocess_pipeline(image_path, tmp_dir, img_index):
     return True
 
 def main():
-    base_dir = Path(__file__).resolve().parent.parent.parent
+    base_dir = Path(__file__).resolve().parent.parent.parent.parent
     raw_images_dir = base_dir / 'data' / 'raw' / 'images_png'
     
     # 设定临时输出文件夹

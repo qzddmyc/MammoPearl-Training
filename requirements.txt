@@ -1,5 +1,11 @@
-opencv-python
-pandas
-numpy
-tqdm
+numpy>=1.21.0
+pandas>=1.3.0
+opencv-python>=4.5.0
+tqdm>=4.60.0
+
 kagglehub>=0.4.1
+
+torch>=1.12.0
+torchvision>=0.13.0
+
+pillow>=9.0.0

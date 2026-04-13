@@ -54,7 +54,7 @@ def preprocess_pipeline(image_path, save_path):
     return True
 
 def main():
-    base_dir = Path(__file__).resolve().parent.parent.parent
+    base_dir = Path(__file__).resolve().parent.parent.parent.parent
     raw_data_dir = base_dir / 'data' / 'raw'
     csv_path = raw_data_dir / 'vindr_detection_folds.csv'
     raw_images_dir = raw_data_dir / 'images_png'
