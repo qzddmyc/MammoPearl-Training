@@ -68,7 +68,7 @@ def main():
     raw_images_dir = base_dir / 'data' / 'raw' / 'images_png'
     
     # 设定临时输出文件夹
-    tmp_dir = base_dir / 'tmp'
+    tmp_dir = base_dir / 'tmp' / 'pre_process_test'
     os.makedirs(tmp_dir, exist_ok=True)
 
     if not raw_images_dir.exists():

@@ -4,6 +4,11 @@
 /data/processed/images_png/*
 !/data/processed/images_png/.gitkeep
 
+/data/segmented/base/*
+!/data/segmented/base/.gitkeep
+/data/segmented/mask/*
+!/data/segmented/mask/.gitkeep
+
 /tmp/
 
 .vscode/
