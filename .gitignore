@@ -9,6 +9,8 @@
 /data/segmented/mask/*
 !/data/segmented/mask/.gitkeep
 
+*.pth
+
 /tmp/
 
 .vscode/

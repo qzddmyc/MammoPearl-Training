@@ -1,14 +1,3 @@
-# 样本采用了 neg:pos = 2:1 的采样比例
-
-"""Train a breast lesion bounding-box detector from VinDr detection CSV.
-
-This script reads `data/raw/vindr_detection_folds.csv`, matches each row to
-`data/processed/images_png/<patient_id>/<image_id>`, and trains a Faster
-R-CNN detector to predict lesion bounding boxes (xmin, ymin, xmax, ymax).
-
-Model checkpoint is saved to `models/bbox.pth`.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -113,6 +102,7 @@ class Sample:
     image_path: Path
     boxes: np.ndarray
     orig_size: Tuple[float, float]
+    finding_categories: str
 
 
 class VinDrBboxDataset(Dataset):
@@ -165,6 +155,11 @@ class VinDrBboxDataset(Dataset):
             first = group.iloc[0]
             orig_h = float(first["height"]) if pd.notna(first["height"]) else 0.0
             orig_w = float(first["width"]) if pd.notna(first["width"]) else 0.0
+            finding_categories = (
+                group["finding_categories"].dropna().astype(str).iloc[0]
+                if group["finding_categories"].notna().any()
+                else "UNKNOWN"
+            )
 
             self.samples.append(
                 Sample(
@@ -173,6 +168,7 @@ class VinDrBboxDataset(Dataset):
                     image_path=image_path,
                     boxes=boxes,
                     orig_size=(orig_h, orig_w),
+                    finding_categories=finding_categories,
                 )
             )
 
@@ -184,7 +180,7 @@ class VinDrBboxDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, str]]:
         sample = self.samples[index]
         if not sample.image_path.exists():
             raise FileNotFoundError(f"Missing image: {sample.image_path}")
@@ -222,12 +218,19 @@ class VinDrBboxDataset(Dataset):
             ),
             "iscrowd": torch.zeros((labels_tensor.shape[0],), dtype=torch.int64),
         }
-        return image_to_tensor(img), target
+
+        meta: Dict[str, str] = {
+            "patient_id": sample.patient_id,
+            "image_id": sample.image_id,
+            "finding_categories": sample.finding_categories,
+        }
+
+        return image_to_tensor(img), target, meta
 
 
 def collate_fn(batch):
-    images, targets = zip(*batch)
-    return list(images), list(targets)
+    images, targets, metas = zip(*batch)
+    return list(images), list(targets), list(metas)
 
 
 # def build_model(num_classes: int = 2) -> FasterRCNN:
@@ -271,18 +274,21 @@ def train_one_epoch(
     running_loss = 0.0
     count = 0
     bad_keys_count = 0
+    bad_category_counter = defaultdict(int)
 
     pbar = tqdm(loader, desc=f"epoch {epoch + 1}/{epochs}", leave=False)
-    for images, targets in pbar:
+    for images, targets, metas in pbar:
         images = [img.to(device) for img in images]
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
         loss_dict = model(images, targets)
 
-        # !!! > 筛选无效数据并清除
         bad_keys = [k for k, v in loss_dict.items() if not torch.isfinite(v)]
         if bad_keys:
             bad_keys_count += 1
+            for meta in metas:
+                finding_categories = meta.get("finding_categories", "UNKNOWN")
+                bad_category_counter[finding_categories] += 1
             # pbar.write(f"[Warning] non-finite loss in {bad_keys}, batch skipped")
             # pbar.write(str(targets))
             optimizer.zero_grad(set_to_none=True)
@@ -309,6 +315,7 @@ def train_one_epoch(
 
     print(f"[Sum] count = {count}")
     print(f"[Sum] bad data count = {bad_keys_count}")
+    print(f"[Sum] bad category count = {dict(bad_category_counter)}")
 
     return running_loss / max(count, 1)
 
@@ -347,7 +354,7 @@ def parse_args() -> argparse.Namespace:
         help="Output checkpoint path (default: models/bbox.pth)",
     )
     parser.add_argument("--epochs", type=int, default=12)
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=0.0005)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=0.0005)
@@ -461,130 +468,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-"""log
-
-Here gives the output log:
-
-[Warning] Found 1 invalid boxes in D:\Codes\Github_Repositories\MammoPearl-Training\data\processed\images_png\118092d6244fabf9ac376d580aac8cbb\679a6515593f9692eb6a622b7b6b0aa0.png
-[Warning] Found 1 invalid boxes in D:\Codes\Github_Repositories\MammoPearl-Training\data\processed\images_png\9870e0438ed1f19cb85aaa32cf1e8830\ea8790b418b754139457d48e5228c077.png
-[Warning] Found 1 invalid boxes in D:\Codes\Github_Repositories\MammoPearl-Training\data\processed\images_png\9efd5f5c65ec8c402ec48f0ff7388562\5cd330a56ea7c77a1fa1181712966dbf.png
-[Warning] Found 1 invalid boxes in D:\Codes\Github_Repositories\MammoPearl-Training\data\processed\images_png\a8cb9adadef00fc473b1760cd7b513e4\7323314998471cde47c6fba70ae6d32c.png
-[Warning] Found 2 invalid boxes in D:\Codes\Github_Repositories\MammoPearl-Training\data\processed\images_png\df7c81d477ed6a29aa8e6e49c1719d03\7be2e5f9ade68ae2bfe4e5edb4968654.png
-[Warning] Found 1 invalid boxes in D:\Codes\Github_Repositories\MammoPearl-Training\data\processed\images_png\df7c81d477ed6a29aa8e6e49c1719d03\db70c6572ab2f8633feb484aa6d7d38d.png
-Total images: 16000; positives: 1411; negatives: 14589
-Device: cpu
-[Sum] count = 2117                                                                                                                           
-[Sum] bad data count = 0
-Epoch 001/012 | loss=0.2471 | lr=0.000500
-[Sum] count = 1914                                                                                                                           
-[Sum] bad data count = 203
-Epoch 002/012 | loss=0.6321 | lr=0.000500
-[Sum] count = 1541                                                                                                                           
-[Sum] bad data count = 576
-Epoch 003/012 | loss=0.6972 | lr=0.000500
-[Sum] count = 1658                                                                                                                           
-[Sum] bad data count = 459
-Epoch 004/012 | loss=0.4022 | lr=0.000050
-[Sum] count = 1699                                                                                                                           
-[Sum] bad data count = 418
-Epoch 005/012 | loss=0.9775 | lr=0.000050
-[Sum] count = 1829                                                                                                                           
-[Sum] bad data count = 288
-Epoch 006/012 | loss=0.2265 | lr=0.000050
-[Sum] count = 1807                                                                                                                           
-[Sum] bad data count = 310
-Epoch 007/012 | loss=0.1625 | lr=0.000050
-[Sum] count = 1642                                                                                                                           
-[Sum] bad data count = 475
-Epoch 008/012 | loss=0.1852 | lr=0.000005
-[Sum] count = 1611                                                                                                                           
-[Sum] bad data count = 506
-Epoch 009/012 | loss=0.2587 | lr=0.000005
-[Sum] count = 1577                                                                                                                           
-[Sum] bad data count = 540
-Epoch 010/012 | loss=0.3000 | lr=0.000005
-[Sum] count = 1573                                                                                                                           
-[Sum] bad data count = 544
-Epoch 011/012 | loss=0.3491 | lr=0.000005
-[Sum] count = 1578                                                                                                                           
-[Sum] bad data count = 539
-Epoch 012/012 | loss=0.4026 | lr=0.000001
-Saved checkpoint to: D:\Codes\Github_Repositories\MammoPearl-Training\models\bbox.pth
-{
-  "task": "bbox_detection",
-  "num_classes": 2,
-  "class_names": [
-    "background",
-    "lesion"
-  ],
-  "csv_path": "D:\\Codes\\Github_Repositories\\MammoPearl-Training\\data\\raw\\vindr_detection_folds.csv",
-  "images_root": "D:\\Codes\\Github_Repositories\\MammoPearl-Training\\data\\processed\\images_png",
-  "positive_only": false,
-  "history": [
-    {
-      "epoch": 1.0,
-      "train_loss": 0.24705643521271642,
-      "lr": 0.0005
-    },
-    {
-      "epoch": 2.0,
-      "train_loss": 0.6320763567667902,
-      "lr": 0.0005
-    },
-    {
-      "epoch": 3.0,
-      "train_loss": 0.6972195912836365,
-      "lr": 0.0005
-    },
-    {
-      "epoch": 4.0,
-      "train_loss": 0.40221517771996157,
-      "lr": 5e-05
-    },
-    {
-      "epoch": 5.0,
-      "train_loss": 0.9775444359908877,
-      "lr": 5e-05
-    },
-    {
-      "epoch": 6.0,
-      "train_loss": 0.22649905745490231,
-      "lr": 5e-05
-    },
-    {
-      "epoch": 7.0,
-      "train_loss": 0.1624891125764177,
-      "lr": 5e-05
-    },
-    {
-      "epoch": 8.0,
-      "train_loss": 0.18516448602480495,
-      "lr": 5e-06
-    },
-    {
-      "epoch": 9.0,
-      "train_loss": 0.2587370194044816,
-      "lr": 5e-06
-    },
-    {
-      "epoch": 10.0,
-      "train_loss": 0.30000062203096767,
-      "lr": 5e-06
-    },
-    {
-      "epoch": 11.0,
-      "train_loss": 0.3491251763298744,
-      "lr": 5e-06
-    },
-    {
-      "epoch": 12.0,
-      "train_loss": 0.4025792213642547,
-      "lr": 5.000000000000001e-07
-    }
-  ],
-  "torchvision_model": "fasterrcnn_mobilenet_v3_large_320_fpn"
-}
-
-"""

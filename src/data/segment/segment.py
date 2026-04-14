@@ -8,7 +8,7 @@
 
 3. 一个函数C，给定“原始图片的路径”与“结果保存的目标文件夹”，将图片读取，然后加载models/bbox.pth，
 通过该pth文件得到xmin, ymin, xmax, ymax四个值，之后调用函数A，得到mask文件后，
-将mask保存至目标文件夹中。保存格式为“目标文件夹的目录/<原始文件名>”。 
+将mask保存至目标文件夹中。保存格式为“目标文件夹的目录/<原始文件名>”。
 
 4. 一个函数D，与函数B类似，但读取的是所有的测试集数据，
 需要加载models/bbox.pth并得到xmin, ymin, xmax, ymax值，再送到A中处理（不使用标注文件中的bbox位置值）。
@@ -67,6 +67,9 @@ def extract_cell_mask_from_bbox(
     gray = np.asarray(gray)
     h, w = gray.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
+
+    if any(pd.isna(v) for v in (xmin, ymin, xmax, ymax)):
+        return mask
 
     # Clamp bbox into the image range.
     x1 = int(max(0, min(w - 1, round(float(xmin)))))
@@ -136,12 +139,8 @@ def build_training_masks_from_csv(
     csv_path: str | Path | None = None,
     images_root: str | Path | None = None,
     segmented_root: str | Path | None = None,
-    model_path: str | Path | None = None,
-    score_threshold: float = 0.5,
 ) -> int:
     """B: Read the training split from CSV, generate masks with A, and save them.
-    If a training image has empty bounding boxes (NaN), load the model, 
-    predict a new bbox, and use it in A instead.
 
     Saves base images to:  data/segmented/base/<patient_id>/<img_id>
     Saves masks to:        data/segmented/mask/<patient_id>/<img_id>
@@ -151,7 +150,6 @@ def build_training_masks_from_csv(
     csv_path = Path(csv_path) if csv_path is not None else repo_root / "data" / "raw" / "vindr_detection_folds.csv"
     images_root = Path(images_root) if images_root is not None else repo_root / "data" / "processed" / "images_png"
     segmented_root = Path(segmented_root) if segmented_root is not None else repo_root / "data" / "segmented"
-    model_path = Path(model_path) if model_path is not None else repo_root / "models" / "bbox.pth"
 
     base_root = segmented_root / "base"
     mask_root = segmented_root / "mask"
@@ -170,32 +168,6 @@ def build_training_masks_from_csv(
     train_df = df[df["split"].astype(str).str.lower() == "training"].copy()
     if train_df.empty:
         raise ValueError("No training rows found in CSV")
-
-    # --- 新增：为处理空值准备的惰性加载机制 ---
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = None
-
-    def _get_model():
-        nonlocal model
-        if model is not None:
-            return model
-        if not model_path.exists():
-            raise FileNotFoundError(f"Model not found: {model_path}")
-        try:
-            m = fasterrcnn_mobilenet_v3_large_320_fpn(weights=None, weights_backbone=None)
-        except TypeError:
-            m = fasterrcnn_mobilenet_v3_large_320_fpn(pretrained=False, pretrained_backbone=False)  # type: ignore[call-arg]
-        in_features = m.roi_heads.box_predictor.cls_score.in_features
-        m.roi_heads.box_predictor = FastRCNNPredictor(in_features, 2)
-        
-        ckpt = torch.load(model_path, map_location=device)
-        state_dict = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
-        m.load_state_dict(state_dict)
-        m.to(device)
-        m.eval()
-        model = m
-        return model
-    # ----------------------------------------
 
     processed = 0
     for (patient_id, image_id), group in train_df.groupby(["patient_id", "image_id"], sort=True):
@@ -236,12 +208,10 @@ def build_training_masks_from_csv(
             encoded = cv2.imencode(Path(image_id).suffix or ".png", img)[1]
             encoded.tofile(str(base_out_path))
 
+        # Union masks from all bounding boxes in the image.
         union_mask = np.zeros(img.shape[:2], dtype=np.uint8)
         valid_rows = group[["xmin", "ymin", "xmax", "ymax"]].dropna()
-        
-        # --- 新增核心逻辑：分情况处理有值和空值 ---
         if not valid_rows.empty:
-            # 情况1：有标注数据，直接按照原有逻辑处理所有框
             for _, row in valid_rows.iterrows():
                 one_mask = extract_cell_mask_from_bbox(
                     img,
@@ -251,38 +221,6 @@ def build_training_masks_from_csv(
                     float(row["ymax"]),
                 )
                 union_mask = cv2.bitwise_or(union_mask, one_mask)
-        else:
-            # 情况2：数据为空值（NaN），使用模型预测替代
-            m = _get_model()
-            
-            # 转RGB供模型推断
-            if img.ndim == 2:
-                rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-            elif img.ndim == 3:
-                if img.shape[2] == 4:
-                    rgb = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
-                else:
-                    rgb = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2RGB)
-            else:
-                continue
-
-            tensor = torch.from_numpy(rgb.astype(np.float32) / 255.0).permute(2, 0, 1).contiguous().to(device)
-            with torch.no_grad():
-                output = m([tensor])[0]
-
-            boxes = output.get("boxes", torch.zeros((0, 4), device=device)).detach().cpu()
-            scores = output.get("scores", torch.zeros((0,), device=device)).detach().cpu()
-            keep = scores >= float(score_threshold)
-            boxes = boxes[keep]
-            scores = scores[keep]
-
-            # 取置信度最高的框传给函数A (与函数C/D行为保持一致)
-            if boxes.numel() > 0:
-                top_idx = int(torch.argmax(scores).item())
-                box = boxes[top_idx].tolist()
-                one_mask = extract_cell_mask_from_bbox(img, box[0], box[1], box[2], box[3])
-                union_mask = cv2.bitwise_or(union_mask, one_mask)
-        # ----------------------------------------
 
         # If there is no valid bbox, save an empty mask so the file layout stays complete.
         if not cv2.imencode(".png", union_mask)[0]:
@@ -381,6 +319,8 @@ def build_test_masks_from_csv(
 
     Saves base images to:  data/segmented/base/<patient_id>/<img_id>
     Saves masks to:        data/segmented/mask/<patient_id>/<img_id>
+
+    注意该函数只会取置信度最高的bbox框，其余标注都会被忽略！
     """
 
     repo_root = Path(__file__).resolve().parents[3]

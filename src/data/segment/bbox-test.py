@@ -1,3 +1,7 @@
+# use: 
+# python src/data/segment/bbox-test.py --score-threshold 0.01
+
+
 """Evaluate a bbox detector on the VinDr test split.
 
 This script loads `models/bbox.pth`, runs inference on the test split, and
@@ -68,21 +72,22 @@ def image_to_tensor(img: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 
 
-def scale_boxes_to_image(boxes: np.ndarray, orig_size: Tuple[float, float], new_size: Tuple[int, int]) -> np.ndarray:
-    orig_h, orig_w = orig_size
-    new_h, new_w = new_size
-    if orig_h <= 0 or orig_w <= 0:
-        return boxes
+# 不再需要缩放
+# def scale_boxes_to_image(boxes: np.ndarray, orig_size: Tuple[float, float], new_size: Tuple[int, int]) -> np.ndarray:
+#     orig_h, orig_w = orig_size
+#     new_h, new_w = new_size
+#     if orig_h <= 0 or orig_w <= 0:
+#         return boxes
 
-    scale_x = float(new_w) / float(orig_w)
-    scale_y = float(new_h) / float(orig_h)
-    scaled = boxes.copy().astype(np.float32)
-    scaled[:, [0, 2]] *= scale_x
-    scaled[:, [1, 3]] *= scale_y
-    scaled[:, 0::2] = np.clip(scaled[:, 0::2], 0, max(new_w - 1, 0))
-    scaled[:, 1::2] = np.clip(scaled[:, 1::2], 0, max(new_h - 1, 0))
-    keep = (scaled[:, 2] > scaled[:, 0]) & (scaled[:, 3] > scaled[:, 1])
-    return scaled[keep]
+#     scale_x = float(new_w) / float(orig_w)
+#     scale_y = float(new_h) / float(orig_h)
+#     scaled = boxes.copy().astype(np.float32)
+#     scaled[:, [0, 2]] *= scale_x
+#     scaled[:, [1, 3]] *= scale_y
+#     scaled[:, 0::2] = np.clip(scaled[:, 0::2], 0, max(new_w - 1, 0))
+#     scaled[:, 1::2] = np.clip(scaled[:, 1::2], 0, max(new_h - 1, 0))
+#     keep = (scaled[:, 2] > scaled[:, 0]) & (scaled[:, 3] > scaled[:, 1])
+#     return scaled[keep]
 
 
 class VinDrBboxDataset(Dataset):
@@ -93,10 +98,6 @@ class VinDrBboxDataset(Dataset):
 
         df = pd.read_csv(csv_path, low_memory=False)
         df = df[df["split"].astype(str).str.lower() == split_name.lower()].copy()
-
-        df = df.dropna(subset=["xmin", "ymin", "xmax", "ymax"])
-        if "finding_categories" in df.columns:
-            df = df[df["finding_categories"] != "['No Finding']"]
 
         if df.empty:
             raise ValueError(f"No rows found for split={split_name!r} in {csv_path}")
@@ -138,14 +139,15 @@ class VinDrBboxDataset(Dataset):
             raise FileNotFoundError(f"Missing image: {sample['image_path']}")
 
         img = normalize_image(read_image_unicode(sample["image_path"]))
-        h, w = img.shape[:2]
 
-        boxes = sample["boxes"]
+        boxes = sample["boxes"].astype(np.float32)
+
         if boxes.size > 0:
-            boxes = scale_boxes_to_image(boxes, sample["orig_size"], (h, w))
+            keep = (boxes[:, 2] > boxes[:, 0] + 1) & (boxes[:, 3] > boxes[:, 1] + 1)
+            boxes = boxes[keep]
 
         target = {
-            "boxes": torch.from_numpy(boxes.astype(np.float32)) if boxes.size > 0 else torch.zeros((0, 4), dtype=torch.float32),
+            "boxes": torch.from_numpy(boxes) if boxes.size > 0 else torch.zeros((0, 4), dtype=torch.float32),
             "image_id": torch.tensor([index], dtype=torch.int64),
         }
         return image_to_tensor(img), target, sample
