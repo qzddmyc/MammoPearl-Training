@@ -1,16 +1,28 @@
-# 低训练负荷版本，可以在 2核2G 云服务器上运行
-# You should install python3.13 bulid from raw
-# and use pip like: python3.13 -m pip --version
+# 不需要再运行这个程序了
+# 这是用来测试 bbox-train.py 中的 bad data 的来源的
 
-"""
-使用这个reuqirements.txt:
+# 注意，这份文件使用的模型仍然为：fasterrcnn_mobilenet_v3_large_320_fpn
 
-numpy<2
-pandas
-opencv-python-headless==4.5.5.64
-torch
-torchvision
-pillow
+"""output:
+
+Device: cpu
+[Sum] count = 3501
+[Sum] bad data count = 732
+[Sum] bad category count = {"['No Finding']": 732}
+Epoch 001/012 | loss=0.5876 | lr=0.000500
+[Sum] count = 2086
+[Sum] bad data count = 2147
+[Sum] bad category count = {"['No Finding']": 2146, "['Focal Asymmetry']": 1}
+Epoch 002/012 | loss=1.0535 | lr=0.000500
+[Sum] count = 2156
+[Sum] bad data count = 2077
+[Sum] bad category count = {"['No Finding']": 2076, "['Focal Asymmetry']": 1}
+Epoch 003/012 | loss=0.7830 | lr=0.000500
+[Sum] count = 2063                                                                                                                           
+[Sum] bad data count = 2170
+[Sum] bad category count = {"['No Finding']": 2169, "['Focal Asymmetry']": 1}
+Epoch 004/012 | loss=0.6201 | lr=0.000050
+
 """
 
 from __future__ import annotations
@@ -19,7 +31,6 @@ import argparse
 import json
 import math
 import random
-import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +45,7 @@ from torchvision.models.detection import FasterRCNN
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.faster_rcnn import fasterrcnn_mobilenet_v3_large_320_fpn
 # from torchvision.models.detection import fasterrcnn_resnet50_fpn
+# 不考虑使用 fasterrcnn_resnet50_fpn 模型，耗时过长
 
 try:
     from tqdm import tqdm
@@ -85,29 +97,29 @@ def image_to_tensor(img: np.ndarray) -> torch.Tensor:
     arr = img.astype(np.float32) / 255.0
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 
+# 不再需要缩放
+# def scale_boxes_to_image(
+#     boxes: np.ndarray,
+#     orig_size: Tuple[float, float],
+#     new_size: Tuple[int, int],
+# ) -> np.ndarray:
+#     """Scale bbox coordinates from original CSV size to actual image size."""
+#     orig_h, orig_w = orig_size
+#     new_h, new_w = new_size
+#     if orig_h <= 0 or orig_w <= 0:
+#         return boxes
 
-def scale_boxes_to_image(
-    boxes: np.ndarray,
-    orig_size: Tuple[float, float],
-    new_size: Tuple[int, int],
-) -> np.ndarray:
-    """Scale bbox coordinates from original CSV size to actual image size."""
-    orig_h, orig_w = orig_size
-    new_h, new_w = new_size
-    if orig_h <= 0 or orig_w <= 0:
-        return boxes
+#     scale_x = float(new_w) / float(orig_w)
+#     scale_y = float(new_h) / float(orig_h)
+#     scaled = boxes.copy().astype(np.float32)
+#     scaled[:, [0, 2]] *= scale_x
+#     scaled[:, [1, 3]] *= scale_y
 
-    scale_x = float(new_w) / float(orig_w)
-    scale_y = float(new_h) / float(orig_h)
-    scaled = boxes.copy().astype(np.float32)
-    scaled[:, [0, 2]] *= scale_x
-    scaled[:, [1, 3]] *= scale_y
-
-    # Clamp to valid image range and remove invalid boxes.
-    scaled[:, 0::2] = np.clip(scaled[:, 0::2], 0, max(new_w - 1, 0))
-    scaled[:, 1::2] = np.clip(scaled[:, 1::2], 0, max(new_h - 1, 0))
-    keep = (scaled[:, 2] > scaled[:, 0]) & (scaled[:, 3] > scaled[:, 1])
-    return scaled[keep]
+#     # Clamp to valid image range and remove invalid boxes.
+#     scaled[:, 0::2] = np.clip(scaled[:, 0::2], 0, max(new_w - 1, 0))
+#     scaled[:, 1::2] = np.clip(scaled[:, 1::2], 0, max(new_h - 1, 0))
+#     keep = (scaled[:, 2] > scaled[:, 0]) & (scaled[:, 3] > scaled[:, 1])
+#     return scaled[keep]
 
 
 @dataclass
@@ -117,6 +129,7 @@ class Sample:
     image_path: Path
     boxes: np.ndarray
     orig_size: Tuple[float, float]
+    finding_categories: str
 
 
 class VinDrBboxDataset(Dataset):
@@ -155,6 +168,13 @@ class VinDrBboxDataset(Dataset):
                 boxes = np.zeros((0, 4), dtype=np.float32)
             else:
                 boxes = valid.to_numpy(dtype=np.float32)
+            
+            image_path = images_root / str(patient_id) / f"{image_id}"
+
+            if boxes.size > 0:
+                invalid = np.sum((boxes[:, 2] <= boxes[:, 0]) | (boxes[:, 3] <= boxes[:, 1]))
+                if invalid > 0:
+                    print(f"[Warning] Found {invalid} invalid boxes in {image_path}")
 
             if positive_only and len(boxes) == 0:
                 continue
@@ -162,8 +182,12 @@ class VinDrBboxDataset(Dataset):
             first = group.iloc[0]
             orig_h = float(first["height"]) if pd.notna(first["height"]) else 0.0
             orig_w = float(first["width"]) if pd.notna(first["width"]) else 0.0
+            finding_categories = (
+                group["finding_categories"].dropna().astype(str).iloc[0]
+                if group["finding_categories"].notna().any()
+                else "UNKNOWN"
+            )
 
-            image_path = images_root / str(patient_id) / f"{image_id}"
             self.samples.append(
                 Sample(
                     patient_id=str(patient_id),
@@ -171,6 +195,7 @@ class VinDrBboxDataset(Dataset):
                     image_path=image_path,
                     boxes=boxes,
                     orig_size=(orig_h, orig_w),
+                    finding_categories=finding_categories,
                 )
             )
 
@@ -182,7 +207,7 @@ class VinDrBboxDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, str]]:
         sample = self.samples[index]
         if not sample.image_path.exists():
             raise FileNotFoundError(f"Missing image: {sample.image_path}")
@@ -190,15 +215,22 @@ class VinDrBboxDataset(Dataset):
         img = normalize_image(read_image_unicode(sample.image_path))
         h, w = img.shape[:2]
 
-        boxes = sample.boxes
+        boxes = sample.boxes.astype(np.float32)
+
         if boxes.size > 0:
-            boxes = scale_boxes_to_image(boxes, sample.orig_size, (h, w))
+            boxes[:, 0] = np.clip(boxes[:, 0], 0, w - 1)
+            boxes[:, 2] = np.clip(boxes[:, 2], 0, w - 1)
+            boxes[:, 1] = np.clip(boxes[:, 1], 0, h - 1)
+            boxes[:, 3] = np.clip(boxes[:, 3], 0, h - 1)
+            # 过滤非法框，左值大于右值，或像素值小于 1。
+            keep = (boxes[:, 2] > boxes[:, 0] + 1) & (boxes[:, 3] > boxes[:, 1] + 1)
+            boxes = boxes[keep]
 
         if boxes.size == 0:
             boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
             labels_tensor = torch.zeros((0,), dtype=torch.int64)
         else:
-            boxes_tensor = torch.from_numpy(boxes.astype(np.float32))
+            boxes_tensor = torch.from_numpy(boxes)
             labels_tensor = torch.ones((boxes_tensor.shape[0],), dtype=torch.int64)
 
         target: Dict[str, torch.Tensor] = {
@@ -213,12 +245,19 @@ class VinDrBboxDataset(Dataset):
             ),
             "iscrowd": torch.zeros((labels_tensor.shape[0],), dtype=torch.int64),
         }
-        return image_to_tensor(img), target
+
+        meta: Dict[str, str] = {
+            "patient_id": sample.patient_id,
+            "image_id": sample.image_id,
+            "finding_categories": sample.finding_categories,
+        }
+
+        return image_to_tensor(img), target, meta
 
 
 def collate_fn(batch):
-    images, targets = zip(*batch)
-    return list(images), list(targets)
+    images, targets, metas = zip(*batch)
+    return list(images), list(targets), list(metas)
 
 
 # def build_model(num_classes: int = 2) -> FasterRCNN:
@@ -257,33 +296,55 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     epochs: int,
-) -> Tuple[float, float]:
-    """Train for one epoch and return (avg_loss, elapsed_seconds).
-
-    This version does not use tqdm and only returns epoch-level timing.
-    """
+) -> float:
     model.train()
     running_loss = 0.0
     count = 0
+    bad_keys_count = 0
+    bad_category_counter = defaultdict(int)
 
-    start_time = time.time()
-    for images, targets in loader:
+    pbar = tqdm(loader, desc=f"epoch {epoch + 1}/{epochs}", leave=False)
+    for images, targets, metas in pbar:
         images = [img.to(device) for img in images]
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
         loss_dict = model(images, targets)
+
+        bad_keys = [k for k, v in loss_dict.items() if not torch.isfinite(v)]
+        if bad_keys:
+            bad_keys_count += 1
+            for meta in metas:
+                finding_categories = meta.get("finding_categories", "UNKNOWN")
+                bad_category_counter[finding_categories] += 1
+            # pbar.write(f"[Warning] non-finite loss in {bad_keys}, batch skipped")
+            # pbar.write(str(targets))
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
         loss = sum(loss for loss in loss_dict.values())
+
+        if not torch.isfinite(loss):
+            pbar.write(f"[Warning] 捕获到 not-Infinite Loss，跳过此 Batch 避免模型崩溃！")
+            optimizer.zero_grad(set_to_none=True)
+            continue
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
         optimizer.step()
 
         batch_loss = float(loss.item())
         running_loss += batch_loss
         count += 1
+        pbar.set_postfix(loss=f"{batch_loss:.4f}")
 
-    elapsed = time.time() - start_time
-    return running_loss / max(count, 1), elapsed
+    print(f"[Sum] count = {count}")
+    print(f"[Sum] bad data count = {bad_keys_count}")
+    print(f"[Sum] bad category count = {dict(bad_category_counter)}")
+
+    return running_loss / max(count, 1)
 
 
 def save_checkpoint(
@@ -297,18 +358,6 @@ def save_checkpoint(
         "meta": meta,
     }
     torch.save(payload, save_path)
-
-
-def _format_seconds(seconds: float) -> str:
-    seconds = int(round(seconds))
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    if h:
-        return f"{h}h{m}m{s}s"
-    if m:
-        return f"{m}m{s}s"
-    return f"{s}s"
 
 
 def parse_args() -> argparse.Namespace:
@@ -332,7 +381,7 @@ def parse_args() -> argparse.Namespace:
         help="Output checkpoint path (default: models/bbox.pth)",
     )
     parser.add_argument("--epochs", type=int, default=12)
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=0.0005)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=0.0005)
@@ -368,61 +417,65 @@ def main() -> None:
         split_name="training",
         positive_only=args.positive_only,
     )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=1,
-        shuffle=True,
-        num_workers=0,
-        collate_fn=collate_fn,
-        pin_memory=False,
-    )
+    # Build index lists of positive / negative images so we can form
+    # per-epoch subsets with a fixed negative:positive ratio.
+    pos_indices = [i for i, s in enumerate(train_dataset.samples) if s.boxes.size > 0]
+    neg_indices = [i for i, s in enumerate(train_dataset.samples) if s.boxes.size == 0]
+
+    if len(pos_indices) == 0:
+        # If no positive samples are present, fall back to using the full dataset.
+        print("Warning: no positive samples found in training split; using full dataset")
+        pos_indices = []
 
     model = build_model(num_classes=2)
     model.to(device)
 
     optimizer = torch.optim.SGD(
         model.parameters(),
-        lr=0.0025,
-        momentum=0.9,
-        weight_decay=0.0005,
+        lr=args.lr,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay,
     )
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=4, gamma=0.1)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(args.epochs // 3, 1), gamma=0.1)
 
     history: List[Dict[str, float]] = []
 
-    print(f"Training images: {len(train_dataset)}")
+    print(f"Total images: {len(train_dataset)}; positives: {len(pos_indices)}; negatives: {len(neg_indices)}")
     print(f"Device: {device}")
-    last_epoch_time: Optional[float] = None
     for epoch in range(args.epochs):
-        # Estimate epoch time based on previous epoch or a default per-batch guess
-        try:
-            batches = len(train_loader)
-        except Exception:
-            batches = 1
-        if last_epoch_time is None:
-            est_epoch = max(0.5 * batches, 1.0)
+        # For each epoch, use all positive samples and sample negatives to
+        # achieve a negative:positive ratio of approximately 2:1.
+        if len(pos_indices) > 0:
+            rng = random.Random(args.seed + epoch)
+            desired_neg = min(len(neg_indices), 2 * len(pos_indices))
+            # If there are fewer negatives than desired, use them all.
+            neg_sample = rng.sample(neg_indices, desired_neg) if desired_neg > 0 else []
+            epoch_indices = pos_indices + neg_sample
+            rng.shuffle(epoch_indices)
+            subset = torch.utils.data.Subset(train_dataset, epoch_indices)
         else:
-            est_epoch = last_epoch_time
-        remaining_epochs = args.epochs - epoch
-        est_remaining = est_epoch * remaining_epochs
-        print(
-            f"Epoch {epoch + 1}/{args.epochs} — 预计本epoch时间: {_format_seconds(est_epoch)}, 剩余总时间(含本): {_format_seconds(est_remaining)}"
+            # No positives -> use full dataset for this epoch
+            subset = train_dataset
+
+        train_loader = DataLoader(
+            subset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            collate_fn=collate_fn,
+            pin_memory=torch.cuda.is_available(),
         )
 
-        avg_loss, elapsed = train_one_epoch(model, train_loader, optimizer, device, epoch, args.epochs)
-        last_epoch_time = elapsed
+        avg_loss = train_one_epoch(model, train_loader, optimizer, device, epoch, args.epochs)
         lr_scheduler.step()
 
         record = {
             "epoch": float(epoch + 1),
             "train_loss": float(avg_loss),
             "lr": float(optimizer.param_groups[0]["lr"]),
-            "epoch_time_s": float(last_epoch_time or 0.0),
         }
         history.append(record)
-        print(
-            f"Epoch {epoch + 1:03d}/{args.epochs:03d} | loss={avg_loss:.4f} | lr={record['lr']:.6f} | time={_format_seconds(last_epoch_time or 0.0)}"
-        )
+        print(f"Epoch {epoch + 1:03d}/{args.epochs:03d} | loss={avg_loss:.4f} | lr={record['lr']:.6f}")
 
     meta = {
         "task": "bbox_detection",

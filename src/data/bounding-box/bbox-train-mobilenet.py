@@ -1,4 +1,6 @@
-# 样本采用了 neg:pos = 2:1 的采样比例
+# 使用 fasterrcnn_mobilenet_v3_large_fpn 模型对数据集进行训练
+
+# 样本采用了 neg:pos = 1:1 的采样比例
 
 """Train a breast lesion bounding-box detector from VinDr detection CSV.
 
@@ -12,9 +14,11 @@ Model checkpoint is saved to `models/bbox.pth`.
 from __future__ import annotations
 
 import argparse
+import time
 import json
 import math
 import random
+import csv
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,9 +31,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision.models.detection import FasterRCNN
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-from torchvision.models.detection.faster_rcnn import fasterrcnn_mobilenet_v3_large_320_fpn
-# from torchvision.models.detection import fasterrcnn_resnet50_fpn
-# 不考虑使用 fasterrcnn_resnet50_fpn 模型，耗时过长
+from torchvision.models.detection.faster_rcnn import fasterrcnn_mobilenet_v3_large_fpn
 
 try:
     from tqdm import tqdm
@@ -80,30 +82,6 @@ def image_to_tensor(img: np.ndarray) -> torch.Tensor:
     """Convert RGB uint8 image to a float tensor in [0, 1]."""
     arr = img.astype(np.float32) / 255.0
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
-
-# 不再需要缩放
-# def scale_boxes_to_image(
-#     boxes: np.ndarray,
-#     orig_size: Tuple[float, float],
-#     new_size: Tuple[int, int],
-# ) -> np.ndarray:
-#     """Scale bbox coordinates from original CSV size to actual image size."""
-#     orig_h, orig_w = orig_size
-#     new_h, new_w = new_size
-#     if orig_h <= 0 or orig_w <= 0:
-#         return boxes
-
-#     scale_x = float(new_w) / float(orig_w)
-#     scale_y = float(new_h) / float(orig_h)
-#     scaled = boxes.copy().astype(np.float32)
-#     scaled[:, [0, 2]] *= scale_x
-#     scaled[:, [1, 3]] *= scale_y
-
-#     # Clamp to valid image range and remove invalid boxes.
-#     scaled[:, 0::2] = np.clip(scaled[:, 0::2], 0, max(new_w - 1, 0))
-#     scaled[:, 1::2] = np.clip(scaled[:, 1::2], 0, max(new_h - 1, 0))
-#     keep = (scaled[:, 2] > scaled[:, 0]) & (scaled[:, 3] > scaled[:, 1])
-#     return scaled[keep]
 
 
 @dataclass
@@ -230,29 +208,16 @@ def collate_fn(batch):
     return list(images), list(targets)
 
 
-# def build_model(num_classes: int = 2) -> FasterRCNN:
-#     try:
-#         model = fasterrcnn_resnet50_fpn(
-#             weights=None,
-#             weights_backbone=None,
-#         )
-#     except TypeError:
-#         model = fasterrcnn_resnet50_fpn(pretrained=False, pretrained_backbone=False)
-#     in_features = model.roi_heads.box_predictor.cls_score.in_features
-#     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
-#     return model
-
-
 def build_model(num_classes: int = 2) -> FasterRCNN:
     """Build a Faster R-CNN detector with a single foreground class."""
     try:
-        model = fasterrcnn_mobilenet_v3_large_320_fpn(
+        model = fasterrcnn_mobilenet_v3_large_fpn(
             weights=None,
             weights_backbone=None,
         )
     except TypeError:
         # Compatibility with older torchvision versions.
-        model = fasterrcnn_mobilenet_v3_large_320_fpn(pretrained=False, pretrained_backbone=False)  # type: ignore[call-arg]
+        model = fasterrcnn_mobilenet_v3_large_fpn(pretrained=False, pretrained_backbone=False)  # type: ignore[call-arg]
 
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
@@ -348,7 +313,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=0.0005)
+    parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=0.0005)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -383,10 +348,27 @@ def main() -> None:
         split_name="training",
         positive_only=args.positive_only,
     )
+
+    # Read bad data record (if exists) and build a set of (patient_id,image_id)
+    bad_record_path = Path(__file__).resolve().parent / "bad_data_record_mobilenet.csv"
+    bad_set = set()
+    if bad_record_path.exists():
+        print("[Info] Bad data file record found.")
+        try:
+            with bad_record_path.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    pid = row.get("patient_id")
+                    iid = row.get("image_id")
+                    if pid is not None and iid is not None:
+                        bad_set.add((str(pid), str(iid)))
+        except Exception:
+            bad_set = set()
     # Build index lists of positive / negative images so we can form
     # per-epoch subsets with a fixed negative:positive ratio.
-    pos_indices = [i for i, s in enumerate(train_dataset.samples) if s.boxes.size > 0]
-    neg_indices = [i for i, s in enumerate(train_dataset.samples) if s.boxes.size == 0]
+    # Filter out bad samples recorded earlier
+    pos_indices = [i for i, s in enumerate(train_dataset.samples) if s.boxes.size > 0 and (s.patient_id, s.image_id) not in bad_set]
+    neg_indices = [i for i, s in enumerate(train_dataset.samples) if s.boxes.size == 0 and (s.patient_id, s.image_id) not in bad_set]
 
     if len(pos_indices) == 0:
         # If no positive samples are present, fall back to using the full dataset.
@@ -409,18 +391,56 @@ def main() -> None:
     print(f"Total images: {len(train_dataset)}; positives: {len(pos_indices)}; negatives: {len(neg_indices)}")
     print(f"Device: {device}")
     for epoch in range(args.epochs):
-        # For each epoch, use all positive samples and sample negatives to
-        # achieve a negative:positive ratio of approximately 2:1.
-        if len(pos_indices) > 0:
+        # For each epoch, build a 1:1 positive:negative subset.
+        if len(pos_indices) > 0 and len(neg_indices) > 0:
             rng = random.Random(args.seed + epoch)
-            desired_neg = min(len(neg_indices), 2 * len(pos_indices))
-            # If there are fewer negatives than desired, use them all.
-            neg_sample = rng.sample(neg_indices, desired_neg) if desired_neg > 0 else []
-            epoch_indices = pos_indices + neg_sample
-            rng.shuffle(epoch_indices)
-            subset = torch.utils.data.Subset(train_dataset, epoch_indices)
+            # ensure epoch-level 1:1 ratio by sampling equal counts
+            pair_count = min(len(pos_indices), len(neg_indices))
+            if pair_count == 0:
+                subset = train_dataset
+            else:
+                pos_sample = rng.sample(pos_indices, pair_count)
+                neg_sample = rng.sample(neg_indices, pair_count)
+                rng.shuffle(pos_sample)
+                rng.shuffle(neg_sample)
+
+                # Build batches that mostly contain both positive and negative
+                B = max(1, args.batch_size)
+                pos_ptr = 0
+                neg_ptr = 0
+                epoch_order: List[int] = []
+                while pos_ptr < len(pos_sample) or neg_ptr < len(neg_sample):
+                    # choose at least one positive if available
+                    if pos_ptr < len(pos_sample):
+                        p = min(max(1, B // 2), len(pos_sample) - pos_ptr)
+                    else:
+                        p = 0
+                    q = B - p
+                    batch = []
+                    if p > 0:
+                        batch.extend(pos_sample[pos_ptr: pos_ptr + p])
+                        pos_ptr += p
+                    take_neg = min(q, len(neg_sample) - neg_ptr)
+                    if take_neg > 0:
+                        batch.extend(neg_sample[neg_ptr: neg_ptr + take_neg])
+                        neg_ptr += take_neg
+                    # fill remaining slots if any
+                    if len(batch) < B:
+                        need = B - len(batch)
+                        more_neg = min(need, len(neg_sample) - neg_ptr)
+                        if more_neg > 0:
+                            batch.extend(neg_sample[neg_ptr: neg_ptr + more_neg])
+                            neg_ptr += more_neg
+                        need = B - len(batch)
+                        if need > 0 and pos_ptr < len(pos_sample):
+                            more_pos = min(need, len(pos_sample) - pos_ptr)
+                            batch.extend(pos_sample[pos_ptr: pos_ptr + more_pos])
+                            pos_ptr += more_pos
+                    epoch_order.extend(batch)
+
+                subset = torch.utils.data.Subset(train_dataset, epoch_order)
         else:
-            # No positives -> use full dataset for this epoch
+            # No positives or no negatives -> fall back to full dataset
             subset = train_dataset
 
         train_loader = DataLoader(
@@ -451,8 +471,7 @@ def main() -> None:
         "images_root": str(images_root),
         "positive_only": args.positive_only,
         "history": history,
-        # "torchvision_model": "fasterrcnn_resnet50_fpn",
-        "torchvision_model": "fasterrcnn_mobilenet_v3_large_320_fpn",
+        "torchvision_model": "fasterrcnn_mobilenet_v3_large_fpn",
     }
     save_checkpoint(save_path, model, meta)
     print(f"Saved checkpoint to: {save_path}")
@@ -460,131 +479,22 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    start_time = time.time()
     main()
+    print(f"Running time: {time.time() - start_time} s.")
 
 
-"""log
+r"""log
 
 Here gives the output log:
 
-[Warning] Found 1 invalid boxes in D:\Codes\Github_Repositories\MammoPearl-Training\data\processed\images_png\118092d6244fabf9ac376d580aac8cbb\679a6515593f9692eb6a622b7b6b0aa0.png
-[Warning] Found 1 invalid boxes in D:\Codes\Github_Repositories\MammoPearl-Training\data\processed\images_png\9870e0438ed1f19cb85aaa32cf1e8830\ea8790b418b754139457d48e5228c077.png
-[Warning] Found 1 invalid boxes in D:\Codes\Github_Repositories\MammoPearl-Training\data\processed\images_png\9efd5f5c65ec8c402ec48f0ff7388562\5cd330a56ea7c77a1fa1181712966dbf.png
-[Warning] Found 1 invalid boxes in D:\Codes\Github_Repositories\MammoPearl-Training\data\processed\images_png\a8cb9adadef00fc473b1760cd7b513e4\7323314998471cde47c6fba70ae6d32c.png
-[Warning] Found 2 invalid boxes in D:\Codes\Github_Repositories\MammoPearl-Training\data\processed\images_png\df7c81d477ed6a29aa8e6e49c1719d03\7be2e5f9ade68ae2bfe4e5edb4968654.png
-[Warning] Found 1 invalid boxes in D:\Codes\Github_Repositories\MammoPearl-Training\data\processed\images_png\df7c81d477ed6a29aa8e6e49c1719d03\db70c6572ab2f8633feb484aa6d7d38d.png
-Total images: 16000; positives: 1411; negatives: 14589
+Total images: 16000; positives: 1411; negatives: 8633
 Device: cpu
-[Sum] count = 2117                                                                                                                           
+[Sum] count = 1411
 [Sum] bad data count = 0
-Epoch 001/012 | loss=0.2471 | lr=0.000500
-[Sum] count = 1914                                                                                                                           
-[Sum] bad data count = 203
-Epoch 002/012 | loss=0.6321 | lr=0.000500
-[Sum] count = 1541                                                                                                                           
-[Sum] bad data count = 576
-Epoch 003/012 | loss=0.6972 | lr=0.000500
-[Sum] count = 1658                                                                                                                           
-[Sum] bad data count = 459
-Epoch 004/012 | loss=0.4022 | lr=0.000050
-[Sum] count = 1699                                                                                                                           
-[Sum] bad data count = 418
-Epoch 005/012 | loss=0.9775 | lr=0.000050
-[Sum] count = 1829                                                                                                                           
-[Sum] bad data count = 288
-Epoch 006/012 | loss=0.2265 | lr=0.000050
-[Sum] count = 1807                                                                                                                           
-[Sum] bad data count = 310
-Epoch 007/012 | loss=0.1625 | lr=0.000050
-[Sum] count = 1642                                                                                                                           
-[Sum] bad data count = 475
-Epoch 008/012 | loss=0.1852 | lr=0.000005
-[Sum] count = 1611                                                                                                                           
-[Sum] bad data count = 506
-Epoch 009/012 | loss=0.2587 | lr=0.000005
-[Sum] count = 1577                                                                                                                           
-[Sum] bad data count = 540
-Epoch 010/012 | loss=0.3000 | lr=0.000005
-[Sum] count = 1573                                                                                                                           
-[Sum] bad data count = 544
-Epoch 011/012 | loss=0.3491 | lr=0.000005
-[Sum] count = 1578                                                                                                                           
-[Sum] bad data count = 539
-Epoch 012/012 | loss=0.4026 | lr=0.000001
-Saved checkpoint to: D:\Codes\Github_Repositories\MammoPearl-Training\models\bbox.pth
-{
-  "task": "bbox_detection",
-  "num_classes": 2,
-  "class_names": [
-    "background",
-    "lesion"
-  ],
-  "csv_path": "D:\\Codes\\Github_Repositories\\MammoPearl-Training\\data\\raw\\vindr_detection_folds.csv",
-  "images_root": "D:\\Codes\\Github_Repositories\\MammoPearl-Training\\data\\processed\\images_png",
-  "positive_only": false,
-  "history": [
-    {
-      "epoch": 1.0,
-      "train_loss": 0.24705643521271642,
-      "lr": 0.0005
-    },
-    {
-      "epoch": 2.0,
-      "train_loss": 0.6320763567667902,
-      "lr": 0.0005
-    },
-    {
-      "epoch": 3.0,
-      "train_loss": 0.6972195912836365,
-      "lr": 0.0005
-    },
-    {
-      "epoch": 4.0,
-      "train_loss": 0.40221517771996157,
-      "lr": 5e-05
-    },
-    {
-      "epoch": 5.0,
-      "train_loss": 0.9775444359908877,
-      "lr": 5e-05
-    },
-    {
-      "epoch": 6.0,
-      "train_loss": 0.22649905745490231,
-      "lr": 5e-05
-    },
-    {
-      "epoch": 7.0,
-      "train_loss": 0.1624891125764177,
-      "lr": 5e-05
-    },
-    {
-      "epoch": 8.0,
-      "train_loss": 0.18516448602480495,
-      "lr": 5e-06
-    },
-    {
-      "epoch": 9.0,
-      "train_loss": 0.2587370194044816,
-      "lr": 5e-06
-    },
-    {
-      "epoch": 10.0,
-      "train_loss": 0.30000062203096767,
-      "lr": 5e-06
-    },
-    {
-      "epoch": 11.0,
-      "train_loss": 0.3491251763298744,
-      "lr": 5e-06
-    },
-    {
-      "epoch": 12.0,
-      "train_loss": 0.4025792213642547,
-      "lr": 5.000000000000001e-07
-    }
-  ],
-  "torchvision_model": "fasterrcnn_mobilenet_v3_large_320_fpn"
-}
+Epoch 001/012 | loss=0.2842 | lr=0.001000
+[Sum] count = 1411
+[Sum] bad data count = 0
+Epoch 002/012 | loss=0.1967 | lr=0.001000
 
 """

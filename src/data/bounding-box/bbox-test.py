@@ -1,5 +1,5 @@
 # use: 
-# python src/data/segment/bbox-test.py --score-threshold 0.01
+# python src/data/bounding-box/bbox-test.py --score-threshold 0.3
 
 
 """Evaluate a bbox detector on the VinDr test split.
@@ -19,7 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import cv2
 import numpy as np
@@ -196,7 +196,16 @@ def greedy_match(pred_boxes: torch.Tensor, pred_scores: torch.Tensor, gt_boxes: 
     return matches
 
 
-def evaluate(model: FasterRCNN, loader: DataLoader, device: torch.device, score_threshold: float, iou_threshold: float):
+def evaluate(
+    model: FasterRCNN,
+    loader: DataLoader,
+    device: torch.device,
+    score_threshold: float,
+    iou_threshold: float,
+    # save_debug_dir: Optional[Path] = None,
+    # max_debug_images: int = 20,
+    # nms_iou: float = 0.5,
+):
     model.eval()
 
     total_gt = 0
@@ -211,6 +220,11 @@ def evaluate(model: FasterRCNN, loader: DataLoader, device: torch.device, score_
     coord_abs_errors: List[np.ndarray] = []
     rows: List[Dict[str, Any]] = []
 
+    # saved_debug = 0
+    # printed_debug = 0
+    # if save_debug_dir is not None:
+    #     save_debug_dir.mkdir(parents=True, exist_ok=True)
+
     with torch.no_grad():
         for images, targets, samples in tqdm(loader, desc="evaluating", leave=False):
             images = [img.to(device) for img in images]
@@ -224,6 +238,92 @@ def evaluate(model: FasterRCNN, loader: DataLoader, device: torch.device, score_
                 pred_scores = pred_scores[keep]
 
                 gt_boxes = target["boxes"].detach().cpu()
+
+                # # Apply NMS to predictions to reduce duplicates (configurable)
+                # if nms_iou is not None and nms_iou > 0 and pred_boxes.numel() > 0:
+                #     try:
+                #         from torchvision.ops import nms as tv_nms
+
+                #         keep_idx = tv_nms(pred_boxes, pred_scores, float(nms_iou))
+                #         if keep_idx.numel() > 0:
+                #             pred_boxes = pred_boxes[keep_idx]
+                #             pred_scores = pred_scores[keep_idx]
+                #     except Exception:
+                #         pass
+
+                # # Save debug visualization for a few images to inspect coordinate alignment
+                # if save_debug_dir is not None and saved_debug < max_debug_images:
+                #     try:
+                #         img = normalize_image(read_image_unicode(sample["image_path"]))
+                #         # convert to BGR for correct OpenCV drawing
+                #         vis_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+                #         # draw GT boxes in green (BGR)
+                #         for b in gt_boxes.numpy() if gt_boxes.numel() > 0 else []:
+                #             x1, y1, x2, y2 = map(int, b.tolist())
+                #             cv2.rectangle(vis_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                #         # draw predicted boxes in red with score (BGR)
+                #         for i, b in enumerate(pred_boxes.numpy() if pred_boxes.numel() > 0 else []):
+                #             x1, y1, x2, y2 = map(int, b.tolist())
+                #             cv2.rectangle(vis_bgr, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                #             s = float(pred_scores[i].item())
+                #             cv2.putText(vis_bgr, f"{s:.2f}", (max(x1, 0), max(y1 - 6, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+                #         out_name = f"{sample['patient_id']}_{sample['image_id']}.png"
+                #         out_path = save_debug_dir / out_name
+                #         cv2.imwrite(str(out_path), vis_bgr)
+                #         saved_debug += 1
+                #     except Exception:
+                #         pass
+
+                # # Numeric diagnostics for selected images (only when GT or preds exist or many preds)
+                # try:
+                #     img = normalize_image(read_image_unicode(sample["image_path"]))
+                #     h, w = img.shape[:2]
+                #     has_gt = gt_boxes.numel() > 0
+                #     num_preds = int(pred_boxes.shape[0])
+                #     # condition to print: has GT, or has predictions, or unusually many predictions
+                #     if (has_gt or num_preds > 0 or num_preds > 20) and printed_debug < 30:
+                #         printed_debug += 1
+                #         print(f"[Debug] image: {sample['image_path']}")
+                #         print(f"[Debug] shape: {(h, w)} gt_count={int(gt_boxes.shape[0])} pred_count={num_preds}")
+                #         if gt_boxes.numel() > 0:
+                #             print("[Debug] gt_boxes sample:", gt_boxes.numpy()[:5])
+                #         if pred_boxes.numel() > 0:
+                #             print("[Debug] pred_scores_top:", pred_scores.numpy()[:5])
+                #             print("[Debug] pred_boxes sample:", pred_boxes.numpy()[:5])
+
+                #         def in_bounds_arr(arr):
+                #             if arr.size == 0:
+                #                 return []
+                #             return [
+                #                 (0 <= float(b[0]) < w and 0 <= float(b[2]) <= w and 0 <= float(b[1]) < h and 0 <= float(b[3]) <= h)
+                #                 for b in arr
+                #             ]
+
+                #         print("[Debug] gt_in_bounds:", in_bounds_arr(gt_boxes.numpy() if gt_boxes.numel() > 0 else np.zeros((0, 4))))
+                #         print("[Debug] pred_in_bounds:", in_bounds_arr(pred_boxes.numpy() if pred_boxes.numel() > 0 else np.zeros((0, 4))))
+
+                #         if gt_boxes.numel() > 0 and pred_boxes.numel() > 0:
+                #             try:
+                #                 ious = box_iou(pred_boxes, gt_boxes).numpy()
+                #                 if ious.size > 0:
+                #                     max_iou_per_pred = ious.max(axis=1)
+                #                     max_iou_per_gt = ious.max(axis=0)
+                #                     print("[Debug] iou_pred_max_stats: count=", len(max_iou_per_pred), "max=", float(np.max(max_iou_per_pred)), "mean=", float(np.mean(max_iou_per_pred)))
+                #                     print("[Debug] iou_gt_max_stats: count=", len(max_iou_per_gt), "max=", float(np.max(max_iou_per_gt)), "mean=", float(np.mean(max_iou_per_gt)))
+                #             except Exception:
+                #                 pass
+
+                #             try:
+                #                 from torchvision.ops import nms as tv_nms
+
+                #                 keep_idx = tv_nms(pred_boxes, pred_scores, float(nms_iou) if nms_iou is not None else 0.5)
+                #                 print("[Debug] nms_kept:", len(keep_idx), "raw_preds:", num_preds)
+                #             except Exception:
+                #                 pass
+                # except Exception:
+                #     pass
 
                 matches = greedy_match(pred_boxes, pred_scores, gt_boxes, iou_threshold=iou_threshold)
                 matched_pred = {m[0] for m in matches}
@@ -307,6 +407,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iou-threshold", type=float, default=0.5)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--save-predictions", type=Path, default=None, help="Optional CSV path for matched predictions.")
+    # parser.add_argument(
+    #     "--save-debug-dir",
+    #     type=Path,
+    #     default=None,
+    #     help="Optional folder to save debug images with GT (green) and predictions (red).",
+    # )
+    # parser.add_argument("--max-debug-images", type=int, default=50, help="Maximum number of debug images to save.")
+    # parser.add_argument(
+    #     "--nms-iou",
+    #     type=float,
+    #     default=0.5,
+    #     help="IoU threshold for per-image NMS applied before matching (set <=0 to disable).",
+    # )
     return parser.parse_args()
 
 
@@ -339,6 +452,9 @@ def main() -> None:
         device=device,
         score_threshold=args.score_threshold,
         iou_threshold=args.iou_threshold,
+        # save_debug_dir=args.save_debug_dir,
+        # max_debug_images=args.max_debug_images,
+        # nms_iou=args.nms_iou,
     )
 
     print(json.dumps(metrics, ensure_ascii=False, indent=2))

@@ -24,4 +24,4 @@ python ./src/data/segment/segment-test.py
 
 但是你可以在 `src/data/segment/segment.py` 中阅读顶部提示词，并查看其中写好的四个函数。这四个函数就是分割的关键函数。
 
-另外，你可以在 `src/data/segment/` 文件夹下查看到 `bbox-*` 文件，这些是用来训练识别 bbox （标注框）的训练与测试文件。由于存在大量被污染的数据，这些文件正在测试中。`validate_bbox_coords.py` 文件使用来查看训练与测试文件的标注框位置是否正确的，以防止图像放缩导致异常。
+另外，你可以在 `src/data/bounding-box/` 文件夹下查看到 `bbox-*` 文件，这些是用来训练识别 bbox （标注框）的训练与测试文件。由于存在大量被污染的数据，这些文件正在测试中。`validate_bbox_coords.py` 文件使用来查看训练与测试文件的标注框位置是否正确的，以防止图像放缩导致异常。

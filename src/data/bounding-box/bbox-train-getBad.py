@@ -1,9 +1,33 @@
+# use:
+# python src/data/bounding-box/bbox-train-getBad.py --epochs 1 --batch-size 2
+
+# 作用：预跑一遍，将 bad data (loss !== !Infinite) 保存到 csv 文件中
+
+# 当前使用的模型为：fasterrcnn_mobilenet_v3_large_fpn，可以对应 bbox-train-mobilenet.py 训练程序。
+# 保存的文件为：./bad_data_record_mobilenet.csv
+
+"""
+Here is the output for fasterrcnn_mobilenet_v3_large_fpn model:
+
+Total images: 16000; positives: 1411; negatives: 14589
+[Sum] count = 5022                                                                                                                           
+[Sum] bad data count = 2978
+"""
+
+"""Train script wrapper that records bad data entries when encountered.
+
+Run this script just like `bbox-train.py`. It behaves the same but whenever a
+batch produces non-finite losses (bad data), it records the corresponding
+`patient_id,image_id` pairs into `bad_data_record(.*)?.csv` in this directory.
+"""
+
 from __future__ import annotations
 
 import argparse
 import json
 import math
 import random
+import csv
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,9 +40,8 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision.models.detection import FasterRCNN
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-from torchvision.models.detection.faster_rcnn import fasterrcnn_mobilenet_v3_large_320_fpn
-# from torchvision.models.detection import fasterrcnn_resnet50_fpn
-# 不考虑使用 fasterrcnn_resnet50_fpn 模型，耗时过长
+from torchvision.models.detection.faster_rcnn import fasterrcnn_mobilenet_v3_large_fpn
+# or use model: fasterrcnn_mobilenet_v3_large_320_fpn
 
 try:
     from tqdm import tqdm
@@ -26,19 +49,11 @@ except Exception:  # pragma: no cover
     tqdm = lambda x, **kwargs: x  # type: ignore[assignment]
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
 def repo_root_from_file() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
 def read_image_unicode(path: Path) -> np.ndarray:
-    """Read an image from a path that may contain unicode characters."""
     raw = np.fromfile(str(path), dtype=np.uint8)
     img = cv2.imdecode(raw, cv2.IMREAD_UNCHANGED)
     if img is None:
@@ -47,7 +62,6 @@ def read_image_unicode(path: Path) -> np.ndarray:
 
 
 def normalize_image(img: np.ndarray) -> np.ndarray:
-    """Convert image to RGB uint8 with 3 channels."""
     if img.ndim == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
     elif img.ndim == 3:
@@ -66,33 +80,8 @@ def normalize_image(img: np.ndarray) -> np.ndarray:
 
 
 def image_to_tensor(img: np.ndarray) -> torch.Tensor:
-    """Convert RGB uint8 image to a float tensor in [0, 1]."""
     arr = img.astype(np.float32) / 255.0
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
-
-# 不再需要缩放
-# def scale_boxes_to_image(
-#     boxes: np.ndarray,
-#     orig_size: Tuple[float, float],
-#     new_size: Tuple[int, int],
-# ) -> np.ndarray:
-#     """Scale bbox coordinates from original CSV size to actual image size."""
-#     orig_h, orig_w = orig_size
-#     new_h, new_w = new_size
-#     if orig_h <= 0 or orig_w <= 0:
-#         return boxes
-
-#     scale_x = float(new_w) / float(orig_w)
-#     scale_y = float(new_h) / float(orig_h)
-#     scaled = boxes.copy().astype(np.float32)
-#     scaled[:, [0, 2]] *= scale_x
-#     scaled[:, [1, 3]] *= scale_y
-
-#     # Clamp to valid image range and remove invalid boxes.
-#     scaled[:, 0::2] = np.clip(scaled[:, 0::2], 0, max(new_w - 1, 0))
-#     scaled[:, 1::2] = np.clip(scaled[:, 1::2], 0, max(new_h - 1, 0))
-#     keep = (scaled[:, 2] > scaled[:, 0]) & (scaled[:, 3] > scaled[:, 1])
-#     return scaled[keep]
 
 
 @dataclass
@@ -102,16 +91,9 @@ class Sample:
     image_path: Path
     boxes: np.ndarray
     orig_size: Tuple[float, float]
-    finding_categories: str
 
 
 class VinDrBboxDataset(Dataset):
-    """Dataset grouped at the image level.
-
-    Each item contains one image and all lesion boxes found for that image.
-    Images with no lesion boxes are kept as negative samples.
-    """
-
     def __init__(
         self,
         csv_path: Path,
@@ -134,32 +116,18 @@ class VinDrBboxDataset(Dataset):
         grouped = df.groupby(["patient_id", "series_id", "image_id"], sort=True)
 
         for (patient_id, _series_id, image_id), group in grouped:
-            # Keep all boxes for this image (some images have multiple lesions).
             valid = group[["xmin", "ymin", "xmax", "ymax"]].dropna()
             boxes: np.ndarray
             if valid.empty:
                 boxes = np.zeros((0, 4), dtype=np.float32)
             else:
                 boxes = valid.to_numpy(dtype=np.float32)
-            
+
             image_path = images_root / str(patient_id) / f"{image_id}"
-
-            if boxes.size > 0:
-                invalid = np.sum((boxes[:, 2] <= boxes[:, 0]) | (boxes[:, 3] <= boxes[:, 1]))
-                if invalid > 0:
-                    print(f"[Warning] Found {invalid} invalid boxes in {image_path}")
-
-            if positive_only and len(boxes) == 0:
-                continue
 
             first = group.iloc[0]
             orig_h = float(first["height"]) if pd.notna(first["height"]) else 0.0
             orig_w = float(first["width"]) if pd.notna(first["width"]) else 0.0
-            finding_categories = (
-                group["finding_categories"].dropna().astype(str).iloc[0]
-                if group["finding_categories"].notna().any()
-                else "UNKNOWN"
-            )
 
             self.samples.append(
                 Sample(
@@ -168,7 +136,6 @@ class VinDrBboxDataset(Dataset):
                     image_path=image_path,
                     boxes=boxes,
                     orig_size=(orig_h, orig_w),
-                    finding_categories=finding_categories,
                 )
             )
 
@@ -180,7 +147,7 @@ class VinDrBboxDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, str]]:
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         sample = self.samples[index]
         if not sample.image_path.exists():
             raise FileNotFoundError(f"Missing image: {sample.image_path}")
@@ -195,7 +162,6 @@ class VinDrBboxDataset(Dataset):
             boxes[:, 2] = np.clip(boxes[:, 2], 0, w - 1)
             boxes[:, 1] = np.clip(boxes[:, 1], 0, h - 1)
             boxes[:, 3] = np.clip(boxes[:, 3], 0, h - 1)
-            # 过滤非法框，左值大于右值，或像素值小于 1。
             keep = (boxes[:, 2] > boxes[:, 0] + 1) & (boxes[:, 3] > boxes[:, 1] + 1)
             boxes = boxes[keep]
 
@@ -218,44 +184,22 @@ class VinDrBboxDataset(Dataset):
             ),
             "iscrowd": torch.zeros((labels_tensor.shape[0],), dtype=torch.int64),
         }
-
-        meta: Dict[str, str] = {
-            "patient_id": sample.patient_id,
-            "image_id": sample.image_id,
-            "finding_categories": sample.finding_categories,
-        }
-
-        return image_to_tensor(img), target, meta
+        return image_to_tensor(img), target
 
 
 def collate_fn(batch):
-    images, targets, metas = zip(*batch)
-    return list(images), list(targets), list(metas)
-
-
-# def build_model(num_classes: int = 2) -> FasterRCNN:
-#     try:
-#         model = fasterrcnn_resnet50_fpn(
-#             weights=None,
-#             weights_backbone=None,
-#         )
-#     except TypeError:
-#         model = fasterrcnn_resnet50_fpn(pretrained=False, pretrained_backbone=False)
-#     in_features = model.roi_heads.box_predictor.cls_score.in_features
-#     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
-#     return model
+    images, targets = zip(*batch)
+    return list(images), list(targets)
 
 
 def build_model(num_classes: int = 2) -> FasterRCNN:
-    """Build a Faster R-CNN detector with a single foreground class."""
     try:
-        model = fasterrcnn_mobilenet_v3_large_320_fpn(
+        model = fasterrcnn_mobilenet_v3_large_fpn(
             weights=None,
             weights_backbone=None,
         )
     except TypeError:
-        # Compatibility with older torchvision versions.
-        model = fasterrcnn_mobilenet_v3_large_320_fpn(pretrained=False, pretrained_backbone=False)  # type: ignore[call-arg]
+        model = fasterrcnn_mobilenet_v3_large_fpn(pretrained=False, pretrained_backbone=False)  # type: ignore[call-arg]
 
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
@@ -269,35 +213,84 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     epochs: int,
+    bad_record_path: Path,
 ) -> float:
     model.train()
     running_loss = 0.0
     count = 0
     bad_keys_count = 0
-    bad_category_counter = defaultdict(int)
 
     pbar = tqdm(loader, desc=f"epoch {epoch + 1}/{epochs}", leave=False)
-    for images, targets, metas in pbar:
+    for images, targets in pbar:
         images = [img.to(device) for img in images]
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
         loss_dict = model(images, targets)
 
+        # Detect non-finite losses
         bad_keys = [k for k, v in loss_dict.items() if not torch.isfinite(v)]
         if bad_keys:
             bad_keys_count += 1
-            for meta in metas:
-                finding_categories = meta.get("finding_categories", "UNKNOWN")
-                bad_category_counter[finding_categories] += 1
-            # pbar.write(f"[Warning] non-finite loss in {bad_keys}, batch skipped")
-            # pbar.write(str(targets))
+            # analyze each target to try to identify which image(s) contain invalid boxes
+            try:
+                ds = loader.dataset
+                orig = ds.dataset if isinstance(ds, torch.utils.data.Subset) else ds
+
+                def analyze_target(t, sample: Sample) -> List[str]:
+                    reasons: List[str] = []
+                    try:
+                        boxes = t.get("boxes")
+                        if boxes is None:
+                            reasons.append("no_boxes_field")
+                            return reasons
+                        boxes_np = boxes.detach().cpu().numpy() if isinstance(boxes, torch.Tensor) else np.asarray(boxes)
+                        if boxes_np.size == 0:
+                            return reasons
+                        if np.isnan(boxes_np).any():
+                            reasons.append("nan_in_boxes")
+                        if np.isinf(boxes_np).any():
+                            reasons.append("inf_in_boxes")
+                        # widths/heights
+                        ws = boxes_np[:, 2] - boxes_np[:, 0]
+                        hs = boxes_np[:, 3] - boxes_np[:, 1]
+                        if (ws <= 0).any() or (hs <= 0).any():
+                            reasons.append("non_positive_wh")
+                        # check bounds using actual image size
+                        try:
+                            img = normalize_image(read_image_unicode(sample.image_path))
+                            h, w = img.shape[:2]
+                            if (boxes_np[:, 0] < 0).any() or (boxes_np[:, 1] < 0).any() or (boxes_np[:, 2] > w).any() or (boxes_np[:, 3] > h).any():
+                                reasons.append("out_of_bounds")
+                        except Exception:
+                            # if image can't be read, note it
+                            reasons.append("img_read_error")
+                    except Exception:
+                        reasons.append("analyze_error")
+                    return reasons
+
+                with bad_record_path.open("a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    for t in targets:
+                        try:
+                            img_idx = int(t["image_id"].item())
+                            sample = orig.samples[img_idx]
+                            reasons = analyze_target(t, sample)
+                            if reasons:
+                                writer.writerow([sample.patient_id, sample.image_id, ";".join(reasons)])
+                            else:
+                                # if we couldn't find per-target issues, still record generic bad_keys
+                                writer.writerow([sample.patient_id, sample.image_id, ",".join(bad_keys)])
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
             optimizer.zero_grad(set_to_none=True)
             continue
 
         loss = sum(loss for loss in loss_dict.values())
 
         if not torch.isfinite(loss):
-            pbar.write(f"[Warning] 捕获到 not-Infinite Loss，跳过此 Batch 避免模型崩溃！")
             optimizer.zero_grad(set_to_none=True)
             continue
 
@@ -315,46 +308,17 @@ def train_one_epoch(
 
     print(f"[Sum] count = {count}")
     print(f"[Sum] bad data count = {bad_keys_count}")
-    print(f"[Sum] bad category count = {dict(bad_category_counter)}")
 
     return running_loss / max(count, 1)
 
 
-def save_checkpoint(
-    save_path: Path,
-    model: FasterRCNN,
-    meta: Dict[str, Any],
-) -> None:
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "model_state_dict": model.state_dict(),
-        "meta": meta,
-    }
-    torch.save(payload, save_path)
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a bbox detector for VinDr.")
-    parser.add_argument(
-        "--csv-path",
-        type=Path,
-        default=None,
-        help="Path to vindr_detection_folds.csv",
-    )
-    parser.add_argument(
-        "--images-root",
-        type=Path,
-        default=None,
-        help="Root folder containing processed images_png/<patient_id>/<image_id>",
-    )
-    parser.add_argument(
-        "--save-path",
-        type=Path,
-        default=None,
-        help="Output checkpoint path (default: models/bbox.pth)",
-    )
-    parser.add_argument("--epochs", type=int, default=12)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser = argparse.ArgumentParser(description="Train a bbox detector for VinDr (get bad data).")
+    parser.add_argument("--csv-path", type=Path, default=None)
+    parser.add_argument("--images-root", type=Path, default=None)
+    parser.add_argument("--save-path", type=Path, default=None)
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=0.0005)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=0.0005)
@@ -376,12 +340,21 @@ def main() -> None:
     images_root = args.images_root or (root / "data" / "processed" / "images_png")
     save_path = args.save_path or (root / "models" / "bbox.pth")
 
+    bad_record_path = Path(__file__).resolve().parent / "bad_data_record_mobilenet.csv"
+    # ensure header exists
+    if not bad_record_path.exists():
+        with bad_record_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["patient_id", "image_id", "reason"])
+
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV not found: {csv_path}")
     if not images_root.exists():
         raise FileNotFoundError(f"Images root not found: {images_root}")
 
-    set_seed(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_dataset = VinDrBboxDataset(
@@ -390,15 +363,12 @@ def main() -> None:
         split_name="training",
         positive_only=args.positive_only,
     )
-    # Build index lists of positive / negative images so we can form
-    # per-epoch subsets with a fixed negative:positive ratio.
+
+    # Build index lists
     pos_indices = [i for i, s in enumerate(train_dataset.samples) if s.boxes.size > 0]
     neg_indices = [i for i, s in enumerate(train_dataset.samples) if s.boxes.size == 0]
 
-    if len(pos_indices) == 0:
-        # If no positive samples are present, fall back to using the full dataset.
-        print("Warning: no positive samples found in training split; using full dataset")
-        pos_indices = []
+    print(f"Total images: {len(train_dataset)}; positives: {len(pos_indices)}; negatives: {len(neg_indices)}")
 
     model = build_model(num_classes=2)
     model.to(device)
@@ -409,28 +379,11 @@ def main() -> None:
         momentum=args.momentum,
         weight_decay=args.weight_decay,
     )
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(args.epochs // 3, 1), gamma=0.1)
 
-    history: List[Dict[str, float]] = []
-
-    print(f"Total images: {len(train_dataset)}; positives: {len(pos_indices)}; negatives: {len(neg_indices)}")
-    print(f"Device: {device}")
     for epoch in range(args.epochs):
-        # For each epoch, use all positive samples and sample negatives to
-        # achieve a negative:positive ratio of approximately 2:1.
-        if len(pos_indices) > 0:
-            rng = random.Random(args.seed + epoch)
-            desired_neg = min(len(neg_indices), 2 * len(pos_indices))
-            # If there are fewer negatives than desired, use them all.
-            neg_sample = rng.sample(neg_indices, desired_neg) if desired_neg > 0 else []
-            epoch_indices = pos_indices + neg_sample
-            rng.shuffle(epoch_indices)
-            subset = torch.utils.data.Subset(train_dataset, epoch_indices)
-        else:
-            # No positives -> use full dataset for this epoch
-            subset = train_dataset
-
-        train_loader = DataLoader(
+        # Same simple loop as original but primarily this script's job is to record bad data
+        subset = train_dataset
+        loader = DataLoader(
             subset,
             batch_size=args.batch_size,
             shuffle=True,
@@ -439,31 +392,7 @@ def main() -> None:
             pin_memory=torch.cuda.is_available(),
         )
 
-        avg_loss = train_one_epoch(model, train_loader, optimizer, device, epoch, args.epochs)
-        lr_scheduler.step()
-
-        record = {
-            "epoch": float(epoch + 1),
-            "train_loss": float(avg_loss),
-            "lr": float(optimizer.param_groups[0]["lr"]),
-        }
-        history.append(record)
-        print(f"Epoch {epoch + 1:03d}/{args.epochs:03d} | loss={avg_loss:.4f} | lr={record['lr']:.6f}")
-
-    meta = {
-        "task": "bbox_detection",
-        "num_classes": 2,
-        "class_names": ["background", "lesion"],
-        "csv_path": str(csv_path),
-        "images_root": str(images_root),
-        "positive_only": args.positive_only,
-        "history": history,
-        # "torchvision_model": "fasterrcnn_resnet50_fpn",
-        "torchvision_model": "fasterrcnn_mobilenet_v3_large_320_fpn",
-    }
-    save_checkpoint(save_path, model, meta)
-    print(f"Saved checkpoint to: {save_path}")
-    print(json.dumps(meta, ensure_ascii=False, indent=2))
+        _ = train_one_epoch(model, loader, optimizer, device, epoch, args.epochs, bad_record_path)
 
 
 if __name__ == "__main__":

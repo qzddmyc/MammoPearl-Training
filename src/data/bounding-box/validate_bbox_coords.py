@@ -14,10 +14,10 @@ Even if the two are identical, they are rendered independently using the
 two code paths so you can confirm they really match.
 
 Usage:
-  python ./src/data/segment/validate_bbox_coords.py
-* python ./src/data/segment/validate_bbox_coords.py --split test --num-samples 3
-  python ./src/data/segment/validate_bbox_coords.py --image-id some_image_id.png
-  python ./src/data/segment/validate_bbox_coords.py --output-dir bbox_validation_out
+  python ./src/data/bounding-box/validate_bbox_coords.py
+* python ./src/data/bounding-box/validate_bbox_coords.py --split test --num-samples 3
+  python ./src/data/bounding-box/validate_bbox_coords.py --image-id some_image_id.png
+  python ./src/data/bounding-box/validate_bbox_coords.py --output-dir bbox_validation_out
 """
 
 from __future__ import annotations
