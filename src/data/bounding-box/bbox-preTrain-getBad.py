@@ -1,5 +1,5 @@
 # use:
-# python src/data/bounding-box/bbox-train-getBad.py --epochs 1 --batch-size 2
+# python src/data/bounding-box/bbox-preTrain-getBad.py --epochs 1 --batch-size 2
 
 # 作用：预跑一遍，将 bad data (loss !== !Infinite) 保存到 csv 文件中
 
@@ -18,7 +18,7 @@ Total images: 16000; positives: 1411; negatives: 14589
 
 Run this script just like `bbox-train.py`. It behaves the same but whenever a
 batch produces non-finite losses (bad data), it records the corresponding
-`patient_id,image_id` pairs into `bad_data_record(.*)?.csv` in this directory.
+`patient_id,image_id` pairs into `bad_data_record(_.*)?.csv` in this directory.
 """
 
 from __future__ import annotations

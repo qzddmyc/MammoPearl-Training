@@ -1,3 +1,8 @@
+# 可视化 train 与 test 文件中的 bbox 框定位
+# 结果保存在 tmp/bbox_validation_out 中
+
+# 时间久远，已经不知道逻辑是否仍然与 train / test 文件同步了
+
 """
 Validate VinDr bbox coordinates by comparing the TRAIN logic against the TEST logic.
 

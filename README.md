@@ -9,20 +9,23 @@ MammoPearl-IBCDS 训练数据集仓库，同时也作为《数字图像处理》
 ## 项目结构
 
 ```plaintext
-MammoPearl-Training
-├── data                    # 数据相关目录
-│   ├── raw
-│   │   ├── images_png                  # 原始数据目录
+MammoPearl-Training/
+├── data/                   # 数据相关目录
+│   ├── raw/
+│   │   ├── images_png/                 # 原始数据目录
 │   │   │   └── dataset.sha256          # 数据集完整性校验文件
 │   │   └── vindr_detection_folds.csv   # 数据集划分文件
-│   └── processed
-│       └── images_png      # 预处理后的数据目录
-├── src
-│   ├── init
-│   │   └── download-dataset.py   # 原始数据下载脚本
-│   └── data
-│       ├── pre-process.py        # 数据预处理脚本
-│       └── pre-process-test.py   # 数据预处理测试脚本
+│   └── processed/
+│       └── images_png/     # 预处理后的数据目录
+├── src/
+│   ├── init/
+│   │   └── download-dataset.py         # 原始数据下载脚本
+│   └── data/
+│       ├── pre-process/    # 数据预处理
+│       ├── segment/        # 图像分隔
+│       └── bounding-box/   # 标注框预测模型的训练
+│
+├── tools/                  # 工具文件
 ├── README.md
 ├── build_dataset.sh        # 项目及数据集初始化脚本
 └── requirements.txt        # Python 依赖列表
