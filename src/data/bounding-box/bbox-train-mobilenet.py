@@ -496,5 +496,111 @@ Epoch 001/012 | loss=0.2842 | lr=0.001000
 [Sum] count = 1411
 [Sum] bad data count = 0
 Epoch 002/012 | loss=0.1967 | lr=0.001000
+[Sum] count = 1411
+[Sum] bad data count = 0
+Epoch 003/012 | loss=0.2089 | lr=0.001000
+[Sum] count = 1411
+[Sum] bad data count = 0
+Epoch 004/012 | loss=0.2081 | lr=0.000100
+[Sum] count = 1411                                                                                                                           
+[Sum] bad data count = 0
+Epoch 005/012 | loss=0.2012 | lr=0.000100
+[Sum] count = 1411                                                                                                                           
+[Sum] bad data count = 0
+Epoch 006/012 | loss=0.1991 | lr=0.000100
+[Sum] count = 1411                                                                                                                           
+[Sum] bad data count = 0
+Epoch 007/012 | loss=0.2027 | lr=0.000100
+[Sum] count = 1411                                                                                                                           
+[Sum] bad data count = 0
+Epoch 008/012 | loss=0.2058 | lr=0.000010
+[Sum] count = 1411                                                                                                                           
+[Sum] bad data count = 0
+Epoch 009/012 | loss=0.1966 | lr=0.000010
+[Sum] count = 1411                                                                                                                           
+[Sum] bad data count = 0
+Epoch 010/012 | loss=0.1988 | lr=0.000010
+[Sum] count = 1411                                                                                                                           
+[Sum] bad data count = 0
+Epoch 011/012 | loss=0.2010 | lr=0.000010
+[Sum] count = 1411                                                                                                                           
+[Sum] bad data count = 0
+Epoch 012/012 | loss=0.2008 | lr=0.000001
+Saved checkpoint to: D:\Codes\Github_Repositories\MammoPearl-Training\models\bbox.pth
+{
+  "task": "bbox_detection",
+  "num_classes": 2,
+  "class_names": [
+    "background",
+    "lesion"
+  ],
+  "csv_path": "D:\\Codes\\Github_Repositories\\MammoPearl-Training\\data\\raw\\vindr_detection_folds.csv",
+  "images_root": "D:\\Codes\\Github_Repositories\\MammoPearl-Training\\data\\processed\\images_png",
+  "positive_only": false,
+  "history": [
+    {
+      "epoch": 1.0,
+      "train_loss": 0.28416168339574255,
+      "lr": 0.001
+    },
+    {
+      "epoch": 2.0,
+      "train_loss": 0.19672592568873282,
+      "lr": 0.001
+    },
+    {
+      "epoch": 3.0,
+      "train_loss": 0.20887250005195615,
+      "lr": 0.001
+    },
+    {
+      "epoch": 4.0,
+      "train_loss": 0.2080930071251901,
+      "lr": 0.0001
+    },
+    {
+      "epoch": 5.0,
+      "train_loss": 0.20123556787365932,
+      "lr": 0.0001
+    },
+    {
+      "epoch": 6.0,
+      "train_loss": 0.1991037121590446,
+      "lr": 0.0001
+    },
+    {
+      "epoch": 7.0,
+      "train_loss": 0.2027248712005734,
+      "lr": 0.0001
+    },
+    {
+      "epoch": 8.0,
+      "train_loss": 0.2057937145718947,
+      "lr": 1e-05
+    },
+    {
+      "epoch": 9.0,
+      "train_loss": 0.19655466429799437,
+      "lr": 1e-05
+    },
+    {
+      "epoch": 10.0,
+      "train_loss": 0.19881717764827259,
+      "lr": 1e-05
+    },
+    {
+      "epoch": 11.0,
+      "train_loss": 0.20098607952051092,
+      "lr": 1e-05
+    },
+    {
+      "epoch": 12.0,
+      "train_loss": 0.20081896507257133,
+      "lr": 1.0000000000000002e-06
+    }
+  ],
+  "torchvision_model": "fasterrcnn_mobilenet_v3_large_fpn"
+}
+Running time: 29041.806410312653 s.
 
 """

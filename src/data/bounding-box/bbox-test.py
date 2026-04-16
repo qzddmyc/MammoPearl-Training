@@ -28,7 +28,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision.models.detection import FasterRCNN
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-from torchvision.models.detection.faster_rcnn import fasterrcnn_mobilenet_v3_large_320_fpn
+from torchvision.models.detection.faster_rcnn import fasterrcnn_mobilenet_v3_large_fpn
 from torchvision.ops import box_iou
 
 try:
@@ -160,9 +160,9 @@ def collate_fn(batch):
 
 def build_model(num_classes: int = 2) -> FasterRCNN:
     try:
-        model = fasterrcnn_mobilenet_v3_large_320_fpn(weights=None, weights_backbone=None)
+        model = fasterrcnn_mobilenet_v3_large_fpn(weights=None, weights_backbone=None)
     except TypeError:
-        model = fasterrcnn_mobilenet_v3_large_320_fpn(pretrained=False, pretrained_backbone=False)  # type: ignore[call-arg]
+        model = fasterrcnn_mobilenet_v3_large_fpn(pretrained=False, pretrained_backbone=False)  # type: ignore[call-arg]
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
     return model
@@ -470,3 +470,70 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+"""
+
+$ python src/data/bounding-box/bbox-test.py --score-threshold 0.1
+{
+  "images": 4000,
+  "gt_boxes": 447,
+  "pred_boxes": 1708,
+  "tp": 87,
+  "fp": 1621,
+  "fn": 360,
+  "precision": 0.050936768149882905,
+  "recall": 0.19463087248322147,
+  "f1": 0.08074245939675175,
+  "image_accuracy": 0.72425,
+  "mean_iou": 0.6947889567791731,
+  "mean_abs_error": {
+    "xmin": 29.78919219970703,
+    "ymin": 16.525043487548828,
+    "xmax": 29.812847137451172,
+    "ymax": 21.54195213317871
+  }
+}
+
+$ python src/data/bounding-box/bbox-test.py --score-threshold 0.2
+{
+  "images": 4000,
+  "gt_boxes": 447,
+  "pred_boxes": 639,
+  "tp": 56,
+  "fp": 583,
+  "fn": 391,
+  "precision": 0.08763693270735524,
+  "recall": 0.12527964205816555,
+  "f1": 0.10313075506445674,
+  "image_accuracy": 0.83675,
+  "mean_iou": 0.6972921724830355,
+  "mean_abs_error": {
+    "xmin": 31.927339553833008,
+    "ymin": 15.799338340759277,
+    "xmax": 31.565969467163086,
+    "ymax": 20.72801399230957
+  }
+}
+
+$ python src/data/bounding-box/bbox-test.py --score-threshold 0.3
+{
+  "images": 4000,
+  "gt_boxes": 447,
+  "pred_boxes": 305,
+  "tp": 40,
+  "fp": 265,
+  "fn": 407,
+  "precision": 0.13114754098360656,
+  "recall": 0.0894854586129754,
+  "f1": 0.10638297872340427,
+  "image_accuracy": 0.8765,
+  "mean_iou": 0.6958038419485092,
+  "mean_abs_error": {
+    "xmin": 32.75843048095703,
+    "ymin": 17.093406677246094,
+    "xmax": 30.962665557861328,
+    "ymax": 24.175111770629883
+  }
+}
+
+"""
