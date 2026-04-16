@@ -15,8 +15,11 @@ MammoPearl-Training/
 │   │   ├── images_png/                 # 原始数据目录
 │   │   │   └── dataset.sha256          # 数据集完整性校验文件
 │   │   └── vindr_detection_folds.csv   # 数据集划分文件
-│   └── processed/
-│       └── images_png/     # 预处理后的数据目录
+│   ├── processed/
+│   │   └── images_png/     # 预处理后的数据目录
+│   └── segmented/          # 分割后的图像
+│       ├── base/           # 基于 processed 的原图
+│       └── mask/           # 遮罩
 ├── src/
 │   ├── init/
 │   │   └── download-dataset.py         # 原始数据下载脚本
@@ -26,6 +29,7 @@ MammoPearl-Training/
 │       └── bounding-box/   # 标注框预测模型的训练
 │
 ├── tools/                  # 工具文件
+├── models/                 # 训练产出的模型
 ├── README.md
 ├── build_dataset.sh        # 项目及数据集初始化脚本
 └── requirements.txt        # Python 依赖列表

@@ -1,5 +1,5 @@
 # use: 
-# python src/data/bounding-box/bbox-test.py --score-threshold 0.3
+# python src/data/bounding-box/bbox-test.py --score-threshold 0.2
 
 
 """Evaluate a bbox detector on the VinDr test split.
