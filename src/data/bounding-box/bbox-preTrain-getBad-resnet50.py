@@ -452,3 +452,13 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+"""output:
+
+root@autodl-container-e0dc46b58e-0f0a0b5b:~/autodl-tmp/MammoPearl-Training# python src/data/bounding-box/bbox-preTrain-getBad-resnet50.py --epochs 1 --batch-size 2
+Total images: 16000; positives: 1411; negatives: 14589
+[Sum] count = 8000
+[Sum] bad data count = 0
+
+"""

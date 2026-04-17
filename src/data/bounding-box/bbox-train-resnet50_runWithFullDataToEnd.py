@@ -1,57 +1,8 @@
-# 使用 fasterrcnn_resnet50_fpn 模型对数据集进行训练
-# 这个样本中的 bad data 使用 bad_data_record_resnet50.csv，但是跑完筛选程序后，会发现这是一个空集合。
+# 这个版本没有 validation 集的划分与"提早终止"的代码，但是去除了对单个 epoch 中正负样本 1:1 的分配。
 
-# 使用这个模型去训练会耗费很长的时间，需要注意
-
-# If your computer is GREAT, use this to run fuckingly:
-# python src/data/bounding-box/bbox-train-resnet50.py --epochs 12 --batch-size 8 --fuck-running --lr 0.005 --freeze-epochs 4
-
-# Otherwise, use:
-# python src/data/bounding-box/bbox-train-resnet50.py --epochs 12 --batch-size 2 --accumulation-steps 4 --lr 0.005 --freeze-epochs 4
-
-# try:
+# run:
 # python src/data/bounding-box/bbox-train-resnet50.py --epochs 12 --batch-size 2 --accumulation-steps 4 --lr 0.005 --freeze-epochs 4 --roi-batch-size-per-image 256 --roi-positive-fraction 0.1
 
-"""Train a breast lesion bounding-box detector from VinDr detection CSV.
-
-This script reads `data/raw/vindr_detection_folds.csv`, matches each row to
-`data/processed/images_png/<patient_id>/<image_id>`, and trains a Faster
-R-CNN detector to predict lesion bounding boxes (xmin, ymin, xmax, ymax).
-
-Model checkpoint is saved to `models/bbox_resnet50.pth`.
-
-
-Update prompts:
-1.  针对训练后期 Loss 卡在 0.19 左右无法下降的问题，需从学习率策略、
-    模型结构和优化器等方面进行系统性干预，打破局部最优解。
-2.  引入学习率 Warmup 机制，防止初始训练时因梯度过大破坏预训练权重，并提供合理的初始学习率设定。
-3.  增加权重衰减（Weight Decay）的配置参数，通过正则化手段有效防止模型在较小数据集上过拟合。
-4.  新增命令行参数 "--fuck-running" 作为算力切换开关：
-    当不含此参数时，代码需在 batch_size=2 的前提下通过累积 4 个 step 再执行 optimizer.step()
-    来变相实现 batch_size=8 的梯度累积；
-    当存在该参数时，直接使用配置的较大 batch_size 进行正常训练，
-    --同时两种模式下都必须保持每个 batch 内合理的正负样本混合比例。--(此行需要剔除，逻辑已删)
- *  fix: 在算得正样本时，需要按照比例上取整，以防止正样本丢失。
-5.  针对 912x1520 的高分辨率医疗影像数据，修改模型的 AnchorGenerator，为其添加 8 和 16 这
-    样更小的 scale 尺寸，以强化微小病灶的检测能力。6. 优化训练策略，除了在 DataLoader 端保持正
-    负样本比之外，还需通过调整模型内部的 ROI 采样比例等参数，变相实现 Hard Negative Mining（挖掘难例）。
-7.  实现渐冻层训练策略：在训练初期主动冻结 ResNet 的 layer1 和 layer2 层，仅训练 FPN 和检测头；
-    在设定的几轮 Epoch 之后，全量解冻这些底层网络进行全局微调。
-8.  强制采用 torchvision 中的 fasterrcnn_resnet50_fpn_v2 版本模型，以利用其更先进的
-    数据增强策略和优化过的 FPN 特征提取结构。
-  * feat: 需要使用 FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT 权重。 
------------
-9.  取消对每一个 epoch、batch 的样本强制比例分配，保留原始的正负样本比例。
-    即，对每个 epoch 使用全量样本（除了被分为验证集的）直接进行训练，
-    另外，每个 epoch 中，在样本内部通过 shuffle=True 来打乱，以防止模型的过拟合。
-10. 从 training 中自行划出约 15% 作为验证集；划分优先按 patient_id 进行，避免同一 patient 同时
-    出现在 train 和 val；划分后尽量保持原始正负分布；验证集完全不参与训练，不参与反向传播。不做任何
-    采样干预，保持真实分布。不使用 shuffle；使用验证集指标作为保存最佳模型的标准，优先推荐 F1；
-    每个 epoch 后，如果当前指标优于历史最佳，则保存 best checkpoint；若验证集指标连续 N 个 epoch 没
-    有提升，则停止训练，N 由参数控制。
-    [注意] 这个版本保存的模型是效果最佳的一轮模型，而不是最终一轮的训练成果。
-
-"""
 
 from __future__ import annotations
 
@@ -70,7 +21,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 from torchvision.models.detection import FasterRCNN
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.rpn import AnchorGenerator
@@ -178,7 +129,7 @@ class VinDrBboxDataset(Dataset):
                 boxes = np.zeros((0, 4), dtype=np.float32)
             else:
                 boxes = valid.to_numpy(dtype=np.float32)
-
+            
             image_path = images_root / str(patient_id) / f"{image_id}"
 
             if boxes.size > 0:
@@ -255,304 +206,6 @@ class VinDrBboxDataset(Dataset):
 def collate_fn(batch):
     images, targets = zip(*batch)
     return list(images), list(targets)
-
-
-def summarize_subset(samples: List[Sample], indices: List[int]) -> Dict[str, Any]:
-    """Summarize a dataset subset without changing its distribution."""
-    if not indices:
-        return {
-            "images": 0,
-            "patients": 0,
-            "positive_images": 0,
-            "negative_images": 0,
-            "positive_ratio": 0.0,
-        }
-
-    patient_ids = {samples[i].patient_id for i in indices}
-    positive_images = sum(1 for i in indices if samples[i].boxes.size > 0)
-    negative_images = len(indices) - positive_images
-    positive_ratio = float(positive_images / max(len(indices), 1))
-
-    return {
-        "images": int(len(indices)),
-        "patients": int(len(patient_ids)),
-        "positive_images": int(positive_images),
-        "negative_images": int(negative_images),
-        "positive_ratio": float(positive_ratio),
-    }
-
-
-def split_train_val_by_patient(
-    samples: List[Sample],
-    val_ratio: float,
-    seed: int,
-    bad_set: Optional[set[tuple[str, str]]] = None,
-) -> Tuple[List[int], List[int], Dict[str, Any]]:
-    """Split training data into train/val at the patient level.
-
-    The split is patient-level to prevent leakage, and it tries to keep the
-    original positive/negative distribution approximately stable by selecting
-    roughly the same proportion of positive-patient and negative-patient images.
-    """
-    usable_indices: List[int] = []
-    for idx, sample in enumerate(samples):
-        if bad_set and (sample.patient_id, sample.image_id) in bad_set:
-            continue
-        usable_indices.append(idx)
-
-    patient_to_records: Dict[str, Dict[str, Any]] = {}
-    for idx in usable_indices:
-        sample = samples[idx]
-        record = patient_to_records.setdefault(
-            sample.patient_id,
-            {
-                "patient_id": sample.patient_id,
-                "indices": [],
-                "num_images": 0,
-                "pos_images": 0,
-                "neg_images": 0,
-            },
-        )
-        record["indices"].append(idx)
-        record["num_images"] += 1
-        if sample.boxes.size > 0:
-            record["pos_images"] += 1
-        else:
-            record["neg_images"] += 1
-
-    records = list(patient_to_records.values())
-    if not records:
-        raise ValueError("No usable samples remain after filtering bad data.")
-
-    positive_records = [r for r in records if r["pos_images"] > 0]
-    negative_records = [r for r in records if r["pos_images"] == 0]
-
-    def choose_val_patients(group_records: List[Dict[str, Any]], ratio: float, seed_offset: int) -> set[str]:
-        if not group_records:
-            return set()
-
-        group_total_images = sum(r["num_images"] for r in group_records)
-        target_images = int(round(group_total_images * ratio))
-        if target_images <= 0:
-            return set()
-
-        rng = random.Random(seed + seed_offset)
-        remaining = group_records.copy()
-        rng.shuffle(remaining)
-
-        selected: List[Dict[str, Any]] = []
-        current = 0
-
-        while remaining and current < target_images:
-            current_diff = abs(current - target_images)
-            best_idx = None
-            best_key = None
-
-            for i, rec in enumerate(remaining):
-                new_current = current + rec["num_images"]
-                key = (abs(new_current - target_images), -rec["num_images"])
-                if best_key is None or key < best_key:
-                    best_key = key
-                    best_idx = i
-
-            if best_idx is None:
-                break
-
-            candidate = remaining[best_idx]
-            new_diff = abs((current + candidate["num_images"]) - target_images)
-
-            # Accept the candidate if it improves the target distance,
-            # or if we still have very little validation data selected.
-            if (not selected) or (new_diff <= current_diff) or (current < target_images * 0.85):
-                selected.append(candidate)
-                current += candidate["num_images"]
-                remaining.pop(best_idx)
-            else:
-                break
-
-        if not selected:
-            selected = [max(group_records, key=lambda r: r["num_images"])]
-
-        return {r["patient_id"] for r in selected}
-
-    val_patient_ids = set()
-    val_patient_ids |= choose_val_patients(positive_records, val_ratio, 101)
-    val_patient_ids |= choose_val_patients(negative_records, val_ratio, 202)
-
-    train_indices = [idx for idx in usable_indices if samples[idx].patient_id not in val_patient_ids]
-    val_indices = [idx for idx in usable_indices if samples[idx].patient_id in val_patient_ids]
-
-    # Fallback: if the patient-level split is empty on one side, keep training usable.
-    if not train_indices and usable_indices:
-        print("[Warning] Patient-level split produced an empty training split; falling back to using all usable samples for training.")
-        train_indices = usable_indices.copy()
-        val_indices = []
-
-    if not val_indices and usable_indices:
-        print("[Warning] Patient-level split produced an empty validation split; moving one whole patient to validation.")
-        fallback_patient = max(records, key=lambda r: r["num_images"])
-        val_patient_ids = {fallback_patient["patient_id"]}
-        train_indices = [idx for idx in usable_indices if samples[idx].patient_id not in val_patient_ids]
-        val_indices = [idx for idx in usable_indices if samples[idx].patient_id in val_patient_ids]
-
-    train_indices.sort()
-    val_indices.sort()
-
-    summary = {
-        "val_ratio": float(val_ratio),
-        "usable_images": int(len(usable_indices)),
-        "usable_patients": int(len(records)),
-        "train": summarize_subset(samples, train_indices),
-        "val": summarize_subset(samples, val_indices),
-        "train_patients": int(len({samples[i].patient_id for i in train_indices})),
-        "val_patients": int(len({samples[i].patient_id for i in val_indices})),
-    }
-    return train_indices, val_indices, summary
-
-
-def compute_iou_matrix(boxes1: np.ndarray, boxes2: np.ndarray) -> np.ndarray:
-    """Compute IoU matrix for two box sets in xyxy format."""
-    boxes1 = np.asarray(boxes1, dtype=np.float32).reshape(-1, 4)
-    boxes2 = np.asarray(boxes2, dtype=np.float32).reshape(-1, 4)
-
-    if boxes1.size == 0 or boxes2.size == 0:
-        return np.zeros((boxes1.shape[0], boxes2.shape[0]), dtype=np.float32)
-
-    x1 = np.maximum(boxes1[:, None, 0], boxes2[None, :, 0])
-    y1 = np.maximum(boxes1[:, None, 1], boxes2[None, :, 1])
-    x2 = np.minimum(boxes1[:, None, 2], boxes2[None, :, 2])
-    y2 = np.minimum(boxes1[:, None, 3], boxes2[None, :, 3])
-
-    inter_w = np.clip(x2 - x1, a_min=0.0, a_max=None)
-    inter_h = np.clip(y2 - y1, a_min=0.0, a_max=None)
-    inter = inter_w * inter_h
-
-    area1 = np.clip(boxes1[:, 2] - boxes1[:, 0], a_min=0.0, a_max=None) * np.clip(
-        boxes1[:, 3] - boxes1[:, 1], a_min=0.0, a_max=None
-    )
-    area2 = np.clip(boxes2[:, 2] - boxes2[:, 0], a_min=0.0, a_max=None) * np.clip(
-        boxes2[:, 3] - boxes2[:, 1], a_min=0.0, a_max=None
-    )
-
-    union = area1[:, None] + area2[None, :] - inter
-    return inter / np.clip(union, a_min=1e-6, a_max=None)
-
-
-def match_predictions_to_gt(
-    pred_boxes: np.ndarray,
-    pred_scores: np.ndarray,
-    gt_boxes: np.ndarray,
-    score_threshold: float,
-    iou_threshold: float,
-) -> Tuple[int, int, int]:
-    """Greedy one-to-one matching to compute TP / FP / FN for one image."""
-    pred_boxes = np.asarray(pred_boxes, dtype=np.float32).reshape(-1, 4)
-    pred_scores = np.asarray(pred_scores, dtype=np.float32).reshape(-1)
-    gt_boxes = np.asarray(gt_boxes, dtype=np.float32).reshape(-1, 4)
-
-    if pred_boxes.shape[0] == 0:
-        return 0, 0, int(gt_boxes.shape[0])
-    if gt_boxes.shape[0] == 0:
-        return 0, int(pred_boxes.shape[0]), 0
-
-    keep = pred_scores >= float(score_threshold)
-    pred_boxes = pred_boxes[keep]
-    pred_scores = pred_scores[keep]
-
-    if pred_boxes.shape[0] == 0:
-        return 0, 0, int(gt_boxes.shape[0])
-
-    order = np.argsort(-pred_scores)
-    pred_boxes = pred_boxes[order]
-
-    ious = compute_iou_matrix(pred_boxes, gt_boxes)
-    matched_gt = np.zeros((gt_boxes.shape[0],), dtype=bool)
-
-    tp = 0
-    for pred_idx in range(pred_boxes.shape[0]):
-        unmatched = np.where(~matched_gt)[0]
-        if unmatched.size == 0:
-            break
-
-        best_rel = int(unmatched[int(np.argmax(ious[pred_idx, unmatched]))])
-        best_iou = float(ious[pred_idx, best_rel])
-
-        if best_iou >= float(iou_threshold):
-            matched_gt[best_rel] = True
-            tp += 1
-
-    fp = int(pred_boxes.shape[0] - tp)
-    fn = int(gt_boxes.shape[0] - tp)
-    return tp, fp, fn
-
-
-def validate_one_epoch(
-    model: FasterRCNN,
-    loader: DataLoader,
-    device: torch.device,
-    score_threshold: float,
-    iou_threshold: float,
-    epoch: int,
-    epochs: int,
-) -> Dict[str, float]:
-    """Validate one epoch without gradient computation."""
-    model.eval()
-
-    total_tp = 0
-    total_fp = 0
-    total_fn = 0
-    total_images = 0
-    total_gt_boxes = 0
-    total_pred_boxes = 0
-
-    pbar = tqdm(loader, desc=f"val {epoch + 1}/{epochs}", leave=False)
-
-    with torch.no_grad():
-        for images, targets in pbar:
-            images = [img.to(device) for img in images]
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-
-            outputs = model(images)
-
-            for output, target in zip(outputs, targets):
-                total_images += 1
-
-                pred_boxes = output.get("boxes", torch.zeros((0, 4), device=device)).detach().cpu().numpy()
-                pred_scores = output.get("scores", torch.zeros((0,), device=device)).detach().cpu().numpy()
-                gt_boxes = target["boxes"].detach().cpu().numpy()
-
-                total_gt_boxes += int(gt_boxes.shape[0])
-
-                # Apply the same score threshold used during validation statistics.
-                keep = pred_scores >= float(score_threshold)
-                total_pred_boxes += int(np.sum(keep))
-
-                tp, fp, fn = match_predictions_to_gt(
-                    pred_boxes=pred_boxes,
-                    pred_scores=pred_scores,
-                    gt_boxes=gt_boxes,
-                    score_threshold=score_threshold,
-                    iou_threshold=iou_threshold,
-                )
-                total_tp += tp
-                total_fp += fp
-                total_fn += fn
-
-    precision = float(total_tp / max(total_tp + total_fp, 1))
-    recall = float(total_tp / max(total_tp + total_fn, 1))
-    f1 = float((2.0 * precision * recall) / max(precision + recall, 1e-12))
-
-    return {
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "tp": float(total_tp),
-        "fp": float(total_fp),
-        "fn": float(total_fn),
-        "images": float(total_images),
-        "gt_boxes": float(total_gt_boxes),
-        "pred_boxes": float(total_pred_boxes),
-    }
 
 
 def build_model(
@@ -637,6 +290,22 @@ def unfreeze_backbone_layers(model: FasterRCNN) -> None:
     for name, param in model.named_parameters():
         if "backbone" in name and ("layer1" in name or "layer2" in name):
             param.requires_grad = True
+
+
+# def build_model(num_classes: int = 2) -> FasterRCNN:
+#     """Build a Faster R-CNN detector with a single foreground class."""
+#     try:
+#         model = fasterrcnn_mobilenet_v3_large_320_fpn(
+#             weights=None,
+#             weights_backbone=None,
+#         )
+#     except TypeError:
+#         # Compatibility with older torchvision versions.
+#         model = fasterrcnn_mobilenet_v3_large_320_fpn(pretrained=False, pretrained_backbone=False)  # type: ignore[call-arg]
+
+#     in_features = model.roi_heads.box_predictor.cls_score.in_features
+#     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+#     return model
 
 
 def train_one_epoch(
@@ -750,16 +419,10 @@ def parse_args() -> argparse.Namespace:
         "--save-path",
         type=Path,
         default=None,
-        help="Best checkpoint path (default: models/bbox_resnet50.pth)",
+        help="Output checkpoint path (default: models/bbox_resnet50.pth)",
     )
     parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--val-batch-size", type=int, default=1)
-    parser.add_argument("--val-ratio", type=float, default=0.15)
-    parser.add_argument("--val-score-threshold", type=float, default=0.5)
-    parser.add_argument("--val-iou-threshold", type=float, default=0.5)
-    parser.add_argument("--patience", type=int, default=5)
-    parser.add_argument("--min-delta", type=float, default=0.0)
     parser.add_argument("--lr", type=float, default=0.005, help="Base learning rate (after warmup)")
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=0.0005)
@@ -806,21 +469,17 @@ def main() -> None:
     set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Build the full training split first, then split it into train/validation
-    # at the patient level so that the same patient never appears on both sides.
     train_dataset = VinDrBboxDataset(
         csv_path=csv_path,
         images_root=images_root,
         split_name="training",
-        positive_only=False,
+        positive_only=args.positive_only,
     )
 
     # Read bad data record (if exists) and build a set of (patient_id,image_id)
     bad_record_path = Path(__file__).resolve().parent / "bad_data_record_resnet50.csv"
     bad_set = set()
     if bad_record_path.exists():
-        print("[Info] Bad data file record found.")
         try:
             with bad_record_path.open("r", newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
@@ -831,47 +490,13 @@ def main() -> None:
                         bad_set.add((str(pid), str(iid)))
         except Exception:
             bad_set = set()
-    else:
-        print("[Info] bad data not found, use empty set instead.")
 
-    usable_indices = [i for i, s in enumerate(train_dataset.samples) if (s.patient_id, s.image_id) not in bad_set]
-    pos_indices = [i for i in usable_indices if train_dataset.samples[i].boxes.size > 0]
-    neg_indices = [i for i in usable_indices if train_dataset.samples[i].boxes.size == 0]
+    pos_indices = [i for i, s in enumerate(train_dataset.samples) if s.boxes.size > 0 and (s.patient_id, s.image_id) not in bad_set]
+    neg_indices = [i for i, s in enumerate(train_dataset.samples) if s.boxes.size == 0 and (s.patient_id, s.image_id) not in bad_set]
 
-    train_indices, val_indices, split_summary = split_train_val_by_patient(
-        samples=train_dataset.samples,
-        val_ratio=float(args.val_ratio),
-        seed=int(args.seed),
-        bad_set=bad_set,
-    )
-
-    # Keep the existing positive-only behavior for training only.
-    # Validation must remain untouched so that it keeps the real distribution.
-    if args.positive_only:
-        positive_train_indices = [i for i in train_indices if train_dataset.samples[i].boxes.size > 0]
-        if positive_train_indices:
-            train_indices = positive_train_indices
-        else:
-            print("Warning: positive_only enabled but no positive samples remain in training split; falling back to mixed training split.")
-
-    train_indices.sort()
-    val_indices.sort()
-
-    train_summary = summarize_subset(train_dataset.samples, train_indices)
-    val_summary = summarize_subset(train_dataset.samples, val_indices)
-
-    split_summary["train"] = train_summary
-    split_summary["val"] = val_summary
-    split_summary["train_patients"] = int(len({train_dataset.samples[i].patient_id for i in train_indices}))
-    split_summary["val_patients"] = int(len({train_dataset.samples[i].patient_id for i in val_indices}))
-
-    train_subset = Subset(train_dataset, train_indices)
-    val_subset = Subset(train_dataset, val_indices)
-
-    if len(train_subset) == 0:
-        raise ValueError("Training split is empty after patient-level split and filtering.")
-    if len(val_subset) == 0:
-        raise ValueError("Validation split is empty. Please check the CSV and splitting logic.")
+    if len(pos_indices) == 0:
+        print("Warning: no positive samples found in training split; using full dataset")
+        pos_indices = []
 
     # Parse anchor sizes from args
     anchor_sizes = tuple((int(s.strip()),) for s in str(args.anchor_sizes).split(",") if s.strip())
@@ -915,36 +540,66 @@ def main() -> None:
     except Exception:
         pass
 
-    print(f"Total usable images: {len(usable_indices)}; positives: {len(pos_indices)}; negatives: {len(neg_indices)}")
-    print(
-        f"Split summary | train images: {train_summary['images']} (pos={train_summary['positive_images']}, neg={train_summary['negative_images']}) "
-        f"| val images: {val_summary['images']} (pos={val_summary['positive_images']}, neg={val_summary['negative_images']})"
-    )
-    print(
-        f"Split summary | train patients: {split_summary['train_patients']} | val patients: {split_summary['val_patients']} | "
-        f"val_ratio≈{split_summary['val_ratio']}"
-    )
+    print(f"Total images: {len(train_dataset)}; positives: {len(pos_indices)}; negatives: {len(neg_indices)}")
     print(f"Device: {device}")
-
-    best_val_f1 = -float("inf")
-    best_epoch = 0
-    no_improve_epochs = 0
-
     for epoch in range(int(args.epochs)):
-        train_loader = DataLoader(
-            train_subset,
-            batch_size=int(args.batch_size),
-            shuffle=True,
-            num_workers=int(args.num_workers),
-            collate_fn=collate_fn,
-            pin_memory=torch.cuda.is_available(),
-        )
+        # For each epoch, build a 1:1 positive:negative subset if possible
+        # if len(pos_indices) > 0 and len(neg_indices) > 0:
+        #     rng = random.Random(int(args.seed) + epoch)
+        #     pair_count = min(len(pos_indices), len(neg_indices))
+        #     if pair_count == 0:
+        #         subset = train_dataset
+        #     else:
+        #         pos_sample = rng.sample(pos_indices, pair_count)
+        #         neg_sample = rng.sample(neg_indices, pair_count)
+        #         rng.shuffle(pos_sample)
+        #         rng.shuffle(neg_sample)
 
-        # Validation loader must not shuffle and must not use any sampling tricks.
-        val_loader = DataLoader(
-            val_subset,
-            batch_size=max(1, int(args.val_batch_size)),
-            shuffle=False,
+        #         B = max(1, int(args.batch_size))
+        #         pos_ptr = 0
+        #         neg_ptr = 0
+        #         epoch_order: List[int] = []
+        #         while pos_ptr < len(pos_sample) or neg_ptr < len(neg_sample):
+        #             if pos_ptr < len(pos_sample):
+        #                 p = min(max(1, B // 2), len(pos_sample) - pos_ptr)
+        #             else:
+        #                 p = 0
+        #             q = B - p
+        #             batch = []
+        #             if p > 0:
+        #                 batch.extend(pos_sample[pos_ptr: pos_ptr + p])
+        #                 pos_ptr += p
+        #             take_neg = min(q, len(neg_sample) - neg_ptr)
+        #             if take_neg > 0:
+        #                 batch.extend(neg_sample[neg_ptr: neg_ptr + take_neg])
+        #                 neg_ptr += take_neg
+        #             if len(batch) < B:
+        #                 need = B - len(batch)
+        #                 more_neg = min(need, len(neg_sample) - neg_ptr)
+        #                 if more_neg > 0:
+        #                     batch.extend(neg_sample[neg_ptr: neg_ptr + more_neg])
+        #                     neg_ptr += more_neg
+        #                 need = B - len(batch)
+        #                 if need > 0 and pos_ptr < len(pos_sample):
+        #                     more_pos = min(need, len(pos_sample) - pos_ptr)
+        #                     batch.extend(pos_sample[pos_ptr: pos_ptr + more_pos])
+        #                     pos_ptr += more_pos
+        #             epoch_order.extend(batch)
+
+        #         subset = torch.utils.data.Subset(train_dataset, epoch_order)
+        # else:
+        #     subset = train_dataset
+
+        # # If we've built an ordered Subset above, avoid DataLoader shuffling to preserve per-batch pos/neg mixing
+        # use_shuffle = not isinstance(subset, torch.utils.data.Subset)
+
+        subset = train_dataset
+        use_shuffle = True
+
+        train_loader = DataLoader(
+            subset,
+            batch_size=int(args.batch_size),
+            shuffle=use_shuffle,
             num_workers=int(args.num_workers),
             collate_fn=collate_fn,
             pin_memory=torch.cuda.is_available(),
@@ -960,16 +615,7 @@ def main() -> None:
             if warmup_iters > 0:
                 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_iters)
 
-        avg_loss, optimizer_steps, avg_sublosses = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            device,
-            epoch,
-            int(args.epochs),
-            accumulation_steps,
-            warmup_scheduler,
-        )
+        avg_loss, optimizer_steps, avg_sublosses = train_one_epoch(model, train_loader, optimizer, device, epoch, int(args.epochs), accumulation_steps, warmup_scheduler)
 
         # Unfreeze backbone after configured freeze epochs
         rebuilt_this_epoch = False
@@ -986,16 +632,6 @@ def main() -> None:
                 lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, int(args.epochs) - epoch - 1), eta_min=1e-6)
             rebuilt_this_epoch = True
 
-        val_metrics = validate_one_epoch(
-            model=model,
-            loader=val_loader,
-            device=device,
-            score_threshold=float(args.val_score_threshold),
-            iou_threshold=float(args.val_iou_threshold),
-            epoch=epoch,
-            epochs=int(args.epochs),
-        )
-
         # Only step the epoch-level scheduler if we actually performed any optimizer.step()
         if optimizer_steps > 0 and not rebuilt_this_epoch:
             print(f"[Info] lr_scheduler.step() at epoch {epoch + 1}.")
@@ -1011,105 +647,34 @@ def main() -> None:
             "loss_box_reg": float(avg_sublosses.get("loss_box_reg", 0.0)),
             "loss_objectness": float(avg_sublosses.get("loss_objectness", 0.0)),
             "loss_rpn_box_reg": float(avg_sublosses.get("loss_rpn_box_reg", 0.0)),
-            "val_precision": float(val_metrics["precision"]),
-            "val_recall": float(val_metrics["recall"]),
-            "val_f1": float(val_metrics["f1"]),
-            "val_tp": float(val_metrics["tp"]),
-            "val_fp": float(val_metrics["fp"]),
-            "val_fn": float(val_metrics["fn"]),
         }
         history.append(record)
-
-        current_f1 = float(val_metrics["f1"])
-        improved = current_f1 > (best_val_f1 + float(args.min_delta))
-
-        if improved:
-            best_val_f1 = current_f1
-            best_epoch = epoch + 1
-            no_improve_epochs = 0
-
-            meta = {
-                "task": "bbox_detection",
-                "num_classes": 2,
-                "class_names": ["background", "lesion"],
-                "csv_path": str(csv_path),
-                "images_root": str(images_root),
-                "positive_only": bool(args.positive_only),
-                "history": history,
-                "torchvision_model": "fasterrcnn_resnet50_fpn_v2",
-                "anchor_sizes": str(args.anchor_sizes),
-                "roi_batch_size_per_image": int(args.roi_batch_size_per_image),
-                "roi_positive_fraction": float(args.roi_positive_fraction),
-                "val_ratio": float(args.val_ratio),
-                "val_score_threshold": float(args.val_score_threshold),
-                "val_iou_threshold": float(args.val_iou_threshold),
-                "patience": int(args.patience),
-                "min_delta": float(args.min_delta),
-                "best_epoch": int(best_epoch),
-                "best_val_precision": float(val_metrics["precision"]),
-                "best_val_recall": float(val_metrics["recall"]),
-                "best_val_f1": float(val_metrics["f1"]),
-                "split_summary": split_summary,
-            }
-            # Save the best checkpoint, not the last one.
-            save_checkpoint(save_path, model, meta)
-            print(f"[Info] Saved best checkpoint to: {save_path}")
-        else:
-            no_improve_epochs += 1
-
-        print(
-            f"Epoch {epoch + 1:03d}/{int(args.epochs):03d} | "
-            f"train_loss={avg_loss:.4f} | "
-            f"val_precision={val_metrics['precision']:.4f} | "
-            f"val_recall={val_metrics['recall']:.4f} | "
-            f"val_F1={val_metrics['f1']:.4f} | "
-            f"lr={record['lr']:.6f}"
-        )
+        print(f"Epoch {epoch + 1:03d}/{int(args.epochs):03d} | loss={avg_loss:.4f} | lr={record['lr']:.6f}")
         print(
             (
-                f"  Train sub-losses: loss_classifier={record['loss_classifier']:.6f}, "
+                f"  Sub-losses: loss_classifier={record['loss_classifier']:.6f}, "
                 f"loss_box_reg={record['loss_box_reg']:.6f}, "
                 f"loss_objectness={record['loss_objectness']:.6f}, "
                 f"loss_rpn_box_reg={record['loss_rpn_box_reg']:.6f}"
             )
         )
-        print(
-            f"  Val counts: TP={int(val_metrics['tp'])}, FP={int(val_metrics['fp'])}, FN={int(val_metrics['fn'])} | "
-            f"best_F1={best_val_f1:.4f} (epoch {best_epoch})"
-        )
 
-        if int(args.patience) > 0 and no_improve_epochs >= int(args.patience):
-            print(
-                f"[EarlyStopping] val_F1 has not improved for {int(args.patience)} consecutive epochs. "
-                f"Stopping at epoch {epoch + 1}."
-            )
-            break
-
-    final_meta = {
+    meta = {
         "task": "bbox_detection",
         "num_classes": 2,
         "class_names": ["background", "lesion"],
         "csv_path": str(csv_path),
         "images_root": str(images_root),
-        "positive_only": bool(args.positive_only),
+        "positive_only": args.positive_only,
         "history": history,
         "torchvision_model": "fasterrcnn_resnet50_fpn_v2",
         "anchor_sizes": str(args.anchor_sizes),
         "roi_batch_size_per_image": int(args.roi_batch_size_per_image),
         "roi_positive_fraction": float(args.roi_positive_fraction),
-        "val_ratio": float(args.val_ratio),
-        "val_score_threshold": float(args.val_score_threshold),
-        "val_iou_threshold": float(args.val_iou_threshold),
-        "patience": int(args.patience),
-        "min_delta": float(args.min_delta),
-        "best_epoch": int(best_epoch),
-        "best_val_f1": float(best_val_f1 if best_val_f1 != -float("inf") else 0.0),
-        "split_summary": split_summary,
     }
-
-    print(f"Best checkpoint saved at: {save_path}")
-    print(f"Best epoch: {best_epoch}, best val_F1: {final_meta['best_val_f1']:.4f}")
-    print(json.dumps(final_meta, ensure_ascii=False, indent=2))
+    save_checkpoint(save_path, model, meta)
+    print(f"Saved checkpoint to: {save_path}")
+    print(json.dumps(meta, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
@@ -1121,7 +686,237 @@ if __name__ == "__main__":
 r"""log
 
 Here gives the output log:
+root@autodl-container-e0dc46b58e-0f0a0b5b:~/autodl-tmp/MammoPearl-Training# python src/data/bounding-box/bbox-train-resnet50.py --epochs 12 --batch-size 2 --accumulation-steps 4 --lr 0.005 --freeze-epochs 4 --roi-batch-size-per-image 256 --roi-positive-fraction 0.1
+[Warning] Found 1 invalid boxes in /root/autodl-tmp/MammoPearl-Training/data/processed/images_png/118092d6244fabf9ac376d580aac8cbb/679a6515593f9692eb6a622b7b6b0aa0.png
+[Warning] Found 1 invalid boxes in /root/autodl-tmp/MammoPearl-Training/data/processed/images_png/9870e0438ed1f19cb85aaa32cf1e8830/ea8790b418b754139457d48e5228c077.png
+[Warning] Found 1 invalid boxes in /root/autodl-tmp/MammoPearl-Training/data/processed/images_png/9efd5f5c65ec8c402ec48f0ff7388562/5cd330a56ea7c77a1fa1181712966dbf.png
+[Warning] Found 1 invalid boxes in /root/autodl-tmp/MammoPearl-Training/data/processed/images_png/a8cb9adadef00fc473b1760cd7b513e4/7323314998471cde47c6fba70ae6d32c.png
+[Warning] Found 2 invalid boxes in /root/autodl-tmp/MammoPearl-Training/data/processed/images_png/df7c81d477ed6a29aa8e6e49c1719d03/7be2e5f9ade68ae2bfe4e5edb4968654.png
+[Warning] Found 1 invalid boxes in /root/autodl-tmp/MammoPearl-Training/data/processed/images_png/df7c81d477ed6a29aa8e6e49c1719d03/db70c6572ab2f8633feb484aa6d7d38d.png
+Total images: 16000; positives: 1411; negatives: 14589
+Device: cuda
+[Sum] count = 8000
+[Sum] bad data count = 0
+Epoch 001/012 | loss=0.0647 | lr=0.004915
+  Sub-losses: loss_classifier=0.016036, loss_box_reg=0.002185, loss_objectness=0.041585, loss_rpn_box_reg=0.004922
+[Sum] count = 8000
+[Sum] bad data count = 0
+Epoch 002/012 | loss=0.0185 | lr=0.004665
+  Sub-losses: loss_classifier=0.006629, loss_box_reg=0.003277, loss_objectness=0.004649, loss_rpn_box_reg=0.003902
+[Sum] count = 8000
+[Sum] bad data count = 0
+Epoch 003/012 | loss=0.0177 | lr=0.004268
+  Sub-losses: loss_classifier=0.006542, loss_box_reg=0.003420, loss_objectness=0.003973, loss_rpn_box_reg=0.003738
+[Sum] count = 8000
+[Sum] bad data count = 0
+[Info] Unfreezing backbone layers after 4 epochs and rebuilding optimizer
+[Warning] No optimizer.step() executed in epoch 4; skipping lr_scheduler.step() to avoid PyTorch warning.
+Epoch 004/012 | loss=0.0176 | lr=0.004268
+  Sub-losses: loss_classifier=0.006655, loss_box_reg=0.003638, loss_objectness=0.003820, loss_rpn_box_reg=0.003520
+[Sum] count = 8000
+[Sum] bad data count = 0
+Epoch 005/012 | loss=0.0182 | lr=0.004106
+  Sub-losses: loss_classifier=0.006986, loss_box_reg=0.003851, loss_objectness=0.003879, loss_rpn_box_reg=0.003465
+[Sum] count = 8000
+[Sum] bad data count = 0
+Epoch 006/012 | loss=0.0182 | lr=0.003643
+  Sub-losses: loss_classifier=0.007007, loss_box_reg=0.003904, loss_objectness=0.003810, loss_rpn_box_reg=0.003459
+[Sum] count = 8000
+[Sum] bad data count = 0
+Epoch 007/012 | loss=0.0181 | lr=0.002951
+  Sub-losses: loss_classifier=0.007062, loss_box_reg=0.003964, loss_objectness=0.003727, loss_rpn_box_reg=0.003386
+[Sum] count = 8000
+[Sum] bad data count = 0
+Epoch 008/012 | loss=0.0182 | lr=0.002134
+  Sub-losses: loss_classifier=0.007113, loss_box_reg=0.004024, loss_objectness=0.003721, loss_rpn_box_reg=0.003318
+[Sum] count = 8000
+[Sum] bad data count = 0
+Epoch 009/012 | loss=0.0180 | lr=0.001318
+  Sub-losses: loss_classifier=0.006972, loss_box_reg=0.004004, loss_objectness=0.003721, loss_rpn_box_reg=0.003278
+[Sum] count = 8000
+[Sum] bad data count = 0
+Epoch 010/012 | loss=0.0179 | lr=0.000626
+  Sub-losses: loss_classifier=0.006942, loss_box_reg=0.003949, loss_objectness=0.003731, loss_rpn_box_reg=0.003288
+[Sum] bad data count = 0
+Epoch 011/012 | loss=0.0179 | lr=0.000163
+  Sub-losses: loss_classifier=0.006931, loss_box_reg=0.004060, loss_objectness=0.003640, loss_rpn_box_reg=0.003243
+[Sum] count = 8000
+[Sum] bad data count = 0
+Epoch 012/012 | loss=0.0179 | lr=0.000001
+  Sub-losses: loss_classifier=0.006967, loss_box_reg=0.004044, loss_objectness=0.003688, loss_rpn_box_reg=0.003238
+Saved checkpoint to: /root/autodl-tmp/MammoPearl-Training/models/bbox_resnet50.pth
+{
+  "task": "bbox_detection",
+  "num_classes": 2,
+  "class_names": [
+    "background",
+    "lesion"
+  ],
+  "csv_path": "/root/autodl-tmp/MammoPearl-Training/data/raw/vindr_detection_folds.csv",
+  "images_root": "/root/autodl-tmp/MammoPearl-Training/data/processed/images_png",
+  "positive_only": false,
+  "history": [
+    {
+      "epoch": 1.0,
+      "train_loss": 0.06472857511289112,
+      "lr": 0.004914831602809505,
+      "loss_classifier": 0.016036115038230492,
+      "loss_box_reg": 0.0021851819014642613,
+      "loss_objectness": 0.04158486384589923,
+      "loss_rpn_box_reg": 0.004922414270649369
+    },
+    {
+      "epoch": 2.0,
+      "train_loss": 0.0184573096505992,
+      "lr": 0.004665130496759185,
+      "loss_classifier": 0.006628764671648241,
+      "loss_box_reg": 0.003277019441185985,
+      "loss_objectness": 0.004649497100574081,
+      "loss_rpn_box_reg": 0.003902028408299884
+    },
+    {
+      "epoch": 3.0,
+      "train_loss": 0.01767272539901751,
+      "lr": 0.004267913399575757,
+      "loss_classifier": 0.006541526366305334,
+      "loss_box_reg": 0.0034204899241792644,
+      "loss_objectness": 0.003972510376355785,
+      "loss_rpn_box_reg": 0.0037381986988425523
+    },
+    {
+      "epoch": 4.0,
+      "train_loss": 0.01763239026899464,
+      "lr": 0.004267913399575757,
+      "loss_classifier": 0.00665487932846554,
+      "loss_box_reg": 0.0036382419285605466,
+      "loss_objectness": 0.0038195468072117363,
+      "loss_rpn_box_reg": 0.0035197221993382754
+    },
+    {
+      "epoch": 5.0,
+      "train_loss": 0.018180692951746097,
+      "lr": 0.004105513678220977,
+      "loss_classifier": 0.006985727310020593,
+      "loss_box_reg": 0.0038508380654293435,
+      "loss_objectness": 0.00387930629272887,
+      "loss_rpn_box_reg": 0.003464821274677888
+    },
+    {
+      "epoch": 6.0,
+      "train_loss": 0.018180612547472264,
+      "lr": 0.00364303839957576,
+      "loss_classifier": 0.007007280627460205,
+      "loss_box_reg": 0.00390375095771833,
+      "loss_objectness": 0.00381049067861386,
+      "loss_rpn_box_reg": 0.0034590902723043654
+    },
+    {
+      "epoch": 7.0,
+      "train_loss": 0.018139016264714883,
+      "lr": 0.0029508952324650015,
+      "loss_classifier": 0.0070620254663135715,
+      "loss_box_reg": 0.003964037522728404,
+      "loss_objectness": 0.0037272323083925585,
+      "loss_rpn_box_reg": 0.003385720937035444
+    },
+    {
+      "epoch": 8.0,
+      "train_loss": 0.018176369273463933,
+      "lr": 0.002134456699787879,
+      "loss_classifier": 0.007113481099815544,
+      "loss_box_reg": 0.004023658248861579,
+      "loss_objectness": 0.003721292563666793,
+      "loss_rpn_box_reg": 0.0033179373779717025
+    },
+    {
+      "epoch": 9.0,
+      "train_loss": 0.017976241969943657,
+      "lr": 0.0013180181671107565,
+      "loss_classifier": 0.006972108300677064,
+      "loss_box_reg": 0.004004364301841292,
+      "loss_objectness": 0.0037212742548763346,
+      "loss_rpn_box_reg": 0.0032784950849704727
+    },
+    {
+      "epoch": 10.0,
+      "train_loss": 0.017909854239693233,
+      "lr": 0.0006258749999999975,
+      "loss_classifier": 0.006941743585968652,
+      "loss_box_reg": 0.003948992292609831,
+      "loss_objectness": 0.003731142747819831,
+      "loss_rpn_box_reg": 0.003287975607737053
+    },
+    {
+      "epoch": 11.0,
+      "train_loss": 0.017873965756032704,
+      "lr": 0.00016339972135478073,
+      "loss_classifier": 0.006930558845862834,
+      "loss_box_reg": 0.004060271261590572,
+      "loss_objectness": 0.0036396742334763987,
+      "loss_rpn_box_reg": 0.003243461453119835
+    },
+    {
+      "epoch": 12.0,
+      "train_loss": 0.017936786814731022,
+      "lr": 1e-06,
+      "loss_classifier": 0.006967201272960665,
+      "loss_box_reg": 0.00404361561392713,
+      "loss_objectness": 0.003687774866917607,
+      "loss_rpn_box_reg": 0.003238195093804279
+    }
+  ],
+  "torchvision_model": "fasterrcnn_resnet50_fpn_v2",
+  "anchor_sizes": "8,16,32,64,128",
+  "roi_batch_size_per_image": 256,
+  "roi_positive_fraction": 0.1
+}
+Running time: 14347.519656181335 s.
+
+"""
 
 
+r"""test info:
+
+root@autodl-container-e0dc46b58e-0f0a0b5b:~/autodl-tmp/MammoPearl-Training# python src/data/bounding-box/bbox-test-resnet50.py --ckpt-path models/bbox_resnet50.pth --score-threshold 0.9 --anchor-sizes 8,16,32,64,128
+{
+  "images": 4000,
+  "gt_boxes": 447,
+  "pred_boxes": 928,
+  "tp": 12,
+  "fp": 916,
+  "fn": 435,
+  "precision": 0.01293103448275862,
+  "recall": 0.026845637583892617,
+  "f1": 0.017454545454545452,
+  "image_accuracy": 0.90225,
+  "mean_iou": 0.6705907980600992,
+  "mean_abs_error": {
+    "xmin": 57.101043701171875,
+    "ymin": 51.92363357543945,
+    "xmax": 60.05610275268555,
+    "ymax": 42.688533782958984
+  }
+}
+
+root@autodl-container-e0dc46b58e-0f0a0b5b:~/autodl-tmp/MammoPearl-Training# python src/data/bounding-box/bbox-test-resnet50.py --ckpt-path models/bbox_resnet50.pth --score-threshold 0.5 --anchor-sizes 8,16,32,64,128
+{
+  "images": 4000,
+  "gt_boxes": 447,
+  "pred_boxes": 2018,
+  "tp": 54,
+  "fp": 1964,
+  "fn": 393,
+  "precision": 0.026759167492566897,
+  "recall": 0.12080536912751678,
+  "f1": 0.0438133874239351,
+  "image_accuracy": 0.85325,
+  "mean_iou": 0.6870159197736669,
+  "mean_abs_error": {
+    "xmin": 40.7904052734375,
+    "ymin": 34.36684036254883,
+    "xmax": 38.019290924072266,
+    "ymax": 25.974227905273438
+  }
+}
 
 """
