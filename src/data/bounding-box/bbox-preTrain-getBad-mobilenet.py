@@ -1,5 +1,5 @@
 # use:
-# python src/data/bounding-box/bbox-preTrain-getBad.py --epochs 1 --batch-size 2
+# python src/data/bounding-box/bbox-preTrain-getBad-mobilenet.py --epochs 1 --batch-size 2
 
 # 作用：预跑一遍，将 bad data (loss !== !Infinite) 保存到 csv 文件中
 
@@ -12,9 +12,10 @@ Here is the output for fasterrcnn_mobilenet_v3_large_fpn model:
 Total images: 16000; positives: 1411; negatives: 14589
 [Sum] count = 5022                                                                                                                           
 [Sum] bad data count = 2978
-"""
 
-"""Train script wrapper that records bad data entries when encountered.
+---------------------------------------
+
+Train script wrapper that records bad data entries when encountered.
 
 Run this script just like `bbox-train.py`. It behaves the same but whenever a
 batch produces non-finite losses (bad data), it records the corresponding

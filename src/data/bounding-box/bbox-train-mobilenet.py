@@ -8,7 +8,7 @@ This script reads `data/raw/vindr_detection_folds.csv`, matches each row to
 `data/processed/images_png/<patient_id>/<image_id>`, and trains a Faster
 R-CNN detector to predict lesion bounding boxes (xmin, ymin, xmax, ymax).
 
-Model checkpoint is saved to `models/bbox.pth`.
+Model checkpoint is saved to `models/bbox_mobilenet.pth`.
 """
 
 from __future__ import annotations
@@ -309,7 +309,7 @@ def parse_args() -> argparse.Namespace:
         "--save-path",
         type=Path,
         default=None,
-        help="Output checkpoint path (default: models/bbox.pth)",
+        help="Output checkpoint path (default: models/bbox_mobilenet.pth)",
     )
     parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=2)
@@ -332,7 +332,7 @@ def main() -> None:
 
     csv_path = args.csv_path or (root / "data" / "raw" / "vindr_detection_folds.csv")
     images_root = args.images_root or (root / "data" / "processed" / "images_png")
-    save_path = args.save_path or (root / "models" / "bbox.pth")
+    save_path = args.save_path or (root / "models" / "bbox_mobilenet.pth")
 
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV not found: {csv_path}")
@@ -526,7 +526,7 @@ Epoch 011/012 | loss=0.2010 | lr=0.000010
 [Sum] count = 1411                                                                                                                           
 [Sum] bad data count = 0
 Epoch 012/012 | loss=0.2008 | lr=0.000001
-Saved checkpoint to: D:\Codes\Github_Repositories\MammoPearl-Training\models\bbox.pth
+Saved checkpoint to: D:\Codes\Github_Repositories\MammoPearl-Training\models\bbox_mobilenet.pth
 {
   "task": "bbox_detection",
   "num_classes": 2,

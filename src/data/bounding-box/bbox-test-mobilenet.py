@@ -1,10 +1,10 @@
 # use: 
-# python src/data/bounding-box/bbox-test.py --score-threshold 0.2
+# python src/data/bounding-box/bbox-test-mobilenet.py --score-threshold 0.2
 
 
 """Evaluate a bbox detector on the VinDr test split.
 
-This script loads `models/bbox.pth`, runs inference on the test split, and
+This script loads `models/bbox_mobilenet.pth`, runs inference on the test split, and
 compares predicted boxes with ground-truth boxes using IoU-based matching.
 It reports:
 
@@ -428,7 +428,7 @@ def main() -> None:
     root = repo_root_from_file()
     csv_path = args.csv_path or (root / "data" / "raw" / "vindr_detection_folds.csv")
     images_root = args.images_root or (root / "data" / "processed" / "images_png")
-    ckpt_path = args.ckpt_path or (root / "models" / "bbox.pth")
+    ckpt_path = args.ckpt_path or (root / "models" / "bbox_mobilenet.pth")
 
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV not found: {csv_path}")
