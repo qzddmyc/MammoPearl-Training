@@ -188,8 +188,9 @@ def build_model(num_classes: int = 2, anchor_sizes: List[Tuple[int, ...]] | None
     except TypeError:
         try:
             from torchvision.models.detection import fasterrcnn_resnet50_fpn
-
-            model = fasterrcnn_resnet50_fpn(pretrained=False, pretrained_backbone=False, rpn_anchor_generator=anchor_generator)  # type: ignore[call-arg]
+            # Avoid deprecated `pretrained`/`pretrained_backbone` args by
+            # explicitly passing `weights=None` / `weights_backbone=None`.
+            model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None, rpn_anchor_generator=anchor_generator)  # type: ignore[call-arg]
         except Exception:
             model = fasterrcnn_resnet50_fpn_v2()
 

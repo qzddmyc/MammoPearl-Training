@@ -3,7 +3,7 @@
 
 # 使用这个模型去训练会耗费很长的时间，需要注意
 
-# If your computer is GREAT, use to run fuckingly:
+# If your computer is GREAT, use this to run fuckingly:
 # python src/data/bounding-box/bbox-train-resnet50.py --epochs 12 --batch-size 8 --fuck-running --lr 0.005 --freeze-epochs 4
 
 # Otherwise, use:
@@ -276,7 +276,9 @@ def build_model(
         try:
             from torchvision.models.detection import fasterrcnn_resnet50_fpn
 
-            model = fasterrcnn_resnet50_fpn(pretrained=False, pretrained_backbone=False, rpn_anchor_generator=anchor_generator)  # type: ignore[call-arg]
+            # Avoid deprecated `pretrained`/`pretrained_backbone` args by
+            # explicitly passing `weights=None` / `weights_backbone=None`.
+            model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None, rpn_anchor_generator=anchor_generator)  # type: ignore[call-arg]
         except Exception:
             model = fasterrcnn_resnet50_fpn_v2()
 
@@ -385,10 +387,9 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
-
-        # iter-level warmup step if provided
-        if warmup_scheduler is not None:
-            warmup_scheduler.step()
+            # Only advance the warmup scheduler at the same time as optimizer.step()
+            if warmup_scheduler is not None:
+                warmup_scheduler.step()
 
         batch_loss = float(loss.item())
         running_loss += batch_loss
