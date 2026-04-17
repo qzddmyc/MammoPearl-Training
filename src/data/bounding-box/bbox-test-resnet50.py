@@ -1,5 +1,5 @@
 # use: 
-# python src/data/bounding-box/bbox-test-resnet50.py --ckpt-path models/bbox_resnet50.pth --score-threshold 0.2 --anchor-sizes 8,16,32,64,128
+# python src/data/bounding-box/bbox-test-resnet50.py --ckpt-path models/bbox_resnet50.pth --score-threshold 0.9 --anchor-sizes 8,16,32,64,128
 
 
 """Evaluate a bbox detector on the VinDr test split.

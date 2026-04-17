@@ -1,3 +1,47 @@
+from __future__ import annotations
+
+"""
+修改建议：
+先跑一遍此代码，看看是不是 0.9 阈值下，框仍然很多，然后问问 AI下方的策略是否有用。
+
+1.  调整 IoU 阈值： 默认情况下，IoU > 0.5 就会被判定为正样本。对于乳腺病灶这种特征模糊
+    的目标，0.5 的阈值可能太低了。尝试将其提高到 0.6 或 0.7。这会强迫模型只学习那些定位
+    非常精准的框，减少由于“边界模糊”导致的误检。
+2.  Faster R-CNN 结构中，总损失由分类（Classification）和回归（Regression）两部分组成。
+    如果 FP 暴涨，说明模型的分类器（Classifier）太“激进”了。
+    人为调高分类损失在总 Loss 中的权重（Weight）。当模型把背景认成病灶时，给它一个更大的惩罚值。
+    这样模型在给出“0.9”的高分预测时会变得更加谨慎。
+3.  尝试完全去掉负样本，只用带有病灶的图像先进行 10(?) 个 Epoch 的“热身训练”，
+    热身之后再接着全量样本去训练。
+4.  若模型仍然报很多错误框，可以考虑：
+      - 加权分类 loss，loss = CE(pos) * 1.0 + CE(neg) * 2.0[or more]，加重负样本的权重
+      - 调整 roi-positive-fraction = 0.05 ~ 0.1，减少正样本的比例
+5.  核心：
+    [概括] 告诉损失函数，背景不值钱，病灶是无价之宝。错认一个病灶的代价，抵得上错认 10 个背景。
+    [提示词] 请帮我修改 Faster R-CNN 模型内部 ROI Head 的分类损失函数（Classification Loss）。
+        目前模型对背景和病灶的分类损失是同等权重的。我需要你介入 FastRCNNPredictor 或重写 roi_heads 的
+        损失计算逻辑，引入带权重的交叉熵损失（Weighted Cross-Entropy Loss）。请为类别赋予明确的
+        权重张量（Weight Tensor），例如设定 background 类的权重为 0.1，lesion 类的权重为 1.0 甚至更高。
+        以此来成倍增加模型漏报正样本的损失惩罚，削弱大量简单背景被正确识别时带来的 Loss 稀释效应。
+  * [概括] 降维打击的Focal Loss：其机制是，如果模型对某个背景有 99% 的把握，
+        它产生的那一丁点 Loss 会被直接乘上一个极小的系数（接近归零）；但如果模型对某个病灶犹豫不决，
+        它的 Loss 会被完全保留甚至放大。
+  * [提示词] 请对现有的 torchvision Faster R-CNN 模型进行深度定制。我要求用 Focal Loss 替换掉 ROI Head 中
+        默认的交叉熵分类损失（Cross Entropy Loss）。这是因为当前医疗影像正负样本极度不平衡，模型通过大量输出
+        高置信度的‘简单背景（Easy Negatives）’来压低了整体 Loss。请实现一个 Focal Loss 模块，并替换分类头的
+        计算逻辑。参数上，请暴露 gamma（建议默认值为 2.0，用于大幅削弱简单背景的 Loss 权重）和 alpha（用于调
+        节正负类别的基础平衡比），迫使模型只能通过学习难点（真实的病灶特征）来降低 Loss。
+    [概括] 只看错题：既然每次提取的 512 个 ROI 里有 400 个是毫无营养的纯背景，那我们算总分的时候，干脆把
+        这 400 个最高分的背景直接扔掉，只计算剩下 112 个最容易混淆的样本的 Loss。
+    [提示词] 请在 Faster R-CNN 的分类和回归损失计算中引入在线难例挖掘（OHEM, Online Hard Example Mining）机制。
+        目前模型在每个 Batch 中会平均所有采样 ROI 的 Loss，导致大量容易识别的负样本（纯黑背景）稀释了病灶的训练梯度。
+        我需要你在 ROI Head 计算损失时，不要使用默认的 mean() 均值。而是先算出所有候选框的独立 Loss，
+        对其进行降序排列，只保留 Loss 值排名前 K 个（例如前 20% 或 128 个最困难的样本）的损失进行反向传播，
+        将那些 Loss 极低的简单背景样本直接从反向传播的计算中剔除。
+"""
+
+
+
 # 使用 fasterrcnn_resnet50_fpn 模型对数据集进行训练
 # 这个样本中的 bad data 使用 bad_data_record_resnet50.csv，但是跑完筛选程序后，会发现这是一个空集合。
 
@@ -53,7 +97,6 @@ Update prompts:
 
 """
 
-from __future__ import annotations
 
 import argparse
 import json
