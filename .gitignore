@@ -10,6 +10,7 @@
 !/data/segmented/mask/.gitkeep
 
 *.pth
+*.bak
 
 /tmp/
 

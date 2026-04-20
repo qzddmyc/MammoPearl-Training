@@ -1,62 +1,87 @@
-from __future__ import annotations
-
-"""
-修改建议：
-先跑一遍此代码，看看是不是 0.9 阈值下，框仍然很多，然后问问 AI下方的策略是否有用。
-
-1.  调整 IoU 阈值： 默认情况下，IoU > 0.5 就会被判定为正样本。对于乳腺病灶这种特征模糊
-    的目标，0.5 的阈值可能太低了。尝试将其提高到 0.6 或 0.7。这会强迫模型只学习那些定位
-    非常精准的框，减少由于“边界模糊”导致的误检。
-2.  Faster R-CNN 结构中，总损失由分类（Classification）和回归（Regression）两部分组成。
-    如果 FP 暴涨，说明模型的分类器（Classifier）太“激进”了。
-    人为调高分类损失在总 Loss 中的权重（Weight）。当模型把背景认成病灶时，给它一个更大的惩罚值。
-    这样模型在给出“0.9”的高分预测时会变得更加谨慎。
-3.  尝试完全去掉负样本，只用带有病灶的图像先进行 10(?) 个 Epoch 的“热身训练”，
-    热身之后再接着全量样本去训练。
-4.  若模型仍然报很多错误框，可以考虑：
-      - 加权分类 loss，loss = CE(pos) * 1.0 + CE(neg) * 2.0[or more]，加重负样本的权重
-      - 调整 roi-positive-fraction = 0.05 ~ 0.1，减少正样本的比例
-5.  核心：
-    [概括] 告诉损失函数，背景不值钱，病灶是无价之宝。错认一个病灶的代价，抵得上错认 10 个背景。
-    [提示词] 请帮我修改 Faster R-CNN 模型内部 ROI Head 的分类损失函数（Classification Loss）。
-        目前模型对背景和病灶的分类损失是同等权重的。我需要你介入 FastRCNNPredictor 或重写 roi_heads 的
-        损失计算逻辑，引入带权重的交叉熵损失（Weighted Cross-Entropy Loss）。请为类别赋予明确的
-        权重张量（Weight Tensor），例如设定 background 类的权重为 0.1，lesion 类的权重为 1.0 甚至更高。
-        以此来成倍增加模型漏报正样本的损失惩罚，削弱大量简单背景被正确识别时带来的 Loss 稀释效应。
-  * [概括] 降维打击的Focal Loss：其机制是，如果模型对某个背景有 99% 的把握，
-        它产生的那一丁点 Loss 会被直接乘上一个极小的系数（接近归零）；但如果模型对某个病灶犹豫不决，
-        它的 Loss 会被完全保留甚至放大。
-  * [提示词] 请对现有的 torchvision Faster R-CNN 模型进行深度定制。我要求用 Focal Loss 替换掉 ROI Head 中
-        默认的交叉熵分类损失（Cross Entropy Loss）。这是因为当前医疗影像正负样本极度不平衡，模型通过大量输出
-        高置信度的‘简单背景（Easy Negatives）’来压低了整体 Loss。请实现一个 Focal Loss 模块，并替换分类头的
-        计算逻辑。参数上，请暴露 gamma（建议默认值为 2.0，用于大幅削弱简单背景的 Loss 权重）和 alpha（用于调
-        节正负类别的基础平衡比），迫使模型只能通过学习难点（真实的病灶特征）来降低 Loss。
-    [概括] 只看错题：既然每次提取的 512 个 ROI 里有 400 个是毫无营养的纯背景，那我们算总分的时候，干脆把
-        这 400 个最高分的背景直接扔掉，只计算剩下 112 个最容易混淆的样本的 Loss。
-    [提示词] 请在 Faster R-CNN 的分类和回归损失计算中引入在线难例挖掘（OHEM, Online Hard Example Mining）机制。
-        目前模型在每个 Batch 中会平均所有采样 ROI 的 Loss，导致大量容易识别的负样本（纯黑背景）稀释了病灶的训练梯度。
-        我需要你在 ROI Head 计算损失时，不要使用默认的 mean() 均值。而是先算出所有候选框的独立 Loss，
-        对其进行降序排列，只保留 Loss 值排名前 K 个（例如前 20% 或 128 个最困难的样本）的损失进行反向传播，
-        将那些 Loss 极低的简单背景样本直接从反向传播的计算中剔除。
-"""
-
-
-
 # 使用 fasterrcnn_resnet50_fpn 模型对数据集进行训练
 # 这个样本中的 bad data 使用 bad_data_record_resnet50.csv，但是跑完筛选程序后，会发现这是一个空集合。
 
 # 使用这个模型去训练会耗费很长的时间，需要注意
 
-# If your computer is GREAT, use this to run fuckingly:
-# python src/data/bounding-box/bbox-train-resnet50.py --epochs 12 --batch-size 8 --fuck-running --lr 0.005 --freeze-epochs 4
+# If your computer is GREAT, you can use "--fuck-running" to run in a big batch-size (8).
 
-# Otherwise, use:
-# python src/data/bounding-box/bbox-train-resnet50.py --epochs 12 --batch-size 2 --accumulation-steps 4 --lr 0.005 --freeze-epochs 4
+r"""
+推荐使用的运行参数:
 
-# try:
-# python src/data/bounding-box/bbox-train-resnet50.py --epochs 12 --batch-size 2 --accumulation-steps 4 --lr 0.005 --freeze-epochs 4 --roi-batch-size-per-image 256 --roi-positive-fraction 0.1
+1. Focal Loss + OHEM + Warmup + 更多 Epoch
 
-"""Train a breast lesion bounding-box detector from VinDr detection CSV.
+python src/data/bounding-box/bbox-train-resnet50.py \
+    --epochs 40 \
+    --batch-size 2 \
+    --accumulation-steps 4 \
+    --lr 0.005 \
+    --freeze-epochs 5 \
+    --roi-batch-size-per-image 512 \
+    --roi-positive-fraction 0.05 \
+    --anchor-sizes 16,32,64,128,256 \
+    --cls-loss-type focal \
+    --focal-gamma 2.0 \
+    --focal-alpha-bg 0.25 \
+    --focal-alpha-lesion 0.75 \
+    --ohem \
+    --ohem-ratio 0.2 \
+    --ohem-min-samples 128 \
+    --warmup-positive-epochs 8 \
+    --box-fg-iou-thresh 0.6 \
+    --patience 10
+
+- 40 epoch 总量，其中前 8 个仅用正样本热身，让模型先建立病灶特征表示
+- Focal Loss (gamma=2.0) 自动压制大量高置信度简单背景的 loss 贡献
+- OHEM 进一步过滤掉最无用的 easy negative，只保留前 20% 难例
+- IoU 阈值 0.6 减少边界模糊样本被当作正例
+- patience 放宽到 10（因为 epoch 多了，前期波动正常）
+
+2. Weighted CE 版本（如果更想显式控制权重）
+
+python src/data/bounding-box/bbox-train-resnet50.py \
+    --epochs 40 \
+    --batch-size 2 \
+    --accumulation-steps 4 \
+    --lr 0.005 \
+    --freeze-epochs 5 \
+    --roi-batch-size-per-image 512 \
+    --roi-positive-fraction 0.05 \
+    --anchor-sizes 16,32,64,128,256 \
+    --cls-loss-type weighted_ce \
+    --cls-weight-bg 0.1 \
+    --cls-weight-lesion 1.0 \
+    --warmup-positive-epochs 8 \
+    --box-fg-iou-thresh 0.6 \
+    --patience 10
+
+3. 如果 A 之后 FP 仍然很多，加重背景惩罚
+
+python src/data/bounding-box/bbox-train-resnet50.py \
+    --epochs 40 \
+    --batch-size 2 \
+    --accumulation-steps 4 \
+    --lr 0.005 \
+    --freeze-epochs 5 \
+    --roi-batch-size-per-image 512 \
+    --roi-positive-fraction 0.05 \
+    --anchor-sizes 16,32,64,128,256 \
+    --cls-loss-type focal \
+    --focal-gamma 3.0 \
+    --focal-alpha-bg 0.15 \
+    --focal-alpha-lesion 0.85 \
+    --ohem \
+    --ohem-ratio 0.15 \
+    --warmup-positive-epochs 10 \
+    --box-fg-iou-thresh 0.7 \
+    --patience 12
+
+- 差异点：gamma 提升到 3.0（更激进地压制简单样本），IoU 阈值到 0.7（更严格的正样本定义），alpha 进一步偏向病灶。
+
+============================================================================================================
+
+本文件介绍：
+
+Train a breast lesion bounding-box detector from VinDr detection CSV.
 
 This script reads `data/raw/vindr_detection_folds.csv`, matches each row to
 `data/processed/images_png/<patient_id>/<image_id>`, and trains a Faster
@@ -64,8 +89,12 @@ R-CNN detector to predict lesion bounding boxes (xmin, ymin, xmax, ymax).
 
 Model checkpoint is saved to `models/bbox_resnet50.pth`.
 
+============================================================================================================
 
-Update prompts:
+每次改进使用的提示词，以单横线分隔。
+
+Prompts for improvement:
+
 1.  针对训练后期 Loss 卡在 0.19 左右无法下降的问题，需从学习率策略、
     模型结构和优化器等方面进行系统性干预，打破局部最优解。
 2.  引入学习率 Warmup 机制，防止初始训练时因梯度过大破坏预训练权重，并提供合理的初始学习率设定。
@@ -94,9 +123,23 @@ Update prompts:
     每个 epoch 后，如果当前指标优于历史最佳，则保存 best checkpoint；若验证集指标连续 N 个 epoch 没
     有提升，则停止训练，N 由参数控制。
     [注意] 这个版本保存的模型是效果最佳的一轮模型，而不是最终一轮的训练成果。
+-----------
+11. 引入可切换的 ROI 分类损失策略（通过 --cls-loss-type 切换）：支持标准 CE、Weighted
+    Cross-Entropy 和 Focal Loss 三种模式。Weighted CE 为背景和病灶分别设定不同的类别权重，
+    用于调节正负样本对分类损失的贡献比例；Focal Loss 通过 gamma 参数自动降低简单样本的损失
+    贡献，迫使模型聚焦于困难样本的学习。
+12. 引入在线难例挖掘（OHEM）机制（通过 --ohem 开关启用）：先逐样本计算独立 loss，按困难度
+    降序排列后仅保留前 K 个最困难样本参与反向传播。K 取 --ohem-ratio 和 --ohem-min-samples
+    二者较大值。该策略可与任意损失函数组合使用。
+13. 将训练阶段 RPN 和 ROI Head 的 IoU 匹配阈值提取为命令行可配置参数
+    （--box-fg-iou-thresh / --box-bg-iou-thresh / --rpn-fg-iou-thresh / --rpn-bg-iou-thresh），
+    支持将 ROI 正样本 IoU 阈值从默认 0.5 上调至 0.6/0.7 以减少边界模糊导致的误检。
+14. 新增两阶段训练策略（positive-only warmup，通过 --warmup-positive-epochs 配置）：前 N 个
+    epoch 仅使用正样本图像训练，让模型先学习病灶特征；之后恢复全量样本训练。验证集保持真实分布。
 
 """
 
+from __future__ import annotations
 
 import argparse
 import json
@@ -117,6 +160,8 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision.models.detection import FasterRCNN
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.rpn import AnchorGenerator
+import torch.nn.functional as F
+import torchvision.models.detection.roi_heads as _roi_heads_module
 try:
     # prefer v2 when available and import associated weights helper
     from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2, FasterRCNN_ResNet50_FPN_V2_Weights
@@ -598,9 +643,133 @@ def validate_one_epoch(
     }
 
 
+class FocalLoss(torch.nn.Module):
+    """Focal Loss for multi-class classification (Lin et al., 2017)."""
+
+    def __init__(self, gamma: float = 2.0, alpha: Optional[torch.Tensor] = None):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce_loss = F.cross_entropy(inputs, targets, reduction="none")
+        pt = torch.exp(-ce_loss)
+        focal_weight = (1.0 - pt) ** self.gamma
+        if self.alpha is not None:
+            alpha_t = self.alpha.to(inputs.device)[targets]
+            focal_weight = focal_weight * alpha_t
+        return focal_weight * ce_loss
+
+
+def _custom_fastrcnn_loss(
+    class_logits,
+    box_regression,
+    labels,
+    regression_targets,
+    cls_loss_type="ce",
+    cls_weight=None,
+    focal_gamma=2.0,
+    focal_alpha=None,
+    ohem_enabled=False,
+    ohem_ratio=0.2,
+    ohem_min_samples=128,
+):
+    """Drop-in replacement for torchvision fastrcnn_loss with configurable strategies."""
+    labels = torch.cat(labels, dim=0)
+    regression_targets = torch.cat(regression_targets, dim=0)
+
+    N = class_logits.shape[0]
+
+    # --- per-sample classification loss ---
+    if cls_loss_type == "focal":
+        cls_loss_per = FocalLoss(gamma=focal_gamma, alpha=focal_alpha)(class_logits, labels)
+    elif cls_loss_type == "weighted_ce":
+        w = cls_weight.to(class_logits.device) if cls_weight is not None else None
+        cls_loss_per = F.cross_entropy(class_logits, labels, weight=w, reduction="none")
+    else:
+        cls_loss_per = F.cross_entropy(class_logits, labels, reduction="none")
+
+    # --- per-sample box regression loss (positive samples only) ---
+    sampled_pos_inds_subset = torch.where(labels > 0)[0]
+    labels_pos = labels[sampled_pos_inds_subset]
+    box_regression = box_regression.reshape(N, box_regression.size(-1) // 4, 4)
+
+    if sampled_pos_inds_subset.numel() > 0:
+        box_reg_per = F.smooth_l1_loss(
+            box_regression[sampled_pos_inds_subset, labels_pos],
+            regression_targets[sampled_pos_inds_subset],
+            beta=1.0 / 9.0,
+            reduction="none",
+        ).sum(dim=1)
+    else:
+        box_reg_per = torch.zeros(0, device=class_logits.device)
+
+    # --- OHEM: keep only top-K hardest samples ---
+    if ohem_enabled and N > 0:
+        difficulty = cls_loss_per.detach().clone()
+        if sampled_pos_inds_subset.numel() > 0:
+            difficulty[sampled_pos_inds_subset] = difficulty[sampled_pos_inds_subset] + box_reg_per.detach()
+
+        k = max(ohem_min_samples, int(N * ohem_ratio))
+        k = min(k, N)
+        _, topk_idx = torch.topk(difficulty, k)
+
+        classification_loss = cls_loss_per[topk_idx].mean()
+
+        topk_mask = torch.zeros(N, dtype=torch.bool, device=class_logits.device)
+        topk_mask[topk_idx] = True
+        pos_mask = torch.zeros(N, dtype=torch.bool, device=class_logits.device)
+        pos_mask[sampled_pos_inds_subset] = True
+        ohem_pos_inds = torch.where(topk_mask & pos_mask)[0]
+
+        if ohem_pos_inds.numel() > 0:
+            box_loss = F.smooth_l1_loss(
+                box_regression[ohem_pos_inds, labels[ohem_pos_inds]],
+                regression_targets[ohem_pos_inds],
+                beta=1.0 / 9.0,
+                reduction="sum",
+            ) / max(k, 1)
+        else:
+            box_loss = box_regression.sum() * 0.0
+    else:
+        classification_loss = cls_loss_per.mean() if N > 0 else cls_loss_per.sum()
+        box_loss = box_reg_per.sum() / max(labels.numel(), 1)
+
+    return classification_loss, box_loss
+
+
+def apply_custom_roi_loss(
+    model: FasterRCNN,
+    cls_loss_type: str = "ce",
+    cls_weight: Optional[torch.Tensor] = None,
+    focal_gamma: float = 2.0,
+    focal_alpha: Optional[torch.Tensor] = None,
+    ohem_enabled: bool = False,
+    ohem_ratio: float = 0.2,
+    ohem_min_samples: int = 128,
+) -> None:
+    """Monkey-patch torchvision's fastrcnn_loss to use the custom loss logic."""
+    def _patched(class_logits, box_regression, labels, regression_targets):
+        return _custom_fastrcnn_loss(
+            class_logits, box_regression, labels, regression_targets,
+            cls_loss_type=cls_loss_type,
+            cls_weight=cls_weight,
+            focal_gamma=focal_gamma,
+            focal_alpha=focal_alpha,
+            ohem_enabled=ohem_enabled,
+            ohem_ratio=ohem_ratio,
+            ohem_min_samples=ohem_min_samples,
+        )
+    _roi_heads_module.fastrcnn_loss = _patched
+
+
 def build_model(
     num_classes: int = 2,
     anchor_sizes: List[Tuple[int, ...]] | None = None,
+    box_fg_iou_thresh: float = 0.5,
+    box_bg_iou_thresh: float = 0.5,
+    rpn_fg_iou_thresh: float = 0.7,
+    rpn_bg_iou_thresh: float = 0.3,
 ) -> FasterRCNN:
     """Build Faster R-CNN using the v2 factory when available and a custom AnchorGenerator.
 
@@ -625,6 +794,10 @@ def build_model(
         model = fasterrcnn_resnet50_fpn_v2(
             weights=weights,
             rpn_anchor_generator=anchor_generator,
+            box_fg_iou_thresh=box_fg_iou_thresh,
+            box_bg_iou_thresh=box_bg_iou_thresh,
+            rpn_fg_iou_thresh=rpn_fg_iou_thresh,
+            rpn_bg_iou_thresh=rpn_bg_iou_thresh,
         )
     except TypeError:
         # fallback to older factory if v2 signature differs
@@ -633,7 +806,9 @@ def build_model(
 
             # Avoid deprecated `pretrained`/`pretrained_backbone` args by
             # explicitly passing `weights=None` / `weights_backbone=None`.
-            model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None, rpn_anchor_generator=anchor_generator)  # type: ignore[call-arg]
+            model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None, rpn_anchor_generator=anchor_generator,
+                                            box_fg_iou_thresh=box_fg_iou_thresh, box_bg_iou_thresh=box_bg_iou_thresh,
+                                            rpn_fg_iou_thresh=rpn_fg_iou_thresh, rpn_bg_iou_thresh=rpn_bg_iou_thresh)  # type: ignore[call-arg]
         except Exception:
             model = fasterrcnn_resnet50_fpn_v2()
 
@@ -831,6 +1006,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-gamma", type=float, default=0.1)
     parser.add_argument("--lr-step-size", type=int, default=0, help="StepLR step size; 0 to use CosineAnnealingLR")
 
+    # IoU thresholds for training sample assignment
+    parser.add_argument("--box-fg-iou-thresh", type=float, default=0.5, help="ROI head foreground IoU threshold (raise to 0.6-0.7 to reduce ambiguous positives)")
+    parser.add_argument("--box-bg-iou-thresh", type=float, default=0.5, help="ROI head background IoU threshold")
+    parser.add_argument("--rpn-fg-iou-thresh", type=float, default=0.7, help="RPN foreground IoU threshold")
+    parser.add_argument("--rpn-bg-iou-thresh", type=float, default=0.3, help="RPN background IoU threshold")
+
+    # Classification loss strategy
+    parser.add_argument("--cls-loss-type", type=str, default="ce", choices=["ce", "weighted_ce", "focal"], help="ROI classification loss: ce / weighted_ce / focal")
+    parser.add_argument("--cls-weight-bg", type=float, default=0.1, help="Background class weight for weighted_ce")
+    parser.add_argument("--cls-weight-lesion", type=float, default=1.0, help="Lesion class weight for weighted_ce")
+    parser.add_argument("--focal-gamma", type=float, default=2.0, help="Focal loss gamma (higher = more focus on hard examples)")
+    parser.add_argument("--focal-alpha-bg", type=float, default=0.25, help="Focal loss alpha for background class")
+    parser.add_argument("--focal-alpha-lesion", type=float, default=0.75, help="Focal loss alpha for lesion class")
+
+    # Online Hard Example Mining
+    parser.add_argument("--ohem", action="store_true", help="Enable Online Hard Example Mining (OHEM)")
+    parser.add_argument("--ohem-ratio", type=float, default=0.2, help="OHEM: keep top ratio of hardest samples")
+    parser.add_argument("--ohem-min-samples", type=int, default=128, help="OHEM: minimum samples to keep regardless of ratio")
+
+    # Positive-only warmup
+    parser.add_argument("--warmup-positive-epochs", type=int, default=0, help="Epochs to train with positive-only images before full training (0=disabled)")
+
     return parser.parse_args()
 
 
@@ -919,8 +1116,34 @@ def main() -> None:
     # Parse anchor sizes from args
     anchor_sizes = tuple((int(s.strip()),) for s in str(args.anchor_sizes).split(",") if s.strip())
 
-    model = build_model(num_classes=2, anchor_sizes=anchor_sizes)
+    model = build_model(
+        num_classes=2,
+        anchor_sizes=anchor_sizes,
+        box_fg_iou_thresh=float(args.box_fg_iou_thresh),
+        box_bg_iou_thresh=float(args.box_bg_iou_thresh),
+        rpn_fg_iou_thresh=float(args.rpn_fg_iou_thresh),
+        rpn_bg_iou_thresh=float(args.rpn_bg_iou_thresh),
+    )
     model.to(device)
+
+    # Apply custom ROI classification loss (Weighted CE / Focal Loss / OHEM)
+    _cls_weight = None
+    _focal_alpha = None
+    if args.cls_loss_type == "weighted_ce":
+        _cls_weight = torch.tensor([float(args.cls_weight_bg), float(args.cls_weight_lesion)])
+    if args.cls_loss_type == "focal":
+        _focal_alpha = torch.tensor([float(args.focal_alpha_bg), float(args.focal_alpha_lesion)])
+    apply_custom_roi_loss(
+        model,
+        cls_loss_type=str(args.cls_loss_type),
+        cls_weight=_cls_weight,
+        focal_gamma=float(args.focal_gamma),
+        focal_alpha=_focal_alpha,
+        ohem_enabled=bool(args.ohem),
+        ohem_ratio=float(args.ohem_ratio),
+        ohem_min_samples=int(args.ohem_min_samples),
+    )
+    print(f"[Info] ROI loss: type={args.cls_loss_type}, ohem={args.ohem}")
 
     # Freeze low-level backbone layers initially if requested
     if int(args.freeze_epochs) > 0:
@@ -969,13 +1192,33 @@ def main() -> None:
     )
     print(f"Device: {device}")
 
+    # Prepare positive-only warmup subset
+    warmup_pos_epochs = int(args.warmup_positive_epochs)
+    warmup_train_subset = None
+    if warmup_pos_epochs > 0 and not args.positive_only:
+        _pos_train_idx = [i for i in train_indices if train_dataset.samples[i].boxes.size > 0]
+        if _pos_train_idx:
+            warmup_train_subset = Subset(train_dataset, _pos_train_idx)
+            print(f"[Info] Positive-only warmup: {len(_pos_train_idx)} images for first {warmup_pos_epochs} epochs")
+        else:
+            warmup_pos_epochs = 0
+            print("[Warning] No positive training samples; disabling positive-only warmup")
+
     best_val_f1 = -float("inf")
     best_epoch = 0
     no_improve_epochs = 0
 
     for epoch in range(int(args.epochs)):
+        # Select training data: positive-only during warmup, full otherwise
+        _is_warmup = warmup_train_subset is not None and epoch < warmup_pos_epochs
+        _epoch_data = warmup_train_subset if _is_warmup else train_subset
+        if _is_warmup and epoch == 0:
+            print(f"[Warmup] Starting positive-only warmup phase ({warmup_pos_epochs} epochs)")
+        elif not _is_warmup and epoch == warmup_pos_epochs and warmup_train_subset is not None:
+            print(f"[Info] Warmup complete, switching to full training ({len(train_subset)} images)")
+
         train_loader = DataLoader(
-            train_subset,
+            _epoch_data,
             batch_size=int(args.batch_size),
             shuffle=True,
             num_workers=int(args.num_workers),
@@ -1092,6 +1335,10 @@ def main() -> None:
                 "best_val_precision": float(val_metrics["precision"]),
                 "best_val_recall": float(val_metrics["recall"]),
                 "best_val_f1": float(val_metrics["f1"]),
+                "cls_loss_type": str(args.cls_loss_type),
+                "ohem_enabled": bool(args.ohem),
+                "box_fg_iou_thresh": float(args.box_fg_iou_thresh),
+                "warmup_positive_epochs": int(args.warmup_positive_epochs),
                 "split_summary": split_summary,
             }
             # Save the best checkpoint, not the last one.
@@ -1147,6 +1394,10 @@ def main() -> None:
         "min_delta": float(args.min_delta),
         "best_epoch": int(best_epoch),
         "best_val_f1": float(best_val_f1 if best_val_f1 != -float("inf") else 0.0),
+        "cls_loss_type": str(args.cls_loss_type),
+        "ohem_enabled": bool(args.ohem),
+        "box_fg_iou_thresh": float(args.box_fg_iou_thresh),
+        "warmup_positive_epochs": int(args.warmup_positive_epochs),
         "split_summary": split_summary,
     }
 

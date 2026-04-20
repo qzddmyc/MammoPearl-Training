@@ -1,5 +1,7 @@
 # use: 
-# python src/data/bounding-box/bbox-test-resnet50.py --ckpt-path models/bbox_resnet50.pth --score-threshold 0.9 --anchor-sizes 8,16,32,64,128
+# python src/data/bounding-box/bbox-test-resnet50.py --ckpt-path models/bbox_resnet50.pth --score-threshold 0.5
+
+# * anchor-sizes will be auto-read from checkpoint meta if omitted.
 
 
 """Evaluate a bbox detector on the VinDr test split.
@@ -40,8 +42,6 @@ try:
     from tqdm import tqdm
 except Exception:  # pragma: no cover
     tqdm = lambda x, **kwargs: x  # type: ignore[assignment]
-
-import math
 
 
 def repo_root_from_file() -> Path:
@@ -352,10 +352,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iou-threshold", type=float, default=0.5)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--save-predictions", type=Path, default=None, help="Optional CSV path for matched predictions.")
-    parser.add_argument("--anchor-sizes", type=str, default="8,16,32,64,128", help="Comma-separated anchor sizes (one per FPN level ideally)")
-    # ROI sampling tuning (align with train behavior)
-    parser.add_argument("--roi-batch-size-per-image", type=int, default=512)
-    parser.add_argument("--roi-positive-fraction", type=float, default=0.25)
+    parser.add_argument("--anchor-sizes", type=str, default=None, help="Comma-separated anchor sizes; auto-read from checkpoint meta if omitted")
     # parser.add_argument(
     #     "--save-debug-dir",
     #     type=Path,
@@ -395,8 +392,9 @@ def main() -> None:
     ckpt = torch.load(ckpt_path, map_location=device)
     meta = ckpt.get("meta", {})
 
-    anchor_str = str(args.anchor_sizes) if args.anchor_sizes is not None else meta.get("anchor_sizes", "8,16,32,64,128")
-    anchor_sizes = tuple((int(s.strip()),) for s in anchor_str.split(",") if s.strip())
+    anchor_str = args.anchor_sizes if args.anchor_sizes is not None else meta.get("anchor_sizes", "8,16,32,64,128")
+    anchor_sizes = tuple((int(s.strip()),) for s in str(anchor_str).split(",") if s.strip())
+    print(f"[Info] Using anchor sizes: {anchor_str}")
 
     model = build_model(num_classes=2, anchor_sizes=anchor_sizes)
     model.to(device)
@@ -404,17 +402,6 @@ def main() -> None:
     # load weights
     state_dict = ckpt.get("model_state_dict", ckpt)
     model.load_state_dict(state_dict)
-
-    # Apply ROI sampling / positive-fraction ceil strategy to match train
-    try:
-        bs = int(args.roi_batch_size_per_image)
-        model.roi_heads.batch_size_per_image = bs
-        pf = float(args.roi_positive_fraction)
-        desired_pos = math.ceil(bs * pf) if bs > 0 else 0
-        pos_frac = (desired_pos / bs) if bs > 0 else pf
-        model.roi_heads.positive_fraction = float(pos_frac)
-    except Exception:
-        pass
 
     metrics, rows = evaluate(
         model=model,
