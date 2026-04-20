@@ -165,7 +165,8 @@ def collate_fn(batch):
     return list(images), list(targets), list(samples)
 
 
-def build_model(num_classes: int = 2, anchor_sizes: List[Tuple[int, ...]] | None = None) -> FasterRCNN:
+def build_model(num_classes: int = 2, anchor_sizes: List[Tuple[int, ...]] | None = None,
+                box_score_thresh: float = 0.05, box_detections_per_img: int = 100) -> FasterRCNN:
     if anchor_sizes is None:
         anchor_sizes = ((8,), (16,), (32,), (64,), (128,))
 
@@ -184,13 +185,16 @@ def build_model(num_classes: int = 2, anchor_sizes: List[Tuple[int, ...]] | None
         model = fasterrcnn_resnet50_fpn_v2(
             weights=weights,
             rpn_anchor_generator=anchor_generator,
+            box_score_thresh=box_score_thresh,
+            box_detections_per_img=box_detections_per_img,
         )
     except TypeError:
         try:
             from torchvision.models.detection import fasterrcnn_resnet50_fpn
             # Avoid deprecated `pretrained`/`pretrained_backbone` args by
             # explicitly passing `weights=None` / `weights_backbone=None`.
-            model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None, rpn_anchor_generator=anchor_generator)  # type: ignore[call-arg]
+            model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None, rpn_anchor_generator=anchor_generator,
+                                            box_score_thresh=box_score_thresh, box_detections_per_img=box_detections_per_img)  # type: ignore[call-arg]
         except Exception:
             model = fasterrcnn_resnet50_fpn_v2()
 
@@ -353,6 +357,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--save-predictions", type=Path, default=None, help="Optional CSV path for matched predictions.")
     parser.add_argument("--anchor-sizes", type=str, default=None, help="Comma-separated anchor sizes; auto-read from checkpoint meta if omitted")
+    parser.add_argument("--box-score-thresh", type=float, default=None, help="Score threshold for model-internal box filtering; auto-read from checkpoint meta if omitted")
+    parser.add_argument("--box-detections-per-img", type=int, default=None, help="Max detections per image at inference time; auto-read from checkpoint meta if omitted")
     # parser.add_argument(
     #     "--save-debug-dir",
     #     type=Path,
@@ -396,7 +402,12 @@ def main() -> None:
     anchor_sizes = tuple((int(s.strip()),) for s in str(anchor_str).split(",") if s.strip())
     print(f"[Info] Using anchor sizes: {anchor_str}")
 
-    model = build_model(num_classes=2, anchor_sizes=anchor_sizes)
+    box_score_thresh = args.box_score_thresh if args.box_score_thresh is not None else float(meta.get("box_score_thresh", 0.05))
+    box_detections_per_img = args.box_detections_per_img if args.box_detections_per_img is not None else int(meta.get("box_detections_per_img", 100))
+    print(f"[Info] box_score_thresh={box_score_thresh}, box_detections_per_img={box_detections_per_img}")
+
+    model = build_model(num_classes=2, anchor_sizes=anchor_sizes,
+                        box_score_thresh=box_score_thresh, box_detections_per_img=box_detections_per_img)
     model.to(device)
 
     # load weights

@@ -6,78 +6,26 @@
 # If your computer is GREAT, you can use "--fuck-running" to run in a big batch-size (8).
 
 r"""
-推荐使用的运行参数:
 
-1. Focal Loss + OHEM + Warmup + 更多 Epoch
-
-python src/data/bounding-box/bbox-train-resnet50.py \
-    --epochs 40 \
-    --batch-size 2 \
-    --accumulation-steps 4 \
-    --lr 0.005 \
-    --freeze-epochs 5 \
-    --roi-batch-size-per-image 512 \
-    --roi-positive-fraction 0.05 \
-    --anchor-sizes 16,32,64,128,256 \
-    --cls-loss-type focal \
-    --focal-gamma 2.0 \
-    --focal-alpha-bg 0.25 \
-    --focal-alpha-lesion 0.75 \
-    --ohem \
-    --ohem-ratio 0.2 \
-    --ohem-min-samples 128 \
-    --warmup-positive-epochs 8 \
-    --box-fg-iou-thresh 0.6 \
-    --patience 10
-
-- 40 epoch 总量，其中前 8 个仅用正样本热身，让模型先建立病灶特征表示
-- Focal Loss (gamma=2.0) 自动压制大量高置信度简单背景的 loss 贡献
-- OHEM 进一步过滤掉最无用的 easy negative，只保留前 20% 难例
-- IoU 阈值 0.6 减少边界模糊样本被当作正例
-- patience 放宽到 10（因为 epoch 多了，前期波动正常）
-
-2. Weighted CE 版本（如果更想显式控制权重）
+Use this to run:
 
 python src/data/bounding-box/bbox-train-resnet50.py \
     --epochs 40 \
     --batch-size 2 \
     --accumulation-steps 4 \
     --lr 0.005 \
-    --freeze-epochs 5 \
+    --freeze-epochs 3 \
     --roi-batch-size-per-image 512 \
-    --roi-positive-fraction 0.05 \
+    --roi-positive-fraction 0.25 \
     --anchor-sizes 16,32,64,128,256 \
     --cls-loss-type weighted_ce \
-    --cls-weight-bg 0.1 \
+    --cls-weight-bg 0.3 \
     --cls-weight-lesion 1.0 \
-    --warmup-positive-epochs 8 \
-    --box-fg-iou-thresh 0.6 \
+    --box-fg-iou-thresh 0.5 \
+    --warmup-balanced-epochs 5 \
+    --warmup-pos-weight-ratio 10.0 \
+    --only-use 0.3 \
     --patience 10
-
-3. 如果 A 之后 FP 仍然很多，加重背景惩罚
-
-python src/data/bounding-box/bbox-train-resnet50.py \
-    --epochs 40 \
-    --batch-size 2 \
-    --accumulation-steps 4 \
-    --lr 0.005 \
-    --freeze-epochs 5 \
-    --roi-batch-size-per-image 512 \
-    --roi-positive-fraction 0.05 \
-    --anchor-sizes 16,32,64,128,256 \
-    --cls-loss-type focal \
-    --focal-gamma 3.0 \
-    --focal-alpha-bg 0.15 \
-    --focal-alpha-lesion 0.85 \
-    --ohem \
-    --ohem-ratio 0.15 \
-    --warmup-positive-epochs 10 \
-    --box-fg-iou-thresh 0.7 \
-    --patience 12
-
-- 差异点：gamma 提升到 3.0（更激进地压制简单样本），IoU 阈值到 0.7（更严格的正样本定义），alpha 进一步偏向病灶。
-
-============================================================================================================
 
 本文件介绍：
 
@@ -136,6 +84,25 @@ Prompts for improvement:
     支持将 ROI 正样本 IoU 阈值从默认 0.5 上调至 0.6/0.7 以减少边界模糊导致的误检。
 14. 新增两阶段训练策略（positive-only warmup，通过 --warmup-positive-epochs 配置）：前 N 个
     epoch 仅使用正样本图像训练，让模型先学习病灶特征；之后恢复全量样本训练。验证集保持真实分布。
+-----------
+15. 废弃 Positive-Only Warmup，改用 Balanced Sampling Warmup（通过 --warmup-balanced-epochs
+    和 --warmup-pos-weight-ratio 配置）：前 N 个 epoch 使用 WeightedRandomSampler 对训练集进行
+    加权采样，使正样本被过采样至与负样本接近的数量，同时 RPN 仍能学到背景抑制。warmup 结束后重建
+    optimizer 和 lr_scheduler，切换回全量训练。
+16. 禁止 Focal Loss + OHEM 同时启用：两者功能高度重叠，同时使用会过度稀释梯度信号。新增启动时
+    互斥检查，当同时启用时自动禁用 OHEM 并打印警告。
+17. 修复 CosineAnnealingLR 的 T_max 与 warmup 阶段冲突：将 T_max 设为实际全量训练的 epoch 数
+    （total - warmup），并在 warmup 阶段跳过 epoch-level scheduler step，防止 LR 在 warmup
+    阶段被 cosine 过度拉低。warmup 结束后重建 optimizer 和 scheduler 以获得干净的 LR 曲线。
+18. 在 validate_one_epoch 中增加多阈值验证报告（threshold=0.1/0.3/0.5/0.7/0.9），输出各阈值
+    下的 TP/FP 统计，帮助更全面地理解模型行为，同时不影响 best checkpoint 的选择逻辑。
+19. 在 validate_one_epoch 中增加 RPN proposal 数量监控：记录模型输出的原始 box 数量（threshold
+    之前），当每图平均值超过 200 时输出警告，用于检测 RPN 是否有效抑制背景。
+20. 在 build_model 中暴露 box_score_thresh 和 box_detections_per_img 参数（对应命令行
+    --box-score-thresh 和 --box-detections-per-img），控制推理时的低分框过滤和每图最大检测数。
+21. 新增 --only-use 参数（float，默认 1.0）：在正式训练阶段每个 epoch 仅使用分配数据总量的指定
+    比例。正负样本按原始比例等比缩减，并对正样本设最低保护（不低于原始比例对应的数量）。通过跨
+    epoch 轮转采样机制，确保所有图像在多个 epoch 中均被训练到。
 
 """
 
@@ -156,7 +123,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler
 from torchvision.models.detection import FasterRCNN
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.rpn import AnchorGenerator
@@ -368,6 +335,59 @@ def summarize_subset(samples: List[Sample], indices: List[int]) -> Dict[str, Any
         "negative_images": int(negative_images),
         "positive_ratio": float(positive_ratio),
     }
+
+
+def select_epoch_subset(
+    train_indices: List[int],
+    samples: List[Sample],
+    epoch: int,
+    only_use: float,
+    seed: int,
+) -> List[int]:
+    """Select a rotating subset of training indices for one epoch.
+
+    Ensures all images are visited across epochs by cycling through
+    positive and negative samples independently.  Positive samples are
+    protected to never fall below the original positive ratio of the subset.
+    """
+    if only_use >= 1.0:
+        return train_indices
+
+    pos_all = [i for i in train_indices if samples[i].boxes.size > 0]
+    neg_all = [i for i in train_indices if samples[i].boxes.size == 0]
+
+    total_target = max(1, math.ceil(len(train_indices) * only_use))
+    original_pos_ratio = len(pos_all) / max(len(train_indices), 1)
+
+    # Protect positive samples: at least the original ratio worth of positives
+    n_pos = max(1, math.ceil(total_target * original_pos_ratio)) if pos_all else 0
+    n_pos = min(n_pos, len(pos_all))
+    n_neg = min(total_target - n_pos, len(neg_all))
+    n_neg = max(0, n_neg)
+
+    selected: List[int] = []
+
+    if pos_all and n_pos > 0:
+        pos_cycles = max(1, math.ceil(len(pos_all) / n_pos))
+        pos_cycle_group = epoch // pos_cycles
+        pos_epoch_in_cycle = epoch % pos_cycles
+        rng_pos = random.Random(seed + 500 + pos_cycle_group * 31)
+        pos_shuffled = pos_all.copy()
+        rng_pos.shuffle(pos_shuffled)
+        start_p = pos_epoch_in_cycle * n_pos
+        selected += [pos_shuffled[j % len(pos_all)] for j in range(start_p, start_p + n_pos)]
+
+    if neg_all and n_neg > 0:
+        neg_cycles = max(1, math.ceil(len(neg_all) / n_neg))
+        neg_cycle_group = epoch // neg_cycles
+        neg_epoch_in_cycle = epoch % neg_cycles
+        rng_neg = random.Random(seed + 700 + neg_cycle_group * 37)
+        neg_shuffled = neg_all.copy()
+        rng_neg.shuffle(neg_shuffled)
+        start_n = neg_epoch_in_cycle * n_neg
+        selected += [neg_shuffled[j % len(neg_all)] for j in range(start_n, start_n + n_neg)]
+
+    return selected
 
 
 def split_train_val_by_patient(
@@ -592,6 +612,11 @@ def validate_one_epoch(
     total_images = 0
     total_gt_boxes = 0
     total_pred_boxes = 0
+    total_raw_preds = 0
+
+    # Multi-threshold tracking
+    multi_thresholds = [0.1, 0.3, 0.5, 0.7, 0.9]
+    multi_stats: Dict[float, Dict[str, int]] = {t: {"tp": 0, "fp": 0} for t in multi_thresholds}
 
     pbar = tqdm(loader, desc=f"val {epoch + 1}/{epochs}", leave=False)
 
@@ -610,6 +635,7 @@ def validate_one_epoch(
                 gt_boxes = target["boxes"].detach().cpu().numpy()
 
                 total_gt_boxes += int(gt_boxes.shape[0])
+                total_raw_preds += int(pred_boxes.shape[0])
 
                 # Apply the same score threshold used during validation statistics.
                 keep = pred_scores >= float(score_threshold)
@@ -626,11 +652,33 @@ def validate_one_epoch(
                 total_fp += fp
                 total_fn += fn
 
+                # Multi-threshold evaluation
+                for t in multi_thresholds:
+                    tp_t, fp_t, _ = match_predictions_to_gt(
+                        pred_boxes=pred_boxes,
+                        pred_scores=pred_scores,
+                        gt_boxes=gt_boxes,
+                        score_threshold=t,
+                        iou_threshold=iou_threshold,
+                    )
+                    multi_stats[t]["tp"] += tp_t
+                    multi_stats[t]["fp"] += fp_t
+
     precision = float(total_tp / max(total_tp + total_fp, 1))
     recall = float(total_tp / max(total_tp + total_fn, 1))
     f1 = float((2.0 * precision * recall) / max(precision + recall, 1e-12))
 
-    return {
+    avg_raw_preds = float(total_raw_preds / max(total_images, 1))
+    if avg_raw_preds > 200:
+        print(f"[Warning] avg_raw_preds_per_image={avg_raw_preds:.1f} > 200, RPN/ROI may not suppress background effectively")
+
+    # Print multi-threshold summary
+    parts = []
+    for t in multi_thresholds:
+        parts.append(f"Val@{t}: TP={multi_stats[t]['tp']}, FP={multi_stats[t]['fp']}")
+    print(f"  {' | '.join(parts)}")
+
+    result: Dict[str, float] = {
         "precision": precision,
         "recall": recall,
         "f1": f1,
@@ -640,7 +688,13 @@ def validate_one_epoch(
         "images": float(total_images),
         "gt_boxes": float(total_gt_boxes),
         "pred_boxes": float(total_pred_boxes),
+        "raw_preds": float(total_raw_preds),
+        "avg_raw_preds_per_image": avg_raw_preds,
     }
+    for t in multi_thresholds:
+        result[f"tp@{t}"] = float(multi_stats[t]["tp"])
+        result[f"fp@{t}"] = float(multi_stats[t]["fp"])
+    return result
 
 
 class FocalLoss(torch.nn.Module):
@@ -770,6 +824,8 @@ def build_model(
     box_bg_iou_thresh: float = 0.5,
     rpn_fg_iou_thresh: float = 0.7,
     rpn_bg_iou_thresh: float = 0.3,
+    box_score_thresh: float = 0.05,
+    box_detections_per_img: int = 100,
 ) -> FasterRCNN:
     """Build Faster R-CNN using the v2 factory when available and a custom AnchorGenerator.
 
@@ -798,6 +854,8 @@ def build_model(
             box_bg_iou_thresh=box_bg_iou_thresh,
             rpn_fg_iou_thresh=rpn_fg_iou_thresh,
             rpn_bg_iou_thresh=rpn_bg_iou_thresh,
+            box_score_thresh=box_score_thresh,
+            box_detections_per_img=box_detections_per_img,
         )
     except TypeError:
         # fallback to older factory if v2 signature differs
@@ -808,7 +866,8 @@ def build_model(
             # explicitly passing `weights=None` / `weights_backbone=None`.
             model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None, rpn_anchor_generator=anchor_generator,
                                             box_fg_iou_thresh=box_fg_iou_thresh, box_bg_iou_thresh=box_bg_iou_thresh,
-                                            rpn_fg_iou_thresh=rpn_fg_iou_thresh, rpn_bg_iou_thresh=rpn_bg_iou_thresh)  # type: ignore[call-arg]
+                                            rpn_fg_iou_thresh=rpn_fg_iou_thresh, rpn_bg_iou_thresh=rpn_bg_iou_thresh,
+                                            box_score_thresh=box_score_thresh, box_detections_per_img=box_detections_per_img)  # type: ignore[call-arg]
         except Exception:
             model = fasterrcnn_resnet50_fpn_v2()
 
@@ -1028,6 +1087,17 @@ def parse_args() -> argparse.Namespace:
     # Positive-only warmup
     parser.add_argument("--warmup-positive-epochs", type=int, default=0, help="Epochs to train with positive-only images before full training (0=disabled)")
 
+    # Balanced sampling warmup (replaces positive-only warmup)
+    parser.add_argument("--warmup-balanced-epochs", type=int, default=0, help="Epochs to use balanced (weighted) sampling before full training (0=disabled)")
+    parser.add_argument("--warmup-pos-weight-ratio", type=float, default=10.0, help="Positive sample weight relative to negative in balanced warmup")
+
+    # Epoch subsampling
+    parser.add_argument("--only-use", type=float, default=1.0, help="Fraction of training data to use per epoch (0.0-1.0); rotates across epochs to cover all data")
+
+    # Inference-time box filtering
+    parser.add_argument("--box-score-thresh", type=float, default=0.05, help="Score threshold for inference-time box filtering")
+    parser.add_argument("--box-detections-per-img", type=int, default=100, help="Max detections per image at inference time")
+
     return parser.parse_args()
 
 
@@ -1044,6 +1114,11 @@ def main() -> None:
         raise FileNotFoundError(f"Images root not found: {images_root}")
 
     set_seed(args.seed)
+
+    # Focal Loss + OHEM mutual exclusion check
+    if args.cls_loss_type == "focal" and args.ohem:
+        print("[Warning] Focal Loss and OHEM should not be used together (gradient signal over-dilution). Disabling OHEM.")
+        args.ohem = False
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -1123,6 +1198,8 @@ def main() -> None:
         box_bg_iou_thresh=float(args.box_bg_iou_thresh),
         rpn_fg_iou_thresh=float(args.rpn_fg_iou_thresh),
         rpn_bg_iou_thresh=float(args.rpn_bg_iou_thresh),
+        box_score_thresh=float(args.box_score_thresh),
+        box_detections_per_img=int(args.box_detections_per_img),
     )
     model.to(device)
 
@@ -1152,11 +1229,14 @@ def main() -> None:
     optimizer = create_optimizer(model, args, base_lr=float(args.lr))
 
     # Choose LR scheduler: StepLR if step size provided, else CosineAnnealingLR
+    # T_max excludes balanced warmup epochs so cosine decay aligns with actual training phase
+    warmup_balanced_epochs = int(args.warmup_balanced_epochs)
+    only_use = float(args.only_use)
+    _effective_epochs = max(1, int(args.epochs) - warmup_balanced_epochs)
     if int(args.lr_step_size) > 0:
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=int(args.lr_step_size), gamma=float(args.lr_gamma))
     else:
-        # warmup is implemented as iter-level LinearLR on epoch 0; remove dependency on --warmup-epochs
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, int(args.epochs)), eta_min=1e-6)
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=_effective_epochs, eta_min=1e-6)
 
     history: List[Dict[str, float]] = []
 
@@ -1192,10 +1272,23 @@ def main() -> None:
     )
     print(f"Device: {device}")
 
-    # Prepare positive-only warmup subset
+    # Prepare balanced sampling warmup (replaces positive-only warmup)
     warmup_pos_epochs = int(args.warmup_positive_epochs)
+    _warmup_weights: List[float] = []
+    if warmup_balanced_epochs > 0:
+        _train_pos_count = sum(1 for i in train_indices if train_dataset.samples[i].boxes.size > 0)
+        if _train_pos_count > 0:
+            _pos_weight = float(args.warmup_pos_weight_ratio)
+            for j in range(len(train_indices)):
+                is_pos = train_dataset.samples[train_indices[j]].boxes.size > 0
+                _warmup_weights.append(_pos_weight if is_pos else 1.0)
+            print(f"[Info] Balanced warmup: {warmup_balanced_epochs} epochs, pos_weight_ratio={_pos_weight}, train_size={len(train_indices)}")
+        else:
+            warmup_balanced_epochs = 0
+            print("[Warning] No positive training samples; disabling balanced warmup")
+    # Legacy positive-only warmup subset (kept for backward compat but not recommended)
     warmup_train_subset = None
-    if warmup_pos_epochs > 0 and not args.positive_only:
+    if warmup_pos_epochs > 0 and warmup_balanced_epochs == 0 and not args.positive_only:
         _pos_train_idx = [i for i in train_indices if train_dataset.samples[i].boxes.size > 0]
         if _pos_train_idx:
             warmup_train_subset = Subset(train_dataset, _pos_train_idx)
@@ -1209,22 +1302,72 @@ def main() -> None:
     no_improve_epochs = 0
 
     for epoch in range(int(args.epochs)):
-        # Select training data: positive-only during warmup, full otherwise
-        _is_warmup = warmup_train_subset is not None and epoch < warmup_pos_epochs
-        _epoch_data = warmup_train_subset if _is_warmup else train_subset
-        if _is_warmup and epoch == 0:
+        # --- Phase detection ---
+        is_warmup_balanced = warmup_balanced_epochs > 0 and epoch < warmup_balanced_epochs
+        _is_legacy_warmup = (not is_warmup_balanced) and warmup_train_subset is not None and epoch < warmup_pos_epochs
+
+        if is_warmup_balanced and epoch == 0:
+            print(f"[Warmup] Starting balanced sampling warmup phase ({warmup_balanced_epochs} epochs)")
+        elif _is_legacy_warmup and epoch == 0:
             print(f"[Warmup] Starting positive-only warmup phase ({warmup_pos_epochs} epochs)")
-        elif not _is_warmup and epoch == warmup_pos_epochs and warmup_train_subset is not None:
+
+        # --- Reset optimizer/scheduler when transitioning from balanced warmup to full training ---
+        rebuilt_warmup = False
+        if not is_warmup_balanced and epoch == warmup_balanced_epochs and warmup_balanced_epochs > 0:
+            print(f"[Info] Balanced warmup complete, resetting optimizer and switching to full training ({len(train_subset)} images)")
+            optimizer = create_optimizer(model, args, base_lr=float(args.lr))
+            remaining = max(1, int(args.epochs) - epoch)
+            if int(args.lr_step_size) > 0:
+                lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=int(args.lr_step_size), gamma=float(args.lr_gamma))
+            else:
+                lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining, eta_min=1e-6)
+            rebuilt_warmup = True
+        elif not _is_legacy_warmup and epoch == warmup_pos_epochs and warmup_train_subset is not None:
             print(f"[Info] Warmup complete, switching to full training ({len(train_subset)} images)")
 
-        train_loader = DataLoader(
-            _epoch_data,
-            batch_size=int(args.batch_size),
-            shuffle=True,
-            num_workers=int(args.num_workers),
-            collate_fn=collate_fn,
-            pin_memory=torch.cuda.is_available(),
-        )
+        # --- Data selection ---
+        if is_warmup_balanced:
+            # Balanced warmup: use WeightedRandomSampler on the full training set
+            sampler = WeightedRandomSampler(_warmup_weights, num_samples=len(train_indices), replacement=True)
+            train_loader = DataLoader(
+                train_subset,
+                batch_size=int(args.batch_size),
+                sampler=sampler,
+                num_workers=int(args.num_workers),
+                collate_fn=collate_fn,
+                pin_memory=torch.cuda.is_available(),
+            )
+        elif _is_legacy_warmup:
+            # Legacy positive-only warmup
+            train_loader = DataLoader(
+                warmup_train_subset,
+                batch_size=int(args.batch_size),
+                shuffle=True,
+                num_workers=int(args.num_workers),
+                collate_fn=collate_fn,
+                pin_memory=torch.cuda.is_available(),
+            )
+        else:
+            # Normal training, possibly with --only-use subsampling
+            if only_use < 1.0:
+                _epoch_offset = epoch - max(warmup_balanced_epochs, warmup_pos_epochs if warmup_train_subset else 0)
+                epoch_indices = select_epoch_subset(
+                    train_indices, train_dataset.samples, _epoch_offset, only_use, int(args.seed))
+                epoch_subset = Subset(train_dataset, epoch_indices)
+                if _epoch_offset == 0 or (_epoch_offset % 5 == 0):
+                    _ep_pos = sum(1 for i in epoch_indices if train_dataset.samples[i].boxes.size > 0)
+                    _ep_neg = len(epoch_indices) - _ep_pos
+                    print(f"[Info] Epoch {epoch+1} subset: {len(epoch_indices)} images (pos={_ep_pos}, neg={_ep_neg})")
+            else:
+                epoch_subset = train_subset
+            train_loader = DataLoader(
+                epoch_subset,
+                batch_size=int(args.batch_size),
+                shuffle=True,
+                num_workers=int(args.num_workers),
+                collate_fn=collate_fn,
+                pin_memory=torch.cuda.is_available(),
+            )
 
         # Validation loader must not shuffle and must not use any sampling tricks.
         val_loader = DataLoader(
@@ -1258,7 +1401,7 @@ def main() -> None:
         )
 
         # Unfreeze backbone after configured freeze epochs
-        rebuilt_this_epoch = False
+        rebuilt_this_epoch = rebuilt_warmup
 
         if int(args.freeze_epochs) > 0 and (epoch + 1) == int(args.freeze_epochs):
             print(f"[Info] Unfreezing backbone layers after {args.freeze_epochs} epochs and rebuilding optimizer")
@@ -1283,7 +1426,10 @@ def main() -> None:
         )
 
         # Only step the epoch-level scheduler if we actually performed any optimizer.step()
-        if optimizer_steps > 0 and not rebuilt_this_epoch:
+        # Skip scheduler stepping during balanced warmup phase
+        if is_warmup_balanced:
+            print(f"[Info] Warmup epoch {epoch + 1}: skipping lr_scheduler.step()")
+        elif optimizer_steps > 0 and not rebuilt_this_epoch:
             print(f"[Info] lr_scheduler.step() at epoch {epoch + 1}.")
             lr_scheduler.step()
         else:
@@ -1303,6 +1449,8 @@ def main() -> None:
             "val_tp": float(val_metrics["tp"]),
             "val_fp": float(val_metrics["fp"]),
             "val_fn": float(val_metrics["fn"]),
+            "val_raw_preds": float(val_metrics.get("raw_preds", 0)),
+            "val_avg_raw_preds_per_image": float(val_metrics.get("avg_raw_preds_per_image", 0)),
         }
         history.append(record)
 
@@ -1339,6 +1487,10 @@ def main() -> None:
                 "ohem_enabled": bool(args.ohem),
                 "box_fg_iou_thresh": float(args.box_fg_iou_thresh),
                 "warmup_positive_epochs": int(args.warmup_positive_epochs),
+                "warmup_balanced_epochs": int(warmup_balanced_epochs),
+                "only_use": float(only_use),
+                "box_score_thresh": float(args.box_score_thresh),
+                "box_detections_per_img": int(args.box_detections_per_img),
                 "split_summary": split_summary,
             }
             # Save the best checkpoint, not the last one.
@@ -1398,6 +1550,10 @@ def main() -> None:
         "ohem_enabled": bool(args.ohem),
         "box_fg_iou_thresh": float(args.box_fg_iou_thresh),
         "warmup_positive_epochs": int(args.warmup_positive_epochs),
+        "warmup_balanced_epochs": int(warmup_balanced_epochs),
+        "only_use": float(only_use),
+        "box_score_thresh": float(args.box_score_thresh),
+        "box_detections_per_img": int(args.box_detections_per_img),
         "split_summary": split_summary,
     }
 
