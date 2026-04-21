@@ -1,7 +1,9 @@
-# use: 
-# python src/data/bounding-box/bbox-test-resnet50.py --ckpt-path models/bbox_resnet50.pth --score-threshold 0.5
+# use:
+# python src/data/bounding-box/bbox-test-resnet50.py --ckpt-path models/bbox_resnet50.pth
+# or:
+# python src/data/bounding-box/bbox-test-resnet50.py --ckpt-path models/bbox_resnet50.pth --save-predictions tmp/bbox_test_matches.csv
 
-# * anchor-sizes will be auto-read from checkpoint meta if omitted.
+# * anchor sizes, internal box filtering, and matching thresholds will be auto-read from checkpoint meta when available.
 
 
 """Evaluate a bbox detector on the VinDr test split.
@@ -10,7 +12,7 @@ This script loads `models/bbox_resnet50.pth`, runs inference on the test split, 
 compares predicted boxes with ground-truth boxes using IoU-based matching.
 It reports:
 
-- box precision / recall / F1 at IoU threshold 0.5
+- box precision / recall / F1 at the configured matching thresholds
 - image-level presence accuracy
 - mean IoU over matched boxes
 - mean absolute coordinate error (pixels)
@@ -21,7 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple
 
 import cv2
 import numpy as np
@@ -79,6 +81,84 @@ def image_to_tensor(img: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 
 
+def detect_breast_region(
+    img: np.ndarray,
+    margin_ratio: float = 0.05,
+) -> Tuple[int, int, int, int]:
+    """Detect the breast-region crop on a processed mammogram."""
+    if img.ndim == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = img
+
+    if gray.dtype != np.uint8:
+        gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    h, w = gray.shape[:2]
+    if h <= 0 or w <= 0:
+        return 0, 0, 0, 0
+    if np.max(gray) <= 0:
+        return 0, 0, w, h
+
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        ys, xs = np.where(gray > 0)
+        if xs.size == 0 or ys.size == 0:
+            return 0, 0, w, h
+        x1 = int(xs.min())
+        y1 = int(ys.min())
+        x2 = int(xs.max()) + 1
+        y2 = int(ys.max()) + 1
+    else:
+        contour = max(contours, key=cv2.contourArea)
+        x, y, cw, ch = cv2.boundingRect(contour)
+        x1 = int(x)
+        y1 = int(y)
+        x2 = int(x + cw)
+        y2 = int(y + ch)
+
+    margin_ratio = max(0.0, float(margin_ratio))
+    margin_x = int(round((x2 - x1) * margin_ratio))
+    margin_y = int(round((y2 - y1) * margin_ratio))
+    x1 = max(0, x1 - margin_x)
+    y1 = max(0, y1 - margin_y)
+    x2 = min(w, x2 + margin_x)
+    y2 = min(h, y2 + margin_y)
+
+    if x2 <= x1 or y2 <= y1:
+        return 0, 0, w, h
+    return x1, y1, x2, y2
+
+
+def crop_image_and_boxes(
+    img: np.ndarray,
+    boxes: np.ndarray,
+    crop_box: Tuple[int, int, int, int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Crop image and remap boxes into crop-local coordinates."""
+    x1, y1, x2, y2 = crop_box
+    cropped_img = img[y1:y2, x1:x2]
+    if boxes.size == 0:
+        return cropped_img, np.zeros((0, 4), dtype=np.float32)
+
+    cropped_boxes = boxes.astype(np.float32).copy()
+    cropped_boxes[:, [0, 2]] -= float(x1)
+    cropped_boxes[:, [1, 3]] -= float(y1)
+
+    crop_h, crop_w = cropped_img.shape[:2]
+    cropped_boxes[:, 0] = np.clip(cropped_boxes[:, 0], 0, max(crop_w - 1, 0))
+    cropped_boxes[:, 2] = np.clip(cropped_boxes[:, 2], 0, max(crop_w - 1, 0))
+    cropped_boxes[:, 1] = np.clip(cropped_boxes[:, 1], 0, max(crop_h - 1, 0))
+    cropped_boxes[:, 3] = np.clip(cropped_boxes[:, 3], 0, max(crop_h - 1, 0))
+
+    keep = (cropped_boxes[:, 2] > cropped_boxes[:, 0] + 1) & (cropped_boxes[:, 3] > cropped_boxes[:, 1] + 1)
+    return cropped_img, cropped_boxes[keep]
+
+
 # 不再需要缩放
 # def scale_boxes_to_image(boxes: np.ndarray, orig_size: Tuple[float, float], new_size: Tuple[int, int]) -> np.ndarray:
 #     orig_h, orig_w = orig_size
@@ -98,10 +178,19 @@ def image_to_tensor(img: np.ndarray) -> torch.Tensor:
 
 
 class VinDrBboxDataset(Dataset):
-    def __init__(self, csv_path: Path, images_root: Path, split_name: str) -> None:
+    def __init__(
+        self,
+        csv_path: Path,
+        images_root: Path,
+        split_name: str,
+        crop_breast_region: bool = False,
+        breast_crop_margin: float = 0.05,
+    ) -> None:
         self.csv_path = csv_path
         self.images_root = images_root
         self.split_name = split_name
+        self.crop_breast_region = crop_breast_region
+        self.breast_crop_margin = breast_crop_margin
 
         df = pd.read_csv(csv_path, low_memory=False)
         df = df[df["split"].astype(str).str.lower() == split_name.lower()].copy()
@@ -146,17 +235,30 @@ class VinDrBboxDataset(Dataset):
             raise FileNotFoundError(f"Missing image: {sample['image_path']}")
 
         img = normalize_image(read_image_unicode(sample["image_path"]))
+        h, w = img.shape[:2]
 
         boxes = sample["boxes"].astype(np.float32)
 
         if boxes.size > 0:
+            boxes[:, 0] = np.clip(boxes[:, 0], 0, w - 1)
+            boxes[:, 2] = np.clip(boxes[:, 2], 0, w - 1)
+            boxes[:, 1] = np.clip(boxes[:, 1], 0, h - 1)
+            boxes[:, 3] = np.clip(boxes[:, 3], 0, h - 1)
             keep = (boxes[:, 2] > boxes[:, 0] + 1) & (boxes[:, 3] > boxes[:, 1] + 1)
             boxes = boxes[keep]
+
+        crop_box = (0, 0, w, h)
+        if self.crop_breast_region:
+            crop_box = detect_breast_region(img, margin_ratio=self.breast_crop_margin)
+            img, boxes = crop_image_and_boxes(img, boxes, crop_box)
 
         target = {
             "boxes": torch.from_numpy(boxes) if boxes.size > 0 else torch.zeros((0, 4), dtype=torch.float32),
             "image_id": torch.tensor([index], dtype=torch.int64),
         }
+        sample = dict(sample)
+        sample["crop_box"] = crop_box
+        sample["original_image_size"] = (h, w)
         return image_to_tensor(img), target, sample
 
 
@@ -275,9 +377,6 @@ def evaluate(
                 gt_boxes = target["boxes"].detach().cpu()
 
                 matches = greedy_match(pred_boxes, pred_scores, gt_boxes, iou_threshold=iou_threshold)
-                matched_pred = {m[0] for m in matches}
-                matched_gt = {m[1] for m in matches}
-
                 tp = len(matches)
                 fp = int(pred_boxes.shape[0] - tp)
                 fn = int(gt_boxes.shape[0] - tp)
@@ -294,18 +393,29 @@ def evaluate(
                     pred = pred_boxes[pred_idx].numpy()
                     gt = gt_boxes[gt_idx].numpy()
                     coord_abs_errors.append(np.abs(pred - gt))
+                    crop_x1, crop_y1, crop_x2, crop_y2 = sample.get("crop_box", (0, 0, 0, 0))
+                    pred_orig = pred.copy()
+                    gt_orig = gt.copy()
+                    pred_orig[[0, 2]] += float(crop_x1)
+                    pred_orig[[1, 3]] += float(crop_y1)
+                    gt_orig[[0, 2]] += float(crop_x1)
+                    gt_orig[[1, 3]] += float(crop_y1)
                     rows.append(
                         {
                             "patient_id": sample["patient_id"],
                             "image_id": sample["image_id"],
-                            "pred_xmin": float(pred[0]),
-                            "pred_ymin": float(pred[1]),
-                            "pred_xmax": float(pred[2]),
-                            "pred_ymax": float(pred[3]),
-                            "gt_xmin": float(gt[0]),
-                            "gt_ymin": float(gt[1]),
-                            "gt_xmax": float(gt[2]),
-                            "gt_ymax": float(gt[3]),
+                            "crop_xmin": float(crop_x1),
+                            "crop_ymin": float(crop_y1),
+                            "crop_xmax": float(crop_x2),
+                            "crop_ymax": float(crop_y2),
+                            "pred_xmin": float(pred_orig[0]),
+                            "pred_ymin": float(pred_orig[1]),
+                            "pred_xmax": float(pred_orig[2]),
+                            "pred_ymax": float(pred_orig[3]),
+                            "gt_xmin": float(gt_orig[0]),
+                            "gt_ymin": float(gt_orig[1]),
+                            "gt_xmax": float(gt_orig[2]),
+                            "gt_ymax": float(gt_orig[3]),
                             "iou": float(iou_val),
                             "score": float(pred_scores[pred_idx].item()),
                         }
@@ -352,13 +462,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--csv-path", type=Path, default=None)
     parser.add_argument("--images-root", type=Path, default=None)
     parser.add_argument("--ckpt-path", type=Path, default=None)
-    parser.add_argument("--score-threshold", type=float, default=0.5)
-    parser.add_argument("--iou-threshold", type=float, default=0.5)
+    parser.add_argument("--score-threshold", type=float, default=None, help="Score threshold used for matching; auto-read from checkpoint val_score_threshold if omitted")
+    parser.add_argument("--iou-threshold", type=float, default=None, help="IoU threshold used for matching; auto-read from checkpoint val_iou_threshold if omitted")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--save-predictions", type=Path, default=None, help="Optional CSV path for matched predictions.")
     parser.add_argument("--anchor-sizes", type=str, default=None, help="Comma-separated anchor sizes; auto-read from checkpoint meta if omitted")
     parser.add_argument("--box-score-thresh", type=float, default=None, help="Score threshold for model-internal box filtering; auto-read from checkpoint meta if omitted")
     parser.add_argument("--box-detections-per-img", type=int, default=None, help="Max detections per image at inference time; auto-read from checkpoint meta if omitted")
+    parser.add_argument("--force-breast-crop", action="store_true", help="Force breast-region cropping even if checkpoint meta does not request it")
+    parser.add_argument("--disable-breast-crop", action="store_true", help="Disable breast-region cropping even if checkpoint meta requests it")
+    parser.add_argument("--breast-crop-margin", type=float, default=None, help="Override breast crop padding ratio; defaults to checkpoint meta when available")
     # parser.add_argument(
     #     "--save-debug-dir",
     #     type=Path,
@@ -391,9 +504,6 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    dataset = VinDrBboxDataset(csv_path=csv_path, images_root=images_root, split_name="test")
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
-
     # Load checkpoint to inspect meta first (may contain anchor sizes / config)
     ckpt = torch.load(ckpt_path, map_location=device)
     meta = ckpt.get("meta", {})
@@ -405,6 +515,28 @@ def main() -> None:
     box_score_thresh = args.box_score_thresh if args.box_score_thresh is not None else float(meta.get("box_score_thresh", 0.05))
     box_detections_per_img = args.box_detections_per_img if args.box_detections_per_img is not None else int(meta.get("box_detections_per_img", 100))
     print(f"[Info] box_score_thresh={box_score_thresh}, box_detections_per_img={box_detections_per_img}")
+    score_threshold = args.score_threshold if args.score_threshold is not None else float(meta.get("val_score_threshold", 0.5))
+    iou_threshold = args.iou_threshold if args.iou_threshold is not None else float(meta.get("val_iou_threshold", 0.5))
+    print(f"[Info] eval score_threshold={score_threshold}, iou_threshold={iou_threshold}")
+
+    crop_from_meta = bool(meta.get("crop_breast_region", False))
+    if args.force_breast_crop:
+        crop_breast_region = True
+    elif args.disable_breast_crop:
+        crop_breast_region = False
+    else:
+        crop_breast_region = crop_from_meta
+    breast_crop_margin = float(args.breast_crop_margin) if args.breast_crop_margin is not None else float(meta.get("breast_crop_margin", 0.05))
+    print(f"[Info] breast_crop_region={crop_breast_region}, breast_crop_margin={breast_crop_margin}")
+
+    dataset = VinDrBboxDataset(
+        csv_path=csv_path,
+        images_root=images_root,
+        split_name="test",
+        crop_breast_region=crop_breast_region,
+        breast_crop_margin=breast_crop_margin,
+    )
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
 
     model = build_model(num_classes=2, anchor_sizes=anchor_sizes,
                         box_score_thresh=box_score_thresh, box_detections_per_img=box_detections_per_img)
@@ -418,8 +550,8 @@ def main() -> None:
         model=model,
         loader=loader,
         device=device,
-        score_threshold=args.score_threshold,
-        iou_threshold=args.iou_threshold,
+        score_threshold=score_threshold,
+        iou_threshold=iou_threshold,
         # save_debug_dir=args.save_debug_dir,
         # max_debug_images=args.max_debug_images,
         # nms_iou=args.nms_iou,

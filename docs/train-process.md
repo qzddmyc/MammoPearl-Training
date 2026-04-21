@@ -4,11 +4,11 @@
 
 你可以使用以下命令运行预处理程序：
 ```bash
-python ./src/data/pre_process/pre-process.py
+python src/data/pre_process/pre-process.py
 ```
 如果你需要获得预处理的过程图片，使用如下命令：
 ```bash
-python ./src/data/pre_process/pre-process-test.py
+python src/data/pre_process/pre-process-test.py
 ```
 此程序会选取随机 3 个文件夹下的所有图片进行预处理，并按照 `<图片索引>-<处理步骤>-<原始名称>` 的命名规则，将所有的中间产出结果保存至项目的 `/tmp/pre_process_test` 文件夹下。
 
@@ -16,7 +16,7 @@ python ./src/data/pre_process/pre-process-test.py
 
 你可以使用以下命令运行分割的**测试**程序：
 ```bash
-python ./src/data/segment/segment-test.py
+python src/data/segment/segment-test.py
 ```
 该测试程序可以选取部分**正样本**的**训练**文件，并根据标注文件中的数据对图像进行分割。其保存的目录会在运行之后进行输出。
 

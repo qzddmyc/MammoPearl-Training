@@ -7,25 +7,25 @@
 
 r"""
 
-Use this to run:
+Use this to run in Git Bash:
 
 python src/data/bounding-box/bbox-train-resnet50.py \
-    --epochs 40 \
+    --epochs 50 \
     --batch-size 2 \
     --accumulation-steps 4 \
     --lr 0.005 \
-    --freeze-epochs 3 \
+    --post-warmup-lr 0.001 \
+    --freeze-epochs 0 \
     --roi-batch-size-per-image 512 \
     --roi-positive-fraction 0.25 \
     --anchor-sizes 16,32,64,128,256 \
     --cls-loss-type weighted_ce \
-    --cls-weight-bg 0.3 \
+    --cls-weight-bg 1.0 \
     --cls-weight-lesion 1.0 \
     --box-fg-iou-thresh 0.5 \
-    --warmup-balanced-epochs 5 \
+    --warmup-balanced-epochs 8 \
     --warmup-pos-weight-ratio 10.0 \
-    --only-use 0.3 \
-    --patience 10
+    --patience 15
 
 本文件介绍：
 
@@ -103,6 +103,30 @@ Prompts for improvement:
 21. 新增 --only-use 参数（float，默认 1.0）：在正式训练阶段每个 epoch 仅使用分配数据总量的指定
     比例。正负样本按原始比例等比缩减，并对正样本设最低保护（不低于原始比例对应的数量）。通过跨
     epoch 轮转采样机制，确保所有图像在多个 epoch 中均被训练到。
+-----------
+22. 修复误导性警告：将 scheduler 更新判断从二分支（warmup | else）扩展为四分支，明确区分
+    "warmup 阶段跳过"、"本 epoch 刚重建 optimizer（正常行为）"、"正常 step"、"真正 0 步（异
+    常）"四种情况，避免重建后误报 [Warning] No optimizer.step()。
+23. 新增 --post-warmup-lr 参数（float，默认 None 即沿用 --lr）：balanced warmup 结束后重建
+    optimizer 时使用该 LR 代替原始 --lr，允许以较低学习率进入正式训练阶段，减少 warmup 结束
+    后的梯度震荡。若未传该参数，行为与之前完全一致。
+24. 新增 freeze_epochs / warmup 冲突检测：若 0 < freeze_epochs < warmup_balanced_epochs，
+    则在启动时打印 [Warning]，提示用户该配置会在 warmup 内部触发 optimizer 重建，可能引发
+    FP 反弹，建议设为 0 或 >= warmup_balanced_epochs。
+25. 在每个 epoch 循环开始处打印分割线（"=" * 60 + "Epoch n/N start" + "=" * 60），便于在
+    长日志中快速定位各 epoch 的起止边界。
+26. 在 weighted_ce 模式下新增背景权重保护：若训练集负样本图像明显多于正样本图像，且
+    --cls-weight-bg < 1.0，则默认将背景权重钳制到 1.0 并打印告警；只有显式传入
+    --allow-low-bg-weight 时才允许保留更低的背景权重，以避免背景分类损失被过度削弱、导致
+    bbox 误检（FP）爆炸。
+27. 启动时打印 train/val 的 neg/pos image ratio，并对 --only-use < 1.0 做阳性样本量预警：
+    若估算每轮可见正样本图像过少，则提示该配置可能导致正式训练阶段学习不足与 FP 反弹。同步
+    更新推荐命令：默认不再推荐 --only-use 0.3，并将 --cls-weight-bg 推荐值调整为 1.0。
+28. 为了更符合“病灶区域的初步框选”目标，在训练和验证阶段默认启用乳房主体区域裁剪：
+    先在 processed 图像上检测乳房主体轮廓，再对图像进行裁剪，并将 bbox 同步重映射到裁剪后
+    的局部坐标系，减少大面积黑色背景和非乳房区域对 detector 的干扰。
+29. 将乳房主体裁剪的开关和边缘留白提取为参数（--disable-breast-crop / --breast-crop-margin），
+    并把裁剪配置写入 checkpoint meta，要求测试脚本优先读取同一配置，保持训练/测试口径一致。
 
 """
 
@@ -188,6 +212,89 @@ def image_to_tensor(img: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 
 
+def detect_breast_region(
+    img: np.ndarray,
+    margin_ratio: float = 0.05,
+) -> Tuple[int, int, int, int]:
+    """Detect a breast-region crop on a processed mammogram.
+
+    The processed images already suppress most background, so a largest-contour
+    heuristic is sufficient and keeps the detector focused on coarse lesion
+    localization inside the breast region.
+    """
+    if img.ndim == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = img
+
+    if gray.dtype != np.uint8:
+        gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    h, w = gray.shape[:2]
+    if h <= 0 or w <= 0:
+        return 0, 0, 0, 0
+    if np.max(gray) <= 0:
+        return 0, 0, w, h
+
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        ys, xs = np.where(gray > 0)
+        if xs.size == 0 or ys.size == 0:
+            return 0, 0, w, h
+        x1 = int(xs.min())
+        y1 = int(ys.min())
+        x2 = int(xs.max()) + 1
+        y2 = int(ys.max()) + 1
+    else:
+        contour = max(contours, key=cv2.contourArea)
+        x, y, cw, ch = cv2.boundingRect(contour)
+        x1 = int(x)
+        y1 = int(y)
+        x2 = int(x + cw)
+        y2 = int(y + ch)
+
+    margin_ratio = max(0.0, float(margin_ratio))
+    margin_x = int(round((x2 - x1) * margin_ratio))
+    margin_y = int(round((y2 - y1) * margin_ratio))
+    x1 = max(0, x1 - margin_x)
+    y1 = max(0, y1 - margin_y)
+    x2 = min(w, x2 + margin_x)
+    y2 = min(h, y2 + margin_y)
+
+    if x2 <= x1 or y2 <= y1:
+        return 0, 0, w, h
+    return x1, y1, x2, y2
+
+
+def crop_image_and_boxes(
+    img: np.ndarray,
+    boxes: np.ndarray,
+    crop_box: Tuple[int, int, int, int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Crop image and remap boxes to the crop-local coordinate system."""
+    x1, y1, x2, y2 = crop_box
+    cropped_img = img[y1:y2, x1:x2]
+    if boxes.size == 0:
+        return cropped_img, np.zeros((0, 4), dtype=np.float32)
+
+    cropped_boxes = boxes.astype(np.float32).copy()
+    cropped_boxes[:, [0, 2]] -= float(x1)
+    cropped_boxes[:, [1, 3]] -= float(y1)
+
+    crop_h, crop_w = cropped_img.shape[:2]
+    cropped_boxes[:, 0] = np.clip(cropped_boxes[:, 0], 0, max(crop_w - 1, 0))
+    cropped_boxes[:, 2] = np.clip(cropped_boxes[:, 2], 0, max(crop_w - 1, 0))
+    cropped_boxes[:, 1] = np.clip(cropped_boxes[:, 1], 0, max(crop_h - 1, 0))
+    cropped_boxes[:, 3] = np.clip(cropped_boxes[:, 3], 0, max(crop_h - 1, 0))
+
+    keep = (cropped_boxes[:, 2] > cropped_boxes[:, 0] + 1) & (cropped_boxes[:, 3] > cropped_boxes[:, 1] + 1)
+    return cropped_img, cropped_boxes[keep]
+
+
 @dataclass
 class Sample:
     patient_id: str
@@ -210,11 +317,15 @@ class VinDrBboxDataset(Dataset):
         images_root: Path,
         split_name: str,
         positive_only: bool = False,
+        crop_breast_region: bool = True,
+        breast_crop_margin: float = 0.05,
     ) -> None:
         self.csv_path = csv_path
         self.images_root = images_root
         self.split_name = split_name
         self.positive_only = positive_only
+        self.crop_breast_region = crop_breast_region
+        self.breast_crop_margin = breast_crop_margin
 
         df = pd.read_csv(csv_path, low_memory=False)
         df = df[df["split"].astype(str).str.lower() == split_name.lower()].copy()
@@ -285,6 +396,10 @@ class VinDrBboxDataset(Dataset):
             keep = (boxes[:, 2] > boxes[:, 0] + 1) & (boxes[:, 3] > boxes[:, 1] + 1)
             boxes = boxes[keep]
 
+        if self.crop_breast_region:
+            crop_box = detect_breast_region(img, margin_ratio=self.breast_crop_margin)
+            img, boxes = crop_image_and_boxes(img, boxes, crop_box)
+
         if boxes.size == 0:
             boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
             labels_tensor = torch.zeros((0,), dtype=torch.int64)
@@ -335,6 +450,30 @@ def summarize_subset(samples: List[Sample], indices: List[int]) -> Dict[str, Any
         "negative_images": int(negative_images),
         "positive_ratio": float(positive_ratio),
     }
+
+
+def compute_neg_pos_ratio(summary: Dict[str, Any]) -> float:
+    """Return negative-to-positive image ratio for a summarized subset."""
+    positive_images = int(summary.get("positive_images", 0))
+    negative_images = int(summary.get("negative_images", 0))
+    if positive_images <= 0:
+        return float("inf") if negative_images > 0 else 0.0
+    return float(negative_images / positive_images)
+
+
+def warn_on_small_epoch_positive_pool(train_summary: Dict[str, Any], only_use: float) -> None:
+    """Warn when epoch subsampling leaves too few positive images for stable training."""
+    if only_use >= 1.0:
+        return
+
+    positive_images = int(train_summary.get("positive_images", 0))
+    estimated_positive_images = math.ceil(positive_images * only_use)
+    if 0 < estimated_positive_images < 256:
+        print(
+            f"[Warning] --only-use={only_use:.3f} leaves about {estimated_positive_images} positive images per epoch "
+            f"under the current train split. This often weakens lesion learning and can trigger FP rebound; "
+            f"prefer --only-use 1.0 for final detector training."
+        )
 
 
 def select_epoch_subset(
@@ -1073,8 +1212,9 @@ def parse_args() -> argparse.Namespace:
 
     # Classification loss strategy
     parser.add_argument("--cls-loss-type", type=str, default="ce", choices=["ce", "weighted_ce", "focal"], help="ROI classification loss: ce / weighted_ce / focal")
-    parser.add_argument("--cls-weight-bg", type=float, default=0.1, help="Background class weight for weighted_ce")
+    parser.add_argument("--cls-weight-bg", type=float, default=1.0, help="Background class weight for weighted_ce; <1.0 can increase FP on heavily imbalanced data")
     parser.add_argument("--cls-weight-lesion", type=float, default=1.0, help="Lesion class weight for weighted_ce")
+    parser.add_argument("--allow-low-bg-weight", action="store_true", help="Keep --cls-weight-bg < 1.0 even when train negatives strongly outnumber positives")
     parser.add_argument("--focal-gamma", type=float, default=2.0, help="Focal loss gamma (higher = more focus on hard examples)")
     parser.add_argument("--focal-alpha-bg", type=float, default=0.25, help="Focal loss alpha for background class")
     parser.add_argument("--focal-alpha-lesion", type=float, default=0.75, help="Focal loss alpha for lesion class")
@@ -1090,6 +1230,7 @@ def parse_args() -> argparse.Namespace:
     # Balanced sampling warmup (replaces positive-only warmup)
     parser.add_argument("--warmup-balanced-epochs", type=int, default=0, help="Epochs to use balanced (weighted) sampling before full training (0=disabled)")
     parser.add_argument("--warmup-pos-weight-ratio", type=float, default=10.0, help="Positive sample weight relative to negative in balanced warmup")
+    parser.add_argument("--post-warmup-lr", type=float, default=None, help="LR used when rebuilding optimizer after balanced warmup ends (defaults to --lr if not set)")
 
     # Epoch subsampling
     parser.add_argument("--only-use", type=float, default=1.0, help="Fraction of training data to use per epoch (0.0-1.0); rotates across epochs to cover all data")
@@ -1097,6 +1238,8 @@ def parse_args() -> argparse.Namespace:
     # Inference-time box filtering
     parser.add_argument("--box-score-thresh", type=float, default=0.05, help="Score threshold for inference-time box filtering")
     parser.add_argument("--box-detections-per-img", type=int, default=100, help="Max detections per image at inference time")
+    parser.add_argument("--disable-breast-crop", action="store_true", help="Disable breast-region cropping and train on the full processed image")
+    parser.add_argument("--breast-crop-margin", type=float, default=0.05, help="Relative padding added around the detected breast crop")
 
     return parser.parse_args()
 
@@ -1107,6 +1250,8 @@ def main() -> None:
     csv_path = args.csv_path or (root / "data" / "raw" / "vindr_detection_folds.csv")
     images_root = args.images_root or (root / "data" / "processed" / "images_png")
     save_path = args.save_path or (root / "models" / "bbox_resnet50.pth")
+    crop_breast_region = not bool(args.disable_breast_crop)
+    breast_crop_margin = max(0.0, float(args.breast_crop_margin))
 
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV not found: {csv_path}")
@@ -1120,6 +1265,16 @@ def main() -> None:
         print("[Warning] Focal Loss and OHEM should not be used together (gradient signal over-dilution). Disabling OHEM.")
         args.ohem = False
 
+    # freeze_epochs / warmup conflict check
+    _freeze = int(args.freeze_epochs)
+    _wbal = int(args.warmup_balanced_epochs)
+    if 0 < _freeze < _wbal:
+        print(
+            f"[Warning] --freeze-epochs={_freeze} falls inside balanced warmup range (0~{_wbal}). "
+            f"This will rebuild the optimizer mid-warmup and may cause FP instability. "
+            f"Recommended: set --freeze-epochs=0 or --freeze-epochs>={_wbal}."
+        )
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Build the full training split first, then split it into train/validation
@@ -1129,6 +1284,8 @@ def main() -> None:
         images_root=images_root,
         split_name="training",
         positive_only=False,
+        crop_breast_region=crop_breast_region,
+        breast_crop_margin=breast_crop_margin,
     )
 
     # Read bad data record (if exists) and build a set of (patient_id,image_id)
@@ -1174,6 +1331,8 @@ def main() -> None:
 
     train_summary = summarize_subset(train_dataset.samples, train_indices)
     val_summary = summarize_subset(train_dataset.samples, val_indices)
+    train_neg_to_pos_ratio = compute_neg_pos_ratio(train_summary)
+    val_neg_to_pos_ratio = compute_neg_pos_ratio(val_summary)
 
     split_summary["train"] = train_summary
     split_summary["val"] = val_summary
@@ -1206,8 +1365,23 @@ def main() -> None:
     # Apply custom ROI classification loss (Weighted CE / Focal Loss / OHEM)
     _cls_weight = None
     _focal_alpha = None
+    effective_cls_weight_bg = float(args.cls_weight_bg)
+    effective_cls_weight_lesion = float(args.cls_weight_lesion)
+    low_bg_weight_guard_applied = False
     if args.cls_loss_type == "weighted_ce":
-        _cls_weight = torch.tensor([float(args.cls_weight_bg), float(args.cls_weight_lesion)])
+        if (
+            train_neg_to_pos_ratio >= 5.0
+            and effective_cls_weight_bg < 1.0
+            and not args.allow_low_bg_weight
+        ):
+            print(
+                f"[Warning] weighted_ce received --cls-weight-bg={effective_cls_weight_bg:.3f} while train neg/pos image ratio is "
+                f"{train_neg_to_pos_ratio:.2f}. Clamping background weight to 1.0 to avoid under-penalizing background FP. "
+                f"Pass --allow-low-bg-weight to keep the lower value."
+            )
+            effective_cls_weight_bg = 1.0
+            low_bg_weight_guard_applied = True
+        _cls_weight = torch.tensor([effective_cls_weight_bg, effective_cls_weight_lesion])
     if args.cls_loss_type == "focal":
         _focal_alpha = torch.tensor([float(args.focal_alpha_bg), float(args.focal_alpha_lesion)])
     apply_custom_roi_loss(
@@ -1221,6 +1395,11 @@ def main() -> None:
         ohem_min_samples=int(args.ohem_min_samples),
     )
     print(f"[Info] ROI loss: type={args.cls_loss_type}, ohem={args.ohem}")
+    if _cls_weight is not None:
+        print(
+            f"[Info] Effective weighted_ce class weights: background={effective_cls_weight_bg:.3f}, "
+            f"lesion={effective_cls_weight_lesion:.3f}"
+        )
 
     # Freeze low-level backbone layers initially if requested
     if int(args.freeze_epochs) > 0:
@@ -1270,7 +1449,16 @@ def main() -> None:
         f"Split summary | train patients: {split_summary['train_patients']} | val patients: {split_summary['val_patients']} | "
         f"val_ratio≈{split_summary['val_ratio']}"
     )
+    print(
+        f"[Info] Image imbalance | train neg/pos={train_neg_to_pos_ratio:.2f} | "
+        f"val neg/pos={val_neg_to_pos_ratio:.2f}"
+    )
+    print(
+        f"[Info] Coarse localization mode | breast_crop_region={crop_breast_region} | "
+        f"breast_crop_margin={breast_crop_margin:.3f}"
+    )
     print(f"Device: {device}")
+    warn_on_small_epoch_positive_pool(train_summary, only_use)
 
     # Prepare balanced sampling warmup (replaces positive-only warmup)
     warmup_pos_epochs = int(args.warmup_positive_epochs)
@@ -1302,6 +1490,8 @@ def main() -> None:
     no_improve_epochs = 0
 
     for epoch in range(int(args.epochs)):
+        print(f"\n{'=' * 60} Epoch {epoch + 1}/{int(args.epochs)} start {'=' * 60}")
+
         # --- Phase detection ---
         is_warmup_balanced = warmup_balanced_epochs > 0 and epoch < warmup_balanced_epochs
         _is_legacy_warmup = (not is_warmup_balanced) and warmup_train_subset is not None and epoch < warmup_pos_epochs
@@ -1315,7 +1505,10 @@ def main() -> None:
         rebuilt_warmup = False
         if not is_warmup_balanced and epoch == warmup_balanced_epochs and warmup_balanced_epochs > 0:
             print(f"[Info] Balanced warmup complete, resetting optimizer and switching to full training ({len(train_subset)} images)")
-            optimizer = create_optimizer(model, args, base_lr=float(args.lr))
+            _post_warmup_lr = float(args.post_warmup_lr) if args.post_warmup_lr is not None else float(args.lr)
+            if args.post_warmup_lr is not None:
+                print(f"[Info] post-warmup LR set to {_post_warmup_lr} (from --post-warmup-lr)")
+            optimizer = create_optimizer(model, args, base_lr=_post_warmup_lr)
             remaining = max(1, int(args.epochs) - epoch)
             if int(args.lr_step_size) > 0:
                 lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=int(args.lr_step_size), gamma=float(args.lr_gamma))
@@ -1429,7 +1622,10 @@ def main() -> None:
         # Skip scheduler stepping during balanced warmup phase
         if is_warmup_balanced:
             print(f"[Info] Warmup epoch {epoch + 1}: skipping lr_scheduler.step()")
-        elif optimizer_steps > 0 and not rebuilt_this_epoch:
+        elif rebuilt_this_epoch:
+            # optimizer/scheduler was just rebuilt this epoch — do not step (this is normal)
+            print(f"[Info] Epoch {epoch + 1}: optimizer/scheduler rebuilt this epoch, skipping lr_scheduler.step()")
+        elif optimizer_steps > 0:
             print(f"[Info] lr_scheduler.step() at epoch {epoch + 1}.")
             lr_scheduler.step()
         else:
@@ -1485,10 +1681,17 @@ def main() -> None:
                 "best_val_f1": float(val_metrics["f1"]),
                 "cls_loss_type": str(args.cls_loss_type),
                 "ohem_enabled": bool(args.ohem),
+                "effective_cls_weight_bg": float(effective_cls_weight_bg),
+                "effective_cls_weight_lesion": float(effective_cls_weight_lesion),
+                "low_bg_weight_guard_applied": bool(low_bg_weight_guard_applied),
+                "crop_breast_region": bool(crop_breast_region),
+                "breast_crop_margin": float(breast_crop_margin),
                 "box_fg_iou_thresh": float(args.box_fg_iou_thresh),
                 "warmup_positive_epochs": int(args.warmup_positive_epochs),
                 "warmup_balanced_epochs": int(warmup_balanced_epochs),
                 "only_use": float(only_use),
+                "train_neg_to_pos_ratio": float(train_neg_to_pos_ratio),
+                "val_neg_to_pos_ratio": float(val_neg_to_pos_ratio),
                 "box_score_thresh": float(args.box_score_thresh),
                 "box_detections_per_img": int(args.box_detections_per_img),
                 "split_summary": split_summary,
@@ -1548,10 +1751,17 @@ def main() -> None:
         "best_val_f1": float(best_val_f1 if best_val_f1 != -float("inf") else 0.0),
         "cls_loss_type": str(args.cls_loss_type),
         "ohem_enabled": bool(args.ohem),
+        "effective_cls_weight_bg": float(effective_cls_weight_bg),
+        "effective_cls_weight_lesion": float(effective_cls_weight_lesion),
+        "low_bg_weight_guard_applied": bool(low_bg_weight_guard_applied),
+        "crop_breast_region": bool(crop_breast_region),
+        "breast_crop_margin": float(breast_crop_margin),
         "box_fg_iou_thresh": float(args.box_fg_iou_thresh),
         "warmup_positive_epochs": int(args.warmup_positive_epochs),
         "warmup_balanced_epochs": int(warmup_balanced_epochs),
         "only_use": float(only_use),
+        "train_neg_to_pos_ratio": float(train_neg_to_pos_ratio),
+        "val_neg_to_pos_ratio": float(val_neg_to_pos_ratio),
         "box_score_thresh": float(args.box_score_thresh),
         "box_detections_per_img": int(args.box_detections_per_img),
         "split_summary": split_summary,

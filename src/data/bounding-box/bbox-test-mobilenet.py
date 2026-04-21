@@ -473,7 +473,7 @@ if __name__ == "__main__":
 
 """
 
-$ python src/data/bounding-box/bbox-test.py --score-threshold 0.1
+$ python src/data/bounding-box/bbox-test-mobilenet.py --score-threshold 0.1
 {
   "images": 4000,
   "gt_boxes": 447,
@@ -494,7 +494,7 @@ $ python src/data/bounding-box/bbox-test.py --score-threshold 0.1
   }
 }
 
-$ python src/data/bounding-box/bbox-test.py --score-threshold 0.2
+$ python src/data/bounding-box/bbox-test-mobilenet.py --score-threshold 0.2
 {
   "images": 4000,
   "gt_boxes": 447,
@@ -515,7 +515,7 @@ $ python src/data/bounding-box/bbox-test.py --score-threshold 0.2
   }
 }
 
-$ python src/data/bounding-box/bbox-test.py --score-threshold 0.3
+$ python src/data/bounding-box/bbox-test-mobilenet.py --score-threshold 0.3
 {
   "images": 4000,
   "gt_boxes": 447,
