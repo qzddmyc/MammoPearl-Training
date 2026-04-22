@@ -133,6 +133,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import atexit
+import datetime
 import math
 import random
 import time
@@ -1753,8 +1755,15 @@ def main() -> None:
 
 if __name__ == "__main__":
     start_time = time.time()
+    print(f"Start time:  {datetime.datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')}")
+
+    def _on_exit():
+        end_time = time.time()
+        print(f"Exit time:   {datetime.datetime.fromtimestamp(end_time).strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Running time: {end_time - start_time:.2f} s.")
+
+    atexit.register(_on_exit)
     main()
-    print(f"Running time: {time.time() - start_time} s.")
 
 
 r"""log
