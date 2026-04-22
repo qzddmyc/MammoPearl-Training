@@ -1,7 +1,7 @@
-# bbox-train-resnet50.py / bbox-test-resnet50.py 功能文档
+# bbox-train.py / bbox-test.py 功能文档
 
-> 训练脚本：`src/data/bounding-box/bbox-train-resnet50.py`  
-> 测试脚本：`src/data/bounding-box/bbox-test-resnet50.py`
+> 训练脚本：`src/data/bounding-box/bbox-train.py`  
+> 测试脚本：`src/data/bounding-box/bbox-test.py`
 
 ## 1. 设计目标
 
@@ -783,7 +783,7 @@ test 文件里存在被注释掉、当前未启用的参数定义：
 ## 9.1 train 文件开头当前给出的训练示例
 
 ```bash
-python src/data/bounding-box/bbox-train-resnet50.py \
+python src/data/bounding-box/bbox-train.py \
     --epochs 50 \
     --batch-size 2 \
     --accumulation-steps 4 \
@@ -805,12 +805,12 @@ python src/data/bounding-box/bbox-train-resnet50.py \
 ## 9.2 test 文件开头当前给出的测试示例
 
 ```bash
-python src/data/bounding-box/bbox-test-resnet50.py \
+python src/data/bounding-box/bbox-test.py \
     --ckpt-path models/bbox_resnet50.pth
 ```
 
 ```bash
-python src/data/bounding-box/bbox-test-resnet50.py \
+python src/data/bounding-box/bbox-test.py \
     --ckpt-path models/bbox_resnet50.pth \
     --save-predictions tmp/bbox_test_matches.csv
 ```

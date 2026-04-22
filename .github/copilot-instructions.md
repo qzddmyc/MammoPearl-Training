@@ -1,11 +1,16 @@
 # Repository Copilot Instructions
 
+## Language
+
+1. The user communicates in Simplified Chinese. All substantive responses, explanations, analysis, and summaries must be written in Simplified Chinese.
+2. Code, command-line examples, file paths, and technical identifiers should remain in their original form (English/ASCII).
+
 ## Path notation and shell usage
 
 1. The default terminal in this repository is Git Bash.
 2. When writing runnable shell examples, use Git Bash / Bash syntax instead of PowerShell syntax.
 3. When a multi-line shell command needs explicit continuation, use `\`; do not use PowerShell backticks.
-4. In runnable commands, prefer Unix-style forward-slash paths such as `src/data/bounding-box/bbox-test-resnet50.py` and `models/bbox_resnet50.pth`.
+4. In runnable commands, prefer Unix-style forward-slash paths such as `src/data/bounding-box/my-script.py` and `models/bbox_output.pth`.
 
 ## ask_user usage
 

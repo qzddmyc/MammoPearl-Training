@@ -1,5 +1,4 @@
 # 使用 fasterrcnn_resnet50_fpn 模型对数据集进行训练
-# 这个样本中的 bad data 使用 bad_data_record_resnet50.csv，但是跑完筛选程序后，会发现这是一个空集合。
 
 # 使用这个模型去训练会耗费很长的时间，需要注意
 
@@ -9,7 +8,7 @@ r"""
 
 Use this to run in Git Bash:
 
-python src/data/bounding-box/bbox-train-resnet50.py \
+python src/data/bounding-box/bbox-train.py \
     --epochs 50 \
     --batch-size 2 \
     --accumulation-steps 4 \
@@ -136,7 +135,6 @@ import argparse
 import json
 import math
 import random
-import csv
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -533,7 +531,6 @@ def split_train_val_by_patient(
     samples: List[Sample],
     val_ratio: float,
     seed: int,
-    bad_set: Optional[set[tuple[str, str]]] = None,
 ) -> Tuple[List[int], List[int], Dict[str, Any]]:
     """Split training data into train/val at the patient level.
 
@@ -541,11 +538,7 @@ def split_train_val_by_patient(
     original positive/negative distribution approximately stable by selecting
     roughly the same proportion of positive-patient and negative-patient images.
     """
-    usable_indices: List[int] = []
-    for idx, sample in enumerate(samples):
-        if bad_set and (sample.patient_id, sample.image_id) in bad_set:
-            continue
-        usable_indices.append(idx)
+    usable_indices: List[int] = list(range(len(samples)))
 
     patient_to_records: Dict[str, Dict[str, Any]] = {}
     for idx in usable_indices:
@@ -1288,25 +1281,7 @@ def main() -> None:
         breast_crop_margin=breast_crop_margin,
     )
 
-    # Read bad data record (if exists) and build a set of (patient_id,image_id)
-    bad_record_path = Path(__file__).resolve().parent / "bad_data_record_resnet50.csv"
-    bad_set = set()
-    if bad_record_path.exists():
-        print("[Info] Bad data file record found.")
-        try:
-            with bad_record_path.open("r", newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    pid = row.get("patient_id")
-                    iid = row.get("image_id")
-                    if pid is not None and iid is not None:
-                        bad_set.add((str(pid), str(iid)))
-        except Exception:
-            bad_set = set()
-    else:
-        print("[Info] bad data not found, use empty set instead.")
-
-    usable_indices = [i for i, s in enumerate(train_dataset.samples) if (s.patient_id, s.image_id) not in bad_set]
+    usable_indices = list(range(len(train_dataset.samples)))
     pos_indices = [i for i in usable_indices if train_dataset.samples[i].boxes.size > 0]
     neg_indices = [i for i in usable_indices if train_dataset.samples[i].boxes.size == 0]
 
@@ -1314,7 +1289,6 @@ def main() -> None:
         samples=train_dataset.samples,
         val_ratio=float(args.val_ratio),
         seed=int(args.seed),
-        bad_set=bad_set,
     )
 
     # Keep the existing positive-only behavior for training only.
