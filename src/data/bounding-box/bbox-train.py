@@ -734,6 +734,7 @@ def validate_one_epoch(
     iou_threshold: float,
     epoch: int,
     epochs: int,
+    disable_tqdm: bool = False,
 ) -> Dict[str, float]:
     """Validate one epoch without gradient computation."""
     model.eval()
@@ -750,7 +751,7 @@ def validate_one_epoch(
     multi_thresholds = [0.1, 0.3, 0.5, 0.7, 0.9]
     multi_stats: Dict[float, Dict[str, int]] = {t: {"tp": 0, "fp": 0} for t in multi_thresholds}
 
-    pbar = tqdm(loader, desc=f"val {epoch + 1}/{epochs}", leave=False)
+    pbar = tqdm(loader, desc=f"val {epoch + 1}/{epochs}", leave=False, disable=disable_tqdm)
 
     with torch.no_grad():
         for images, targets in pbar:
@@ -1057,6 +1058,7 @@ def train_one_epoch(
     epochs: int,
     accumulation_steps: int,
     warmup_scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    disable_tqdm: bool = False,
 ) -> Tuple[float, int, Dict[str, float]]:
     """Train one epoch with gradient accumulation and optional iter-level LinearLR warmup.
 
@@ -1074,7 +1076,7 @@ def train_one_epoch(
     subloss_sums: Dict[str, float] = defaultdict(float)
 
     optimizer.zero_grad(set_to_none=True)
-    pbar = tqdm(loader, desc=f"epoch {epoch + 1}/{epochs}", leave=False)
+    pbar = tqdm(loader, desc=f"epoch {epoch + 1}/{epochs}", leave=False, disable=disable_tqdm)
 
     for i, (images, targets) in enumerate(pbar):
         images = [img.to(device) for img in images]
@@ -1233,6 +1235,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--box-detections-per-img", type=int, default=100, help="Max detections per image at inference time")
     parser.add_argument("--disable-breast-crop", action="store_true", help="Disable breast-region cropping and train on the full processed image")
     parser.add_argument("--breast-crop-margin", type=float, default=0.05, help="Relative padding added around the detected breast crop")
+    parser.add_argument("--hide-progress-bar", action="store_true", help="Suppress tqdm progress bars during training and validation")
 
     return parser.parse_args()
 
@@ -1565,6 +1568,7 @@ def main() -> None:
             int(args.epochs),
             accumulation_steps,
             warmup_scheduler,
+            disable_tqdm=args.hide_progress_bar,
         )
 
         # Unfreeze backbone after configured freeze epochs
@@ -1590,6 +1594,7 @@ def main() -> None:
             iou_threshold=float(args.val_iou_threshold),
             epoch=epoch,
             epochs=int(args.epochs),
+            disable_tqdm=args.hide_progress_bar,
         )
 
         # Only step the epoch-level scheduler if we actually performed any optimizer.step()

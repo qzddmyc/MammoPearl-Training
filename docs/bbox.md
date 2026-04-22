@@ -742,6 +742,7 @@ test 文件里存在被注释掉、当前未启用的参数定义：
 | `--only-use` | `1.0` | 正式训练阶段每个 epoch 使用训练集的比例 |
 | `--disable-breast-crop` | off | 关闭乳房主体裁剪 |
 | `--breast-crop-margin` | `0.05` | 裁剪框相对留白比例 |
+| `--hide-progress-bar` | off | 不输出 tqdm 训练/验证进度条（仅训练脚本；测试脚本无此参数） |
 
 ---
 
