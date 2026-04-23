@@ -17,6 +17,7 @@ python src/data/bounding-box/bbox-train.py \
     --warmup-balanced-epochs 8 \
     --warmup-pos-weight-ratio 10.0 \
     --full-train-pos-weight-ratio 3.0 \
+    --freeze-epochs 0 \
     --augment \
     --aug-hflip-prob 0.5 \
     --aug-brightness-delta 0.2 \
@@ -1390,7 +1391,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--accumulation-steps", type=int, default=4, help="Gradient accumulation steps when not using --fuck-running")
 
     # Freeze / unfreeze backbone
-    parser.add_argument("--freeze-epochs", type=int, default=2, help="Number of epochs to freeze backbone layer1/2 before unfreezing")
+    parser.add_argument("--freeze-epochs", type=int, default=0, help="Number of epochs to freeze backbone layer1/2 before unfreezing (0 = no freeze)")
 
     # Anchor / ROI / RPN tuning
     parser.add_argument("--anchor-sizes", type=str, default="8,16,32,64,128", help="Comma-separated anchor sizes (one per FPN level ideally)")
