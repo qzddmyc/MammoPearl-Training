@@ -14,17 +14,23 @@ python src/data/bounding-box/bbox-train.py \
     --accumulation-steps 4 \
     --lr 0.005 \
     --post-warmup-lr 0.001 \
-    --freeze-epochs 0 \
-    --roi-batch-size-per-image 512 \
-    --roi-positive-fraction 0.25 \
+    --warmup-balanced-epochs 8 \
+    --warmup-pos-weight-ratio 10.0 \
+    --full-train-pos-weight-ratio 3.0 \
+    --augment \
+    --aug-hflip-prob 0.5 \
+    --aug-brightness-delta 0.2 \
+    --aug-rotation-max-deg 8.0 \
     --anchor-sizes 16,32,64,128,256 \
+    --rpn-fg-iou-thresh 0.5 \
     --cls-loss-type weighted_ce \
     --cls-weight-bg 1.0 \
     --cls-weight-lesion 1.0 \
+    --roi-batch-size-per-image 512 \
+    --roi-positive-fraction 0.25 \
     --box-fg-iou-thresh 0.5 \
-    --warmup-balanced-epochs 8 \
-    --warmup-pos-weight-ratio 10.0 \
-    --patience 15
+    --patience 15 \
+    --hide-progress-bar
 
 本文件介绍：
 
@@ -126,6 +132,23 @@ Prompts for improvement:
     的局部坐标系，减少大面积黑色背景和非乳房区域对 detector 的干扰。
 29. 将乳房主体裁剪的开关和边缘留白提取为参数（--disable-breast-crop / --breast-crop-margin），
     并把裁剪配置写入 checkpoint meta，要求测试脚本优先读取同一配置，保持训练/测试口径一致。
+-----------
+30. 新增随机数据增强支持（通过 --augment 启用），仅作用于训练集：
+    - 随机水平翻转（--aug-hflip-prob，默认 0.5）；
+    - 随机亮度扰动（--aug-brightness-delta，默认 ±0.2）；
+    - 随机小角度旋转（--aug-rotation-max-deg，默认 0.0，推荐 5~10）：
+      只对单框图像执行（多框跳过以避免 pivot 歧义）；旋转轴为 bbox 中心；
+      bbox 以 center-preserve 方式更新（中心旋转，尺寸不变）；
+      旋转后调用 detect_breast_region 二次裁剪去除黑角。
+    用 TrainAugmentWrapper 包裹训练 Subset，不创建额外数据集实例。
+31. 修复 RPN 正样本 IoU 阈值：将 --rpn-fg-iou-thresh 默认值从 0.7 降低到 0.5。
+    背景：处理后图像中典型病灶（resize 后约 225×167px）与最优 anchor（256px）的最大 IoU 仅
+    约 0.57，低于原始默认值 0.7，导致病灶 anchor 落入"灰色区间"被忽略，RPN 无法有效学习
+    病灶位置。降低阈值后这些 anchor 将被标记为正样本，显著改善 RPN 召回。
+32. 新增全训练阶段持续加权采样（--full-train-pos-weight-ratio，默认 0.0 即禁用）：在
+    balanced warmup 结束进入全量训练后，若该参数 > 0，则继续使用 WeightedRandomSampler
+    对正样本保持轻微过采样（如 3.0 表示正样本被采到的概率是负样本的 3 倍），防止模型因
+    图像级 10:1 负正比而坍缩至"什么都不预测"的极端状态。
 
 """
 
@@ -210,6 +233,150 @@ def image_to_tensor(img: np.ndarray) -> torch.Tensor:
     """Convert RGB uint8 image to a float tensor in [0, 1]."""
     arr = img.astype(np.float32) / 255.0
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+
+
+def _rotate_box_centers_preserve(
+    boxes: torch.Tensor,
+    angle_deg: float,
+    img_h: int,
+    img_w: int,
+    pivot_x: float,
+    pivot_y: float,
+) -> torch.Tensor:
+    """Rotate bbox centers around a given pivot; keep original box size.
+
+    Each box center is rotated around (pivot_x, pivot_y).  The box is then
+    reconstructed with its original width and height centered on the new
+    rotated position.  Coordinates are clamped to [0, W] x [0, H].
+    """
+    if boxes.numel() == 0:
+        return boxes.clone()
+
+    rad = math.radians(angle_deg)
+    cos_a, sin_a = math.cos(rad), math.sin(rad)
+
+    orig_w = boxes[:, 2] - boxes[:, 0]
+    orig_h = boxes[:, 3] - boxes[:, 1]
+    box_cx = (boxes[:, 0] + boxes[:, 2]) / 2.0
+    box_cy = (boxes[:, 1] + boxes[:, 3]) / 2.0
+
+    dx = box_cx - pivot_x
+    dy = box_cy - pivot_y
+    new_cx = cos_a * dx - sin_a * dy + pivot_x
+    new_cy = sin_a * dx + cos_a * dy + pivot_y
+
+    new_x1 = (new_cx - orig_w / 2.0).clamp(0.0, float(img_w))
+    new_y1 = (new_cy - orig_h / 2.0).clamp(0.0, float(img_h))
+    new_x2 = (new_cx + orig_w / 2.0).clamp(0.0, float(img_w))
+    new_y2 = (new_cy + orig_h / 2.0).clamp(0.0, float(img_h))
+
+    return torch.stack([new_x1, new_y1, new_x2, new_y2], dim=1)
+
+
+def random_augment_fn(
+    img: torch.Tensor,
+    target: Dict[str, torch.Tensor],
+    hflip_prob: float = 0.5,
+    brightness_delta: float = 0.2,
+    rotation_max_deg: float = 0.0,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Apply random augmentation to a (image tensor, target) pair.
+
+    img: float tensor in [0, 1] of shape [C, H, W].
+    target: dict with 'boxes' in xyxy format and other Faster R-CNN keys.
+
+    Augmentations applied:
+    - Random horizontal flip (probability = hflip_prob)
+    - Random brightness jitter (uniform in [-brightness_delta, +brightness_delta])
+    - Random small-angle rotation using strategy-A (keep original image size, fill
+      empty corners with 0; update boxes via rotated-corner AABB)
+    """
+    _, h, w = img.shape
+
+    # Random horizontal flip
+    if random.random() < hflip_prob:
+        img = torch.flip(img, [2])
+        boxes = target.get("boxes")
+        if boxes is not None and boxes.numel() > 0:
+            flipped_boxes = boxes.clone()
+            flipped_boxes[:, 0] = float(w) - boxes[:, 2]
+            flipped_boxes[:, 2] = float(w) - boxes[:, 0]
+            target = {**target, "boxes": flipped_boxes}
+
+    # Random small-angle rotation (strategy A: keep output size, zero-fill corners)
+    # Only applied to single-bbox images to avoid pivot ambiguity for multi-lesion cases.
+    if rotation_max_deg > 0.0:
+        boxes = target.get("boxes")
+        n_boxes = boxes.shape[0] if boxes is not None else 0
+        if n_boxes == 1:
+            angle = random.uniform(-rotation_max_deg, rotation_max_deg)
+            if abs(angle) > 0.1:  # skip near-zero rotations for efficiency
+                # Rotation pivot = bbox center
+                bx1, by1, bx2, by2 = boxes[0].tolist()
+                pivot_x = (bx1 + bx2) / 2.0
+                pivot_y = (by1 + by2) / 2.0
+
+                # Rotate image tensor via numpy/cv2 (keeps same H x W)
+                img_np = (img.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                M = cv2.getRotationMatrix2D((pivot_x, pivot_y), angle, 1.0)
+                rotated_np = cv2.warpAffine(
+                    img_np, M, (w, h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+                img = torch.from_numpy(rotated_np.astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
+
+                # Crop away black corners introduced by rotation.
+                # detect_breast_region works on non-zero pixels, so the zero-filled
+                # rotation corners are naturally excluded.
+                crop_box = detect_breast_region(rotated_np, margin_ratio=0.0)
+                rotated_np_cropped, _ = crop_image_and_boxes(rotated_np, np.zeros((0, 4), dtype=np.float32), crop_box)
+                img = torch.from_numpy(rotated_np_cropped.astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
+                # Remap h, w to the cropped size for subsequent box clamping
+                _, h, w = img.shape
+                cx1, cy1, _cx2, _cy2 = crop_box
+
+                # Update bbox: rotate center around pivot, keep original size
+                rotated_boxes = _rotate_box_centers_preserve(boxes, angle, h + cy1, w + cx1, pivot_x, pivot_y)
+                # Remap rotated bbox to crop-local coordinates
+                rotated_boxes[:, 0] -= cx1
+                rotated_boxes[:, 2] -= cx1
+                rotated_boxes[:, 1] -= cy1
+                rotated_boxes[:, 3] -= cy1
+                rotated_boxes[:, 0] = rotated_boxes[:, 0].clamp(0.0, float(w))
+                rotated_boxes[:, 2] = rotated_boxes[:, 2].clamp(0.0, float(w))
+                rotated_boxes[:, 1] = rotated_boxes[:, 1].clamp(0.0, float(h))
+                rotated_boxes[:, 3] = rotated_boxes[:, 3].clamp(0.0, float(h))
+                # Drop degenerate boxes that collapsed after clamp
+                keep = (rotated_boxes[:, 2] > rotated_boxes[:, 0] + 1) & (
+                    rotated_boxes[:, 3] > rotated_boxes[:, 1] + 1
+                )
+                rotated_boxes = rotated_boxes[keep]
+                target_labels = target.get("labels")
+                target_area = target.get("area")
+                target_iscrowd = target.get("iscrowd")
+                new_target: Dict[str, torch.Tensor] = {
+                    **target,
+                    "boxes": rotated_boxes,
+                }
+                if target_labels is not None:
+                    new_target["labels"] = target_labels[keep]
+                if target_area is not None:
+                    area = (rotated_boxes[:, 2] - rotated_boxes[:, 0]) * (
+                        rotated_boxes[:, 3] - rotated_boxes[:, 1]
+                    )
+                    new_target["area"] = area
+                if target_iscrowd is not None:
+                    new_target["iscrowd"] = target_iscrowd[keep]
+                target = new_target
+
+    # Random brightness/contrast jitter
+    if brightness_delta > 0.0:
+        factor = 1.0 + random.uniform(-brightness_delta, brightness_delta)
+        img = torch.clamp(img * factor, 0.0, 1.0)
+
+    return img, target
 
 
 def detect_breast_region(
@@ -425,6 +592,40 @@ class VinDrBboxDataset(Dataset):
 def collate_fn(batch):
     images, targets = zip(*batch)
     return list(images), list(targets)
+
+
+class TrainAugmentWrapper(torch.utils.data.Dataset):
+    """Wraps a Dataset/Subset and applies random augmentation during training.
+
+    This allows the same underlying dataset object to be shared between
+    train (with augmentation) and val (without augmentation) without creating
+    two separate dataset instances.
+    """
+
+    def __init__(
+        self,
+        dataset: torch.utils.data.Dataset,
+        hflip_prob: float = 0.5,
+        brightness_delta: float = 0.2,
+        rotation_max_deg: float = 0.0,
+    ) -> None:
+        self.dataset = dataset
+        self.hflip_prob = float(hflip_prob)
+        self.brightness_delta = float(brightness_delta)
+        self.rotation_max_deg = float(rotation_max_deg)
+
+    def __len__(self) -> int:
+        return len(self.dataset)  # type: ignore[arg-type]
+
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        img, target = self.dataset[index]
+        img, target = random_augment_fn(
+            img, target,
+            hflip_prob=self.hflip_prob,
+            brightness_delta=self.brightness_delta,
+            rotation_max_deg=self.rotation_max_deg,
+        )
+        return img, target
 
 
 def summarize_subset(samples: List[Sample], indices: List[int]) -> Dict[str, Any]:
@@ -1204,7 +1405,7 @@ def parse_args() -> argparse.Namespace:
     # IoU thresholds for training sample assignment
     parser.add_argument("--box-fg-iou-thresh", type=float, default=0.5, help="ROI head foreground IoU threshold (raise to 0.6-0.7 to reduce ambiguous positives)")
     parser.add_argument("--box-bg-iou-thresh", type=float, default=0.5, help="ROI head background IoU threshold")
-    parser.add_argument("--rpn-fg-iou-thresh", type=float, default=0.7, help="RPN foreground IoU threshold")
+    parser.add_argument("--rpn-fg-iou-thresh", type=float, default=0.5, help="RPN foreground IoU threshold (lowered from 0.7 to 0.5 for medical lesions whose best-anchor IoU rarely exceeds 0.6)")
     parser.add_argument("--rpn-bg-iou-thresh", type=float, default=0.3, help="RPN background IoU threshold")
 
     # Classification loss strategy
@@ -1238,6 +1439,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-breast-crop", action="store_true", help="Disable breast-region cropping and train on the full processed image")
     parser.add_argument("--breast-crop-margin", type=float, default=0.05, help="Relative padding added around the detected breast crop")
     parser.add_argument("--hide-progress-bar", action="store_true", help="Suppress tqdm progress bars during training and validation")
+
+    # Data augmentation
+    parser.add_argument("--augment", action="store_true", help="Enable random data augmentation (hflip + brightness jitter + optional rotation) on the training set")
+    parser.add_argument("--aug-hflip-prob", type=float, default=0.5, help="Probability of random horizontal flip when --augment is set")
+    parser.add_argument("--aug-brightness-delta", type=float, default=0.2, help="Magnitude of random brightness jitter (\u00b1delta) when --augment is set")
+    parser.add_argument(
+        "--aug-rotation-max-deg",
+        type=float,
+        default=0.0,
+        help=(
+            "Max absolute rotation angle (degrees) for random small-angle rotation augmentation "
+            "when --augment is set. 0 disables rotation. Recommended: 5.0-10.0. "
+            "Image size is kept identical (strategy-A: zero-fill corners). "
+            "Bboxes are updated via rotated-corner AABB and degenerate boxes are dropped."
+        ),
+    )
+
+    # Full-training positive sample weight (prevents post-warmup collapse)
+    parser.add_argument(
+        "--full-train-pos-weight-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "When > 0, keep a mild positive-oversampling via WeightedRandomSampler throughout the "
+            "full training phase (after warmup). Positive samples are given this weight relative "
+            "to negative samples (e.g. 3.0 means positives are 3x as likely to be sampled). "
+            "Helps prevent the model from collapsing to predict-nothing on heavily imbalanced data. "
+            "0.0 (default) disables this and uses plain shuffle."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -1318,8 +1549,24 @@ def main() -> None:
     split_summary["train_patients"] = int(len({train_dataset.samples[i].patient_id for i in train_indices}))
     split_summary["val_patients"] = int(len({train_dataset.samples[i].patient_id for i in val_indices}))
 
-    train_subset = Subset(train_dataset, train_indices)
+    _base_train_subset = Subset(train_dataset, train_indices)
     val_subset = Subset(train_dataset, val_indices)
+
+    # Optionally wrap the training subset with augmentation.
+    if args.augment:
+        train_subset = TrainAugmentWrapper(
+            _base_train_subset,
+            hflip_prob=float(args.aug_hflip_prob),
+            brightness_delta=float(args.aug_brightness_delta),
+            rotation_max_deg=float(args.aug_rotation_max_deg),
+        )
+        print(
+            f"[Info] Training augmentation enabled | hflip_prob={args.aug_hflip_prob} | "
+            f"brightness_delta=±{args.aug_brightness_delta} | "
+            f"rotation_max_deg=±{args.aug_rotation_max_deg}"
+        )
+    else:
+        train_subset = _base_train_subset
 
     if len(train_subset) == 0:
         raise ValueError("Training split is empty after patient-level split and filtering.")
@@ -1532,14 +1779,49 @@ def main() -> None:
                     print(f"[Info] Epoch {epoch+1} subset: {len(epoch_indices)} images (pos={_ep_pos}, neg={_ep_neg})")
             else:
                 epoch_subset = train_subset
-            train_loader = DataLoader(
-                epoch_subset,
-                batch_size=int(args.batch_size),
-                shuffle=True,
-                num_workers=int(args.num_workers),
-                collate_fn=collate_fn,
-                pin_memory=torch.cuda.is_available(),
-            )
+
+            # Full-training weighted sampler: keep a mild positive-sample bias
+            # to prevent the model from collapsing to "predict nothing".
+            _full_train_pos_ratio = float(args.full_train_pos_weight_ratio)
+            if _full_train_pos_ratio > 0.0:
+                # Build per-sample weights based on the current epoch_subset.
+                # epoch_subset may be a TrainAugmentWrapper, a Subset, or another Subset;
+                # walk down to the underlying train_dataset.samples for the box check.
+                _epoch_indices: List[int]
+                if hasattr(epoch_subset, "dataset") and hasattr(epoch_subset.dataset, "indices"):
+                    # TrainAugmentWrapper -> Subset -> train_dataset
+                    _epoch_indices = list(epoch_subset.dataset.indices)  # type: ignore[union-attr]
+                elif hasattr(epoch_subset, "indices"):
+                    # plain Subset
+                    _epoch_indices = list(epoch_subset.indices)  # type: ignore[union-attr]
+                else:
+                    _epoch_indices = list(range(len(epoch_subset)))
+                _ft_weights = [
+                    _full_train_pos_ratio if train_dataset.samples[i].boxes.size > 0 else 1.0
+                    for i in _epoch_indices
+                ]
+                _ft_sampler = WeightedRandomSampler(
+                    _ft_weights,
+                    num_samples=len(_epoch_indices),
+                    replacement=True,
+                )
+                train_loader = DataLoader(
+                    epoch_subset,
+                    batch_size=int(args.batch_size),
+                    sampler=_ft_sampler,
+                    num_workers=int(args.num_workers),
+                    collate_fn=collate_fn,
+                    pin_memory=torch.cuda.is_available(),
+                )
+            else:
+                train_loader = DataLoader(
+                    epoch_subset,
+                    batch_size=int(args.batch_size),
+                    shuffle=True,
+                    num_workers=int(args.num_workers),
+                    collate_fn=collate_fn,
+                    pin_memory=torch.cuda.is_available(),
+                )
 
         # Validation loader must not shuffle and must not use any sampling tricks.
         val_loader = DataLoader(
