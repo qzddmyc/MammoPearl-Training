@@ -160,6 +160,7 @@ import atexit
 import datetime
 import math
 import random
+import signal
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -2038,20 +2039,32 @@ def main() -> None:
 if __name__ == "__main__":
     start_time = time.time()
     print(f"Start time:  {datetime.datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')}")
+    _exit_state = {"reported": False}
 
-    def _on_exit():
+    def _on_exit(reason: Optional[str] = None):
+        if _exit_state["reported"]:
+            return
+        _exit_state["reported"] = True
         end_time = time.time()
+        if reason:
+            print(reason)
         print(f"Exit time:   {datetime.datetime.fromtimestamp(end_time).strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Running time: {end_time - start_time:.2f} s.")
 
+    def _handle_signal(signum, _frame):
+        signame = signal.Signals(signum).name
+        raise KeyboardInterrupt(f"Received {signame}")
+
     atexit.register(_on_exit)
-    main()
+    signal.signal(signal.SIGINT, _handle_signal)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _handle_signal)
 
-
-r"""log
-
-Here gives the output log:
-
-
-
-"""
+    try:
+        main()
+    except KeyboardInterrupt as exc:
+        reason = "[Info] Training interrupted by user (Ctrl+C)."
+        if exc.args and exc.args[0]:
+            reason = f"[Info] {exc.args[0]}. Training interrupted."
+        _on_exit(reason)
+        raise SystemExit(130)
