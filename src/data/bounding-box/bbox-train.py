@@ -14,9 +14,9 @@ python src/data/bounding-box/bbox-train.py \
     --accumulation-steps 4 \
     --lr 0.005 \
     --post-warmup-lr 0.001 \
-    --warmup-balanced-epochs 8 \
-    --warmup-pos-weight-ratio 10.0 \
-    --full-train-pos-weight-ratio 3.0 \
+    --warmup-balanced-epochs 5 \
+    --warmup-pos-weight-ratio 3.0 \
+    --full-train-pos-weight-ratio 0.0 \
     --freeze-epochs 0 \
     --augment \
     --aug-hflip-prob 0.5 \
@@ -25,11 +25,14 @@ python src/data/bounding-box/bbox-train.py \
     --anchor-sizes 16,32,64,128,256 \
     --rpn-fg-iou-thresh 0.5 \
     --cls-loss-type weighted_ce \
-    --cls-weight-bg 1.0 \
-    --cls-weight-lesion 1.0 \
+    --cls-weight-bg 2.5 \
+    --cls-weight-lesion 2.0 \
     --roi-batch-size-per-image 512 \
     --roi-positive-fraction 0.25 \
     --box-fg-iou-thresh 0.5 \
+    --box-nms-thresh 0.3 \
+    --box-detections-per-img 10 \
+    --rpn-objectness-loss-scale 3.0 \
     --patience 15 \
     --hide-progress-bar
 
@@ -150,6 +153,23 @@ Prompts for improvement:
     balanced warmup 结束进入全量训练后，若该参数 > 0，则继续使用 WeightedRandomSampler
     对正样本保持轻微过采样（如 3.0 表示正样本被采到的概率是负样本的 3 倍），防止模型因
     图像级 10:1 负正比而坍缩至"什么都不预测"的极端状态。
+-----------
+33. 针对"FP 极高、置信度普遍 > 0.9、F1 长期低于 0.02"的训练失效问题，进行系统性修复：
+    a. 参数调整：将 --warmup-balanced-epochs 从 8 缩短至 5、--warmup-pos-weight-ratio 从
+       10.0 降至 3.0（减少 warmup 过采压力）；将 --full-train-pos-weight-ratio 从 3.0 改
+       为 0.0（全量训练阶段不再强制过采样，让背景梯度充分抑制 FP）；将
+       --cls-weight-bg 从 1.0 提高至 2.5（直接加大 FP 的 loss 惩罚）；将
+       --cls-weight-lesion 提高至 2.0（加大 FN 惩罚）；将 --box-detections-per-img 从
+       100 降至 10（推理端限制每图最大输出框数）。
+    b. 新增 --box-nms-thresh 参数（默认 0.5，推荐 0.3）：暴露 Faster R-CNN 的 NMS IoU
+       阈值，降低后可更积极地去除空间相近的重复 FP 框，直接减少推理输出量。
+    c. 新增 --rpn-objectness-loss-scale 参数（默认 1.0，推荐 3.0）：在 train_one_epoch
+       中将 loss_objectness 乘以该系数后再计入总 loss，强化 RPN 拒绝背景区域的训练信号，
+       从 proposal 生成端压低进入 ROI head 的背景框数量。
+    d. 修复 checkpoint 选择逻辑：validate_one_epoch 额外追踪每个阈值（0.1/0.3/0.5/0.7/
+       0.9）的 FN，计算各阈值 F1，返回最优阈值及 best_thresh_f1；main() 改用
+       best_thresh_f1 代替固定阈值 F1 来判断是否保存最佳 checkpoint，避免因 score
+       threshold 选取不当而丢弃真正最优的 epoch。
 
 """
 
@@ -954,7 +974,7 @@ def validate_one_epoch(
 
     # Multi-threshold tracking
     multi_thresholds = [0.1, 0.3, 0.5, 0.7, 0.9]
-    multi_stats: Dict[float, Dict[str, int]] = {t: {"tp": 0, "fp": 0} for t in multi_thresholds}
+    multi_stats: Dict[float, Dict[str, int]] = {t: {"tp": 0, "fp": 0, "fn": 0} for t in multi_thresholds}
 
     pbar = tqdm(loader, desc=f"val {epoch + 1}/{epochs}", leave=False, disable=disable_tqdm)
 
@@ -992,7 +1012,7 @@ def validate_one_epoch(
 
                 # Multi-threshold evaluation
                 for t in multi_thresholds:
-                    tp_t, fp_t, _ = match_predictions_to_gt(
+                    tp_t, fp_t, fn_t = match_predictions_to_gt(
                         pred_boxes=pred_boxes,
                         pred_scores=pred_scores,
                         gt_boxes=gt_boxes,
@@ -1001,6 +1021,7 @@ def validate_one_epoch(
                     )
                     multi_stats[t]["tp"] += tp_t
                     multi_stats[t]["fp"] += fp_t
+                    multi_stats[t]["fn"] += fn_t
 
     precision = float(total_tp / max(total_tp + total_fp, 1))
     recall = float(total_tp / max(total_tp + total_fn, 1))
@@ -1010,16 +1031,30 @@ def validate_one_epoch(
     if avg_raw_preds > 200:
         print(f"[Warning] avg_raw_preds_per_image={avg_raw_preds:.1f} > 200, RPN/ROI may not suppress background effectively")
 
-    # Print multi-threshold summary
+    # Print multi-threshold summary and compute best-threshold F1
     parts = []
+    best_thresh_f1 = -1.0
+    best_thresh = float(score_threshold)
     for t in multi_thresholds:
-        parts.append(f"Val@{t}: TP={multi_stats[t]['tp']}, FP={multi_stats[t]['fp']}")
+        tp_t = multi_stats[t]["tp"]
+        fp_t = multi_stats[t]["fp"]
+        fn_t = multi_stats[t]["fn"]
+        p_t = float(tp_t / max(tp_t + fp_t, 1))
+        r_t = float(tp_t / max(tp_t + fn_t, 1))
+        f1_t = float(2.0 * p_t * r_t / max(p_t + r_t, 1e-12))
+        parts.append(f"Val@{t}: TP={tp_t}, FP={fp_t} F1={f1_t:.4f}")
+        if f1_t > best_thresh_f1:
+            best_thresh_f1 = f1_t
+            best_thresh = t
     print(f"  {' | '.join(parts)}")
+    print(f"  [BestThresh] F1={best_thresh_f1:.4f} @ threshold={best_thresh}")
 
     result: Dict[str, float] = {
         "precision": precision,
         "recall": recall,
         "f1": f1,
+        "best_thresh_f1": best_thresh_f1,
+        "best_thresh": best_thresh,
         "tp": float(total_tp),
         "fp": float(total_fp),
         "fn": float(total_fn),
@@ -1032,6 +1067,7 @@ def validate_one_epoch(
     for t in multi_thresholds:
         result[f"tp@{t}"] = float(multi_stats[t]["tp"])
         result[f"fp@{t}"] = float(multi_stats[t]["fp"])
+        result[f"fn@{t}"] = float(multi_stats[t]["fn"])
     return result
 
 
@@ -1164,6 +1200,7 @@ def build_model(
     rpn_bg_iou_thresh: float = 0.3,
     box_score_thresh: float = 0.05,
     box_detections_per_img: int = 100,
+    box_nms_thresh: float = 0.5,
 ) -> FasterRCNN:
     """Build Faster R-CNN using the v2 factory when available and a custom AnchorGenerator.
 
@@ -1194,6 +1231,7 @@ def build_model(
             rpn_bg_iou_thresh=rpn_bg_iou_thresh,
             box_score_thresh=box_score_thresh,
             box_detections_per_img=box_detections_per_img,
+            box_nms_thresh=box_nms_thresh,
         )
     except TypeError:
         # fallback to older factory if v2 signature differs
@@ -1205,7 +1243,8 @@ def build_model(
             model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None, rpn_anchor_generator=anchor_generator,
                                             box_fg_iou_thresh=box_fg_iou_thresh, box_bg_iou_thresh=box_bg_iou_thresh,
                                             rpn_fg_iou_thresh=rpn_fg_iou_thresh, rpn_bg_iou_thresh=rpn_bg_iou_thresh,
-                                            box_score_thresh=box_score_thresh, box_detections_per_img=box_detections_per_img)  # type: ignore[call-arg]
+                                            box_score_thresh=box_score_thresh, box_detections_per_img=box_detections_per_img,
+                                            box_nms_thresh=box_nms_thresh)  # type: ignore[call-arg]
         except Exception:
             model = fasterrcnn_resnet50_fpn_v2()
 
@@ -1264,6 +1303,7 @@ def train_one_epoch(
     accumulation_steps: int,
     warmup_scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
     disable_tqdm: bool = False,
+    rpn_objectness_loss_scale: float = 1.0,
 ) -> Tuple[float, int, Dict[str, float]]:
     """Train one epoch with gradient accumulation and optional iter-level LinearLR warmup.
 
@@ -1294,7 +1334,17 @@ def train_one_epoch(
             optimizer.zero_grad(set_to_none=True)
             continue
 
-        loss = sum(loss for loss in loss_dict.values())
+        # Weighted loss: upscale loss_objectness to strengthen RPN background suppression.
+        # Other sub-losses keep their default weight of 1.0.
+        if rpn_objectness_loss_scale != 1.0:
+            loss = (
+                loss_dict.get("loss_classifier", torch.tensor(0.0))
+                + loss_dict.get("loss_box_reg", torch.tensor(0.0))
+                + rpn_objectness_loss_scale * loss_dict.get("loss_objectness", torch.tensor(0.0))
+                + loss_dict.get("loss_rpn_box_reg", torch.tensor(0.0))
+            )
+        else:
+            loss = sum(loss for loss in loss_dict.values())
 
         # accumulate named sub-losses for reporting
         for k in subloss_keys:
@@ -1438,6 +1488,8 @@ def parse_args() -> argparse.Namespace:
     # Inference-time box filtering
     parser.add_argument("--box-score-thresh", type=float, default=0.05, help="Score threshold for inference-time box filtering")
     parser.add_argument("--box-detections-per-img", type=int, default=100, help="Max detections per image at inference time")
+    parser.add_argument("--box-nms-thresh", type=float, default=0.5, help="NMS IoU threshold for post-prediction duplicate suppression; lower value (e.g. 0.3) removes more overlapping FP boxes")
+    parser.add_argument("--rpn-objectness-loss-scale", type=float, default=1.0, help="Scale factor for loss_objectness in the total loss (e.g. 3.0 triples RPN background suppression gradient)")
     parser.add_argument("--disable-breast-crop", action="store_true", help="Disable breast-region cropping and train on the full processed image")
     parser.add_argument("--breast-crop-margin", type=float, default=0.05, help="Relative padding added around the detected breast crop")
     parser.add_argument("--hide-progress-bar", action="store_true", help="Suppress tqdm progress bars during training and validation")
@@ -1587,6 +1639,7 @@ def main() -> None:
         rpn_bg_iou_thresh=float(args.rpn_bg_iou_thresh),
         box_score_thresh=float(args.box_score_thresh),
         box_detections_per_img=int(args.box_detections_per_img),
+        box_nms_thresh=float(args.box_nms_thresh),
     )
     model.to(device)
 
@@ -1855,6 +1908,7 @@ def main() -> None:
             accumulation_steps,
             warmup_scheduler,
             disable_tqdm=args.hide_progress_bar,
+            rpn_objectness_loss_scale=float(args.rpn_objectness_loss_scale),
         )
 
         # Unfreeze backbone after configured freeze epochs
@@ -1907,6 +1961,8 @@ def main() -> None:
             "val_precision": float(val_metrics["precision"]),
             "val_recall": float(val_metrics["recall"]),
             "val_f1": float(val_metrics["f1"]),
+            "val_best_thresh_f1": float(val_metrics.get("best_thresh_f1", val_metrics["f1"])),
+            "val_best_thresh": float(val_metrics.get("best_thresh", float(args.val_score_threshold))),
             "val_tp": float(val_metrics["tp"]),
             "val_fp": float(val_metrics["fp"]),
             "val_fn": float(val_metrics["fn"]),
@@ -1915,7 +1971,9 @@ def main() -> None:
         }
         history.append(record)
 
-        current_f1 = float(val_metrics["f1"])
+        # Use best-threshold F1 for checkpoint selection so we don't miss epochs
+        # where the model is better at a threshold other than val_score_threshold.
+        current_f1 = float(val_metrics.get("best_thresh_f1", val_metrics["f1"]))
         improved = current_f1 > (best_val_f1 + float(args.min_delta))
 
         if improved:
@@ -1973,6 +2031,7 @@ def main() -> None:
             f"val_precision={val_metrics['precision']:.4f} | "
             f"val_recall={val_metrics['recall']:.4f} | "
             f"val_F1={val_metrics['f1']:.4f} | "
+            f"val_BestThreshF1={val_metrics.get('best_thresh_f1', val_metrics['f1']):.4f}@{val_metrics.get('best_thresh', args.val_score_threshold)} | "
             f"lr={record['lr']:.6f}"
         )
         print(
@@ -1985,7 +2044,7 @@ def main() -> None:
         )
         print(
             f"  Val counts: TP={int(val_metrics['tp'])}, FP={int(val_metrics['fp'])}, FN={int(val_metrics['fn'])} | "
-            f"best_F1={best_val_f1:.4f} (epoch {best_epoch})"
+            f"best_BestThreshF1={best_val_f1:.4f} (epoch {best_epoch})"
         )
 
         if int(args.patience) > 0 and no_improve_epochs >= int(args.patience):
