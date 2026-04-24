@@ -30,14 +30,12 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset
-from torchvision.models.detection import FasterRCNN
-from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.rpn import AnchorGenerator
 try:
-    from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2, FasterRCNN_ResNet50_FPN_V2_Weights
+    from torchvision.models.detection import retinanet_resnet50_fpn_v2, RetinaNet_ResNet50_FPN_V2_Weights
 except Exception:  # pragma: no cover
-    from torchvision.models.detection import fasterrcnn_resnet50_fpn as fasterrcnn_resnet50_fpn_v2
-    FasterRCNN_ResNet50_FPN_V2_Weights = None
+    retinanet_resnet50_fpn_v2 = None  # type: ignore
+    RetinaNet_ResNet50_FPN_V2_Weights = None
 from torchvision.ops import box_iou
 
 try:
@@ -267,45 +265,49 @@ def collate_fn(batch):
     return list(images), list(targets), list(samples)
 
 
-def build_model(num_classes: int = 2, anchor_sizes: List[Tuple[int, ...]] | None = None,
-                box_score_thresh: float = 0.05, box_detections_per_img: int = 100) -> FasterRCNN:
+def build_model(
+    num_classes: int = 2,
+    anchor_sizes: List[Tuple[int, ...]] | None = None,
+    score_thresh: float = 0.05,
+    detections_per_img: int = 100,
+    nms_thresh: float = 0.5,
+    focal_loss_alpha: float = 0.75,
+    focal_loss_gamma: float = 2.0,
+) -> torch.nn.Module:
+    """Build RetinaNet with ResNet50-FPN backbone, matching bbox-train.py build_model()."""
+    if retinanet_resnet50_fpn_v2 is None:
+        raise RuntimeError(
+            "torchvision RetinaNet v2 not found. Please upgrade torchvision (>=0.14)."
+        )
+
     if anchor_sizes is None:
-        anchor_sizes = ((8,), (16,), (32,), (64,), (128,))
+        anchor_sizes = ((16,), (32,), (64,), (128,), (256,))
 
     aspect_ratios = tuple([(0.5, 1.0, 2.0) for _ in range(len(anchor_sizes))])
     anchor_generator = AnchorGenerator(sizes=anchor_sizes, aspect_ratios=aspect_ratios)
 
-    # prefer to load torchvision v2 default weights when available
-    weights = None
-    if FasterRCNN_ResNet50_FPN_V2_Weights is not None:
-        try:
-            weights = FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT
-        except Exception:
-            weights = None
-
     try:
-        model = fasterrcnn_resnet50_fpn_v2(
-            weights=weights,
-            rpn_anchor_generator=anchor_generator,
-            box_score_thresh=box_score_thresh,
-            box_detections_per_img=box_detections_per_img,
+        model = retinanet_resnet50_fpn_v2(
+            weights=None,
+            num_classes=num_classes,
+            anchor_generator=anchor_generator,
+            score_thresh=score_thresh,
+            nms_thresh=nms_thresh,
+            detections_per_img=detections_per_img,
         )
     except TypeError:
-        try:
-            from torchvision.models.detection import fasterrcnn_resnet50_fpn
-            # Avoid deprecated `pretrained`/`pretrained_backbone` args by
-            # explicitly passing `weights=None` / `weights_backbone=None`.
-            model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None, rpn_anchor_generator=anchor_generator,
-                                            box_score_thresh=box_score_thresh, box_detections_per_img=box_detections_per_img)  # type: ignore[call-arg]
-        except Exception:
-            model = fasterrcnn_resnet50_fpn_v2()
+        model = retinanet_resnet50_fpn_v2(weights=None, num_classes=num_classes)
 
-    in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    try:
+        model.head.classification_head.focal_loss_alpha = focal_loss_alpha
+        model.head.classification_head.focal_loss_gamma = focal_loss_gamma
+    except AttributeError:
+        pass
+
     return model
 
 
-def load_checkpoint(model: FasterRCNN, ckpt_path: Path, device: torch.device) -> Dict[str, Any]:
+def load_checkpoint(model: torch.nn.Module, ckpt_path: Path, device: torch.device) -> Dict[str, Any]:
     ckpt = torch.load(ckpt_path, map_location=device)
     state_dict = ckpt.get("model_state_dict", ckpt)
     model.load_state_dict(state_dict)
@@ -334,7 +336,7 @@ def greedy_match(pred_boxes: torch.Tensor, pred_scores: torch.Tensor, gt_boxes: 
 
 
 def evaluate(
-    model: FasterRCNN,
+    model: torch.nn.Module,
     loader: DataLoader,
     device: torch.device,
     score_threshold: float,
@@ -508,13 +510,17 @@ def main() -> None:
     ckpt = torch.load(ckpt_path, map_location=device)
     meta = ckpt.get("meta", {})
 
-    anchor_str = args.anchor_sizes if args.anchor_sizes is not None else meta.get("anchor_sizes", "8,16,32,64,128")
+    anchor_str = args.anchor_sizes if args.anchor_sizes is not None else meta.get("anchor_sizes", "16,32,64,128,256")
     anchor_sizes = tuple((int(s.strip()),) for s in str(anchor_str).split(",") if s.strip())
     print(f"[Info] Using anchor sizes: {anchor_str}")
 
     box_score_thresh = args.box_score_thresh if args.box_score_thresh is not None else float(meta.get("box_score_thresh", 0.05))
     box_detections_per_img = args.box_detections_per_img if args.box_detections_per_img is not None else int(meta.get("box_detections_per_img", 100))
-    print(f"[Info] box_score_thresh={box_score_thresh}, box_detections_per_img={box_detections_per_img}")
+    box_nms_thresh = float(meta.get("box_nms_thresh", 0.5))
+    focal_loss_alpha = float(meta.get("focal_loss_alpha", 0.75))
+    focal_loss_gamma = float(meta.get("focal_loss_gamma", 2.0))
+    print(f"[Info] box_score_thresh={box_score_thresh}, box_detections_per_img={box_detections_per_img}, nms_thresh={box_nms_thresh}")
+    print(f"[Info] Focal Loss: alpha={focal_loss_alpha}, gamma={focal_loss_gamma}")
     score_threshold = args.score_threshold if args.score_threshold is not None else float(meta.get("val_score_threshold", 0.5))
     iou_threshold = args.iou_threshold if args.iou_threshold is not None else float(meta.get("val_iou_threshold", 0.5))
     print(f"[Info] eval score_threshold={score_threshold}, iou_threshold={iou_threshold}")
@@ -538,8 +544,15 @@ def main() -> None:
     )
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
 
-    model = build_model(num_classes=2, anchor_sizes=anchor_sizes,
-                        box_score_thresh=box_score_thresh, box_detections_per_img=box_detections_per_img)
+    model = build_model(
+        num_classes=2,
+        anchor_sizes=anchor_sizes,
+        score_thresh=box_score_thresh,
+        detections_per_img=box_detections_per_img,
+        nms_thresh=box_nms_thresh,
+        focal_loss_alpha=focal_loss_alpha,
+        focal_loss_gamma=focal_loss_gamma,
+    )
     model.to(device)
 
     # load weights

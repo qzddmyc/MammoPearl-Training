@@ -23,16 +23,12 @@ python src/data/bounding-box/bbox-train.py \
     --aug-brightness-delta 0.2 \
     --aug-rotation-max-deg 8.0 \
     --anchor-sizes 16,32,64,128,256 \
-    --rpn-fg-iou-thresh 0.5 \
-    --cls-loss-type weighted_ce \
-    --cls-weight-bg 2.5 \
-    --cls-weight-lesion 2.0 \
-    --roi-batch-size-per-image 512 \
-    --roi-positive-fraction 0.25 \
-    --box-fg-iou-thresh 0.5 \
+    --focal-alpha 0.75 \
+    --focal-gamma 2.0 \
+    --box-fg-iou-thresh 0.4 \
+    --box-bg-iou-thresh 0.3 \
     --box-nms-thresh 0.3 \
     --box-detections-per-img 10 \
-    --rpn-objectness-loss-scale 3.0 \
     --patience 15 \
     --hide-progress-bar
 
@@ -170,6 +166,36 @@ Prompts for improvement:
        0.9）的 FN，计算各阈值 F1，返回最优阈值及 best_thresh_f1；main() 改用
        best_thresh_f1 代替固定阈值 F1 来判断是否保存最佳 checkpoint，避免因 score
        threshold 选取不当而丢弃真正最优的 epoch。
+-----------
+34. 彻底切换检测框架：从 Faster R-CNN 迁移至 RetinaNet_ResNet50_FPN_V2，同时完成
+    医学影像灰度输入适配，从根本上解决两阶段 RPN 瓶颈与 Focal Loss 无法原生作用于
+    proposal 生成阶段的双重缺陷：
+    a. 架构替换：删除 fasterrcnn_resnet50_fpn_v2 / FastRCNNPredictor / roi_heads
+       monkey-patch 及相关 import；新增 retinanet_resnet50_fpn_v2 import。RetinaNet
+       是单阶段检测器，直接在 FPN 各尺度特征图上预测，彻底消除了 RPN "漏斗" 瓶颈
+       （Faster R-CNN 中约 70% GT box 从未进入 ROI Head 的根本原因）。
+    b. 删除自定义 loss 模块：移除 FocalLoss 类、_custom_fastrcnn_loss 函数、
+       apply_custom_roi_loss 函数（约 120 行），因为 RetinaNet 已原生集成
+       Focal Loss，无需 monkey-patch。
+    c. 重写 build_model()：加载 COCO 预训练 backbone 权重 →
+       构建 2 类 RetinaNet（num_classes=2）→ 通过
+       model.head.classification_head.focal_loss_alpha/gamma 直接设置 Focal Loss
+       参数，无需外部注入。新增参数 --focal-alpha（默认 0.75，面向 10:1 不平衡数据
+       比 RetinaNet 原始论文 0.25 更高，确保病灶梯度足够）。
+    d. 新增灰度 conv1 均值初始化（方向二轻量实现）：钼靶图像为灰度图，以 R=G=B
+       形式加载为 3 通道。ImageNet 预训练的 conv1 三个通道权重来自不同颜色语义，
+       对等值输入不适合。在 build_model() 中对 conv1 的 3 通道权重取均值后广播
+       覆盖，使三个通道初始化完全一致，减少训练初期的通道间梯度不平衡。
+    e. 简化 train_one_epoch()：移除 rpn_objectness_loss_scale 参数及相关加权逻辑；
+       subloss_keys 改为 RetinaNet 的 ("classification", "bbox_regression")。
+    f. 精简 parse_args()：删除 Faster R-CNN 专有参数（--roi-batch-size-per-image、
+       --roi-positive-fraction、--rpn-*、--cls-loss-type、--cls-weight-*、
+       --ohem、--allow-low-bg-weight、--rpn-objectness-loss-scale，共约 13 个）；
+       新增 --focal-alpha（默认 0.75）；保留 --focal-gamma（默认 2.0）；
+       --box-fg-iou-thresh 和 --box-bg-iou-thresh 现在直接映射到 RetinaNet 的
+       anchor 正负样本 IoU 阈值。
+    g. 更新推荐命令：简化至 24 行，去掉所有 RPN/ROI 参数，直接通过
+       --focal-alpha 0.75 --focal-gamma 2.0 控制 Focal Loss。
 
 """
 
@@ -193,18 +219,15 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler
-from torchvision.models.detection import FasterRCNN
-from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.rpn import AnchorGenerator
 import torch.nn.functional as F
-import torchvision.models.detection.roi_heads as _roi_heads_module
 try:
-    # prefer v2 when available and import associated weights helper
-    from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2, FasterRCNN_ResNet50_FPN_V2_Weights
+    from torchvision.models.detection import retinanet_resnet50_fpn_v2, RetinaNet_ResNet50_FPN_V2_Weights
+    from torchvision.models.detection.retinanet import RetinaNetClassificationHead
 except Exception:  # pragma: no cover
-    from torchvision.models.detection import fasterrcnn_resnet50_fpn as fasterrcnn_resnet50_fpn_v2
-    FasterRCNN_ResNet50_FPN_V2_Weights = None
-# 不推荐使用 fasterrcnn_resnet50_fpn 模型，耗时过长
+    retinanet_resnet50_fpn_v2 = None  # type: ignore
+    RetinaNet_ResNet50_FPN_V2_Weights = None
+    RetinaNetClassificationHead = None
 
 try:
     from tqdm import tqdm
@@ -952,7 +975,7 @@ def match_predictions_to_gt(
 
 
 def validate_one_epoch(
-    model: FasterRCNN,
+    model: torch.nn.Module,
     loader: DataLoader,
     device: torch.device,
     score_threshold: float,
@@ -1071,189 +1094,95 @@ def validate_one_epoch(
     return result
 
 
-class FocalLoss(torch.nn.Module):
-    """Focal Loss for multi-class classification (Lin et al., 2017)."""
-
-    def __init__(self, gamma: float = 2.0, alpha: Optional[torch.Tensor] = None):
-        super().__init__()
-        self.gamma = gamma
-        self.alpha = alpha
-
-    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        ce_loss = F.cross_entropy(inputs, targets, reduction="none")
-        pt = torch.exp(-ce_loss)
-        focal_weight = (1.0 - pt) ** self.gamma
-        if self.alpha is not None:
-            alpha_t = self.alpha.to(inputs.device)[targets]
-            focal_weight = focal_weight * alpha_t
-        return focal_weight * ce_loss
-
-
-def _custom_fastrcnn_loss(
-    class_logits,
-    box_regression,
-    labels,
-    regression_targets,
-    cls_loss_type="ce",
-    cls_weight=None,
-    focal_gamma=2.0,
-    focal_alpha=None,
-    ohem_enabled=False,
-    ohem_ratio=0.2,
-    ohem_min_samples=128,
-):
-    """Drop-in replacement for torchvision fastrcnn_loss with configurable strategies."""
-    labels = torch.cat(labels, dim=0)
-    regression_targets = torch.cat(regression_targets, dim=0)
-
-    N = class_logits.shape[0]
-
-    # --- per-sample classification loss ---
-    if cls_loss_type == "focal":
-        cls_loss_per = FocalLoss(gamma=focal_gamma, alpha=focal_alpha)(class_logits, labels)
-    elif cls_loss_type == "weighted_ce":
-        w = cls_weight.to(class_logits.device) if cls_weight is not None else None
-        cls_loss_per = F.cross_entropy(class_logits, labels, weight=w, reduction="none")
-    else:
-        cls_loss_per = F.cross_entropy(class_logits, labels, reduction="none")
-
-    # --- per-sample box regression loss (positive samples only) ---
-    sampled_pos_inds_subset = torch.where(labels > 0)[0]
-    labels_pos = labels[sampled_pos_inds_subset]
-    box_regression = box_regression.reshape(N, box_regression.size(-1) // 4, 4)
-
-    if sampled_pos_inds_subset.numel() > 0:
-        box_reg_per = F.smooth_l1_loss(
-            box_regression[sampled_pos_inds_subset, labels_pos],
-            regression_targets[sampled_pos_inds_subset],
-            beta=1.0 / 9.0,
-            reduction="none",
-        ).sum(dim=1)
-    else:
-        box_reg_per = torch.zeros(0, device=class_logits.device)
-
-    # --- OHEM: keep only top-K hardest samples ---
-    if ohem_enabled and N > 0:
-        difficulty = cls_loss_per.detach().clone()
-        if sampled_pos_inds_subset.numel() > 0:
-            difficulty[sampled_pos_inds_subset] = difficulty[sampled_pos_inds_subset] + box_reg_per.detach()
-
-        k = max(ohem_min_samples, int(N * ohem_ratio))
-        k = min(k, N)
-        _, topk_idx = torch.topk(difficulty, k)
-
-        classification_loss = cls_loss_per[topk_idx].mean()
-
-        topk_mask = torch.zeros(N, dtype=torch.bool, device=class_logits.device)
-        topk_mask[topk_idx] = True
-        pos_mask = torch.zeros(N, dtype=torch.bool, device=class_logits.device)
-        pos_mask[sampled_pos_inds_subset] = True
-        ohem_pos_inds = torch.where(topk_mask & pos_mask)[0]
-
-        if ohem_pos_inds.numel() > 0:
-            box_loss = F.smooth_l1_loss(
-                box_regression[ohem_pos_inds, labels[ohem_pos_inds]],
-                regression_targets[ohem_pos_inds],
-                beta=1.0 / 9.0,
-                reduction="sum",
-            ) / max(k, 1)
-        else:
-            box_loss = box_regression.sum() * 0.0
-    else:
-        classification_loss = cls_loss_per.mean() if N > 0 else cls_loss_per.sum()
-        box_loss = box_reg_per.sum() / max(labels.numel(), 1)
-
-    return classification_loss, box_loss
-
-
-def apply_custom_roi_loss(
-    model: FasterRCNN,
-    cls_loss_type: str = "ce",
-    cls_weight: Optional[torch.Tensor] = None,
-    focal_gamma: float = 2.0,
-    focal_alpha: Optional[torch.Tensor] = None,
-    ohem_enabled: bool = False,
-    ohem_ratio: float = 0.2,
-    ohem_min_samples: int = 128,
-) -> None:
-    """Monkey-patch torchvision's fastrcnn_loss to use the custom loss logic."""
-    def _patched(class_logits, box_regression, labels, regression_targets):
-        return _custom_fastrcnn_loss(
-            class_logits, box_regression, labels, regression_targets,
-            cls_loss_type=cls_loss_type,
-            cls_weight=cls_weight,
-            focal_gamma=focal_gamma,
-            focal_alpha=focal_alpha,
-            ohem_enabled=ohem_enabled,
-            ohem_ratio=ohem_ratio,
-            ohem_min_samples=ohem_min_samples,
-        )
-    _roi_heads_module.fastrcnn_loss = _patched
-
-
 def build_model(
     num_classes: int = 2,
     anchor_sizes: List[Tuple[int, ...]] | None = None,
-    box_fg_iou_thresh: float = 0.5,
-    box_bg_iou_thresh: float = 0.5,
-    rpn_fg_iou_thresh: float = 0.7,
-    rpn_bg_iou_thresh: float = 0.3,
-    box_score_thresh: float = 0.05,
-    box_detections_per_img: int = 100,
-    box_nms_thresh: float = 0.5,
-) -> FasterRCNN:
-    """Build Faster R-CNN using the v2 factory when available and a custom AnchorGenerator.
+    fg_iou_thresh: float = 0.5,
+    bg_iou_thresh: float = 0.4,
+    score_thresh: float = 0.05,
+    detections_per_img: int = 100,
+    nms_thresh: float = 0.5,
+    focal_loss_alpha: float = 0.75,
+    focal_loss_gamma: float = 2.0,
+) -> torch.nn.Module:
+    """Build RetinaNet with ResNet50-FPN backbone.
 
-    anchor_sizes: sequence of tuples, one tuple per FPN level. Example: ((8,), (16,), (32,), (64,), (128,))
+    Loads COCO-pretrained backbone weights then builds a fresh classification
+    head for ``num_classes`` (2 = background + lesion).  Focal Loss alpha and
+    gamma are set on the classification head after construction.
+
+    anchor_sizes: sequence of tuples, one tuple per FPN level.
     """
+    if retinanet_resnet50_fpn_v2 is None:
+        raise RuntimeError(
+            "torchvision RetinaNet v2 not found. Please upgrade torchvision (>=0.14)."
+        )
+
     if anchor_sizes is None:
-        anchor_sizes = ((8,), (16,), (32,), (64,), (128,))
+        anchor_sizes = ((16,), (32,), (64,), (128,), (256,))
 
     aspect_ratios = tuple([(0.5, 1.0, 2.0) for _ in range(len(anchor_sizes))])
     anchor_generator = AnchorGenerator(sizes=anchor_sizes, aspect_ratios=aspect_ratios)
 
-    # prefer to load torchvision v2 default weights when available
-    weights = None
-    if FasterRCNN_ResNet50_FPN_V2_Weights is not None:
+    # Step 1: Grab pretrained backbone weights before constructing the custom-head model.
+    backbone_state_dict = None
+    if RetinaNet_ResNet50_FPN_V2_Weights is not None:
         try:
-            weights = FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT
-        except Exception:
-            weights = None
+            _pretrained = retinanet_resnet50_fpn_v2(
+                weights=RetinaNet_ResNet50_FPN_V2_Weights.DEFAULT
+            )
+            backbone_state_dict = _pretrained.backbone.state_dict()
+            del _pretrained
+        except Exception as exc:
+            print(f"[Warning] Could not load RetinaNet pretrained weights: {exc}")
 
+    # Step 2: Build model with 2 classes and no COCO weights.
     try:
-        # factory may accept a `weights` enum; pass if available
-        model = fasterrcnn_resnet50_fpn_v2(
-            weights=weights,
-            rpn_anchor_generator=anchor_generator,
-            box_fg_iou_thresh=box_fg_iou_thresh,
-            box_bg_iou_thresh=box_bg_iou_thresh,
-            rpn_fg_iou_thresh=rpn_fg_iou_thresh,
-            rpn_bg_iou_thresh=rpn_bg_iou_thresh,
-            box_score_thresh=box_score_thresh,
-            box_detections_per_img=box_detections_per_img,
-            box_nms_thresh=box_nms_thresh,
+        model = retinanet_resnet50_fpn_v2(
+            weights=None,
+            num_classes=num_classes,
+            anchor_generator=anchor_generator,
+            score_thresh=score_thresh,
+            nms_thresh=nms_thresh,
+            detections_per_img=detections_per_img,
+            fg_iou_thresh=fg_iou_thresh,
+            bg_iou_thresh=bg_iou_thresh,
         )
     except TypeError:
-        # fallback to older factory if v2 signature differs
-        try:
-            from torchvision.models.detection import fasterrcnn_resnet50_fpn
+        # Older torchvision may not accept all kwargs; retry with minimal args.
+        model = retinanet_resnet50_fpn_v2(weights=None, num_classes=num_classes)
 
-            # Avoid deprecated `pretrained`/`pretrained_backbone` args by
-            # explicitly passing `weights=None` / `weights_backbone=None`.
-            model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None, rpn_anchor_generator=anchor_generator,
-                                            box_fg_iou_thresh=box_fg_iou_thresh, box_bg_iou_thresh=box_bg_iou_thresh,
-                                            rpn_fg_iou_thresh=rpn_fg_iou_thresh, rpn_bg_iou_thresh=rpn_bg_iou_thresh,
-                                            box_score_thresh=box_score_thresh, box_detections_per_img=box_detections_per_img,
-                                            box_nms_thresh=box_nms_thresh)  # type: ignore[call-arg]
-        except Exception:
-            model = fasterrcnn_resnet50_fpn_v2()
+    # Step 3: Restore pretrained backbone.
+    if backbone_state_dict is not None:
+        model.backbone.load_state_dict(backbone_state_dict)
+        print("[Info] Loaded RetinaNet_ResNet50_FPN_V2 pretrained backbone weights.")
 
-    in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    # Step 3.5: Adapt conv1 for grayscale-as-3channel input.
+    # Mammogram images are grayscale loaded as 3 identical channels (R=G=B). ImageNet's
+    # conv1 has 3 distinct channel weights optimized for RGB. Averaging them ensures all
+    # three input channels start with the same feature detector, which is the correct
+    # inductive bias for our single-modality input.
+    try:
+        conv1 = model.backbone.body.conv1
+        with torch.no_grad():
+            mean_w = conv1.weight.mean(dim=1, keepdim=True)  # [64, 1, 7, 7]
+            conv1.weight.copy_(mean_w.expand_as(conv1.weight))
+        print("[Info] conv1 weights averaged across channels for grayscale-as-3channel input.")
+    except AttributeError:
+        print("[Warning] Could not adapt conv1 (unexpected backbone structure).")
+
+    # Step 4: Set Focal Loss parameters on the classification head.
+    try:
+        model.head.classification_head.focal_loss_alpha = focal_loss_alpha
+        model.head.classification_head.focal_loss_gamma = focal_loss_gamma
+        print(f"[Info] RetinaNet Focal Loss: alpha={focal_loss_alpha}, gamma={focal_loss_gamma}")
+    except AttributeError:
+        print("[Warning] Could not set focal_loss_alpha/gamma on classification head; using defaults.")
+
     return model
 
 
-def create_optimizer(model: FasterRCNN, args: argparse.Namespace, base_lr: Optional[float] = None) -> torch.optim.Optimizer:
+def create_optimizer(model: torch.nn.Module, args: argparse.Namespace, base_lr: Optional[float] = None) -> torch.optim.Optimizer:
     """Create SGD optimizer with separate weight decay for biases/BN and others."""
     decay = float(args.weight_decay)
     base_lr = float(base_lr) if base_lr is not None else float(args.lr)
@@ -1279,14 +1208,14 @@ def create_optimizer(model: FasterRCNN, args: argparse.Namespace, base_lr: Optio
     return opt
 
 
-def freeze_backbone_layers(model: FasterRCNN) -> None:
+def freeze_backbone_layers(model: torch.nn.Module) -> None:
     """Freeze ResNet backbone layer1 and layer2 parameters."""
     for name, param in model.named_parameters():
         if "backbone" in name and ("layer1" in name or "layer2" in name):
             param.requires_grad = False
 
 
-def unfreeze_backbone_layers(model: FasterRCNN) -> None:
+def unfreeze_backbone_layers(model: torch.nn.Module) -> None:
     """Unfreeze previously frozen ResNet backbone layers."""
     for name, param in model.named_parameters():
         if "backbone" in name and ("layer1" in name or "layer2" in name):
@@ -1294,7 +1223,7 @@ def unfreeze_backbone_layers(model: FasterRCNN) -> None:
 
 
 def train_one_epoch(
-    model: FasterRCNN,
+    model: torch.nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -1303,7 +1232,6 @@ def train_one_epoch(
     accumulation_steps: int,
     warmup_scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
     disable_tqdm: bool = False,
-    rpn_objectness_loss_scale: float = 1.0,
 ) -> Tuple[float, int, Dict[str, float]]:
     """Train one epoch with gradient accumulation and optional iter-level LinearLR warmup.
 
@@ -1316,8 +1244,8 @@ def train_one_epoch(
     count = 0
     optimizer_steps = 0
     bad_keys_count = 0
-    # track common Faster R-CNN sub-losses
-    subloss_keys = ("loss_classifier", "loss_box_reg", "loss_objectness", "loss_rpn_box_reg")
+    # track RetinaNet sub-losses
+    subloss_keys = ("classification", "bbox_regression")
     subloss_sums: Dict[str, float] = defaultdict(float)
 
     optimizer.zero_grad(set_to_none=True)
@@ -1336,15 +1264,7 @@ def train_one_epoch(
 
         # Weighted loss: upscale loss_objectness to strengthen RPN background suppression.
         # Other sub-losses keep their default weight of 1.0.
-        if rpn_objectness_loss_scale != 1.0:
-            loss = (
-                loss_dict.get("loss_classifier", torch.tensor(0.0))
-                + loss_dict.get("loss_box_reg", torch.tensor(0.0))
-                + rpn_objectness_loss_scale * loss_dict.get("loss_objectness", torch.tensor(0.0))
-                + loss_dict.get("loss_rpn_box_reg", torch.tensor(0.0))
-            )
-        else:
-            loss = sum(loss for loss in loss_dict.values())
+        loss = sum(loss for loss in loss_dict.values())
 
         # accumulate named sub-losses for reporting
         for k in subloss_keys:
@@ -1387,7 +1307,7 @@ def train_one_epoch(
 
 def save_checkpoint(
     save_path: Path,
-    model: FasterRCNN,
+    model: torch.nn.Module,
     meta: Dict[str, Any],
 ) -> None:
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1443,36 +1363,20 @@ def parse_args() -> argparse.Namespace:
     # Freeze / unfreeze backbone
     parser.add_argument("--freeze-epochs", type=int, default=0, help="Number of epochs to freeze backbone layer1/2 before unfreezing (0 = no freeze)")
 
-    # Anchor / ROI / RPN tuning
-    parser.add_argument("--anchor-sizes", type=str, default="8,16,32,64,128", help="Comma-separated anchor sizes (one per FPN level ideally)")
-    parser.add_argument("--roi-batch-size-per-image", type=int, default=512)
-    parser.add_argument("--roi-positive-fraction", type=float, default=0.25)
-    parser.add_argument("--rpn-pre-nms-top-n-train", type=int, default=2000)
-    parser.add_argument("--rpn-post-nms-top-n-train", type=int, default=1000)
+    # Anchor tuning
+    parser.add_argument("--anchor-sizes", type=str, default="16,32,64,128,256", help="Comma-separated anchor sizes (one per FPN level)")
 
     # LR scheduling
     parser.add_argument("--lr-gamma", type=float, default=0.1)
     parser.add_argument("--lr-step-size", type=int, default=0, help="StepLR step size; 0 to use CosineAnnealingLR")
 
-    # IoU thresholds for training sample assignment
-    parser.add_argument("--box-fg-iou-thresh", type=float, default=0.5, help="ROI head foreground IoU threshold (raise to 0.6-0.7 to reduce ambiguous positives)")
-    parser.add_argument("--box-bg-iou-thresh", type=float, default=0.5, help="ROI head background IoU threshold")
-    parser.add_argument("--rpn-fg-iou-thresh", type=float, default=0.5, help="RPN foreground IoU threshold (lowered from 0.7 to 0.5 for medical lesions whose best-anchor IoU rarely exceeds 0.6)")
-    parser.add_argument("--rpn-bg-iou-thresh", type=float, default=0.3, help="RPN background IoU threshold")
+    # IoU thresholds for anchor assignment (RetinaNet matcher)
+    parser.add_argument("--box-fg-iou-thresh", type=float, default=0.5, help="Foreground IoU threshold for anchor-to-GT matching")
+    parser.add_argument("--box-bg-iou-thresh", type=float, default=0.4, help="Background IoU threshold; anchors below this are negatives")
 
-    # Classification loss strategy
-    parser.add_argument("--cls-loss-type", type=str, default="ce", choices=["ce", "weighted_ce", "focal"], help="ROI classification loss: ce / weighted_ce / focal")
-    parser.add_argument("--cls-weight-bg", type=float, default=1.0, help="Background class weight for weighted_ce; <1.0 can increase FP on heavily imbalanced data")
-    parser.add_argument("--cls-weight-lesion", type=float, default=1.0, help="Lesion class weight for weighted_ce")
-    parser.add_argument("--allow-low-bg-weight", action="store_true", help="Keep --cls-weight-bg < 1.0 even when train negatives strongly outnumber positives")
+    # Focal Loss parameters (built in to RetinaNet)
     parser.add_argument("--focal-gamma", type=float, default=2.0, help="Focal loss gamma (higher = more focus on hard examples)")
-    parser.add_argument("--focal-alpha-bg", type=float, default=0.25, help="Focal loss alpha for background class")
-    parser.add_argument("--focal-alpha-lesion", type=float, default=0.75, help="Focal loss alpha for lesion class")
-
-    # Online Hard Example Mining
-    parser.add_argument("--ohem", action="store_true", help="Enable Online Hard Example Mining (OHEM)")
-    parser.add_argument("--ohem-ratio", type=float, default=0.2, help="OHEM: keep top ratio of hardest samples")
-    parser.add_argument("--ohem-min-samples", type=int, default=128, help="OHEM: minimum samples to keep regardless of ratio")
+    parser.add_argument("--focal-alpha", type=float, default=0.75, help="Focal loss alpha for foreground (lesion) class; set higher than 0.25 default for imbalanced medical data")
 
     # Positive-only warmup
     parser.add_argument("--warmup-positive-epochs", type=int, default=0, help="Epochs to train with positive-only images before full training (0=disabled)")
@@ -1488,8 +1392,7 @@ def parse_args() -> argparse.Namespace:
     # Inference-time box filtering
     parser.add_argument("--box-score-thresh", type=float, default=0.05, help="Score threshold for inference-time box filtering")
     parser.add_argument("--box-detections-per-img", type=int, default=100, help="Max detections per image at inference time")
-    parser.add_argument("--box-nms-thresh", type=float, default=0.5, help="NMS IoU threshold for post-prediction duplicate suppression; lower value (e.g. 0.3) removes more overlapping FP boxes")
-    parser.add_argument("--rpn-objectness-loss-scale", type=float, default=1.0, help="Scale factor for loss_objectness in the total loss (e.g. 3.0 triples RPN background suppression gradient)")
+    parser.add_argument("--box-nms-thresh", type=float, default=0.5, help="NMS IoU threshold for post-prediction duplicate suppression; lower (e.g. 0.3) removes more overlapping FP boxes")
     parser.add_argument("--disable-breast-crop", action="store_true", help="Disable breast-region cropping and train on the full processed image")
     parser.add_argument("--breast-crop-margin", type=float, default=0.05, help="Relative padding added around the detected breast crop")
     parser.add_argument("--hide-progress-bar", action="store_true", help="Suppress tqdm progress bars during training and validation")
@@ -1497,7 +1400,7 @@ def parse_args() -> argparse.Namespace:
     # Data augmentation
     parser.add_argument("--augment", action="store_true", help="Enable random data augmentation (hflip + brightness jitter + optional rotation) on the training set")
     parser.add_argument("--aug-hflip-prob", type=float, default=0.5, help="Probability of random horizontal flip when --augment is set")
-    parser.add_argument("--aug-brightness-delta", type=float, default=0.2, help="Magnitude of random brightness jitter (\u00b1delta) when --augment is set")
+    parser.add_argument("--aug-brightness-delta", type=float, default=0.2, help="Magnitude of random brightness jitter (±delta) when --augment is set")
     parser.add_argument(
         "--aug-rotation-max-deg",
         type=float,
@@ -1542,11 +1445,6 @@ def main() -> None:
         raise FileNotFoundError(f"Images root not found: {images_root}")
 
     set_seed(args.seed)
-
-    # Focal Loss + OHEM mutual exclusion check
-    if args.cls_loss_type == "focal" and args.ohem:
-        print("[Warning] Focal Loss and OHEM should not be used together (gradient signal over-dilution). Disabling OHEM.")
-        args.ohem = False
 
     # freeze_epochs / warmup conflict check
     _freeze = int(args.freeze_epochs)
@@ -1633,54 +1531,15 @@ def main() -> None:
     model = build_model(
         num_classes=2,
         anchor_sizes=anchor_sizes,
-        box_fg_iou_thresh=float(args.box_fg_iou_thresh),
-        box_bg_iou_thresh=float(args.box_bg_iou_thresh),
-        rpn_fg_iou_thresh=float(args.rpn_fg_iou_thresh),
-        rpn_bg_iou_thresh=float(args.rpn_bg_iou_thresh),
-        box_score_thresh=float(args.box_score_thresh),
-        box_detections_per_img=int(args.box_detections_per_img),
-        box_nms_thresh=float(args.box_nms_thresh),
+        fg_iou_thresh=float(args.box_fg_iou_thresh),
+        bg_iou_thresh=float(args.box_bg_iou_thresh),
+        score_thresh=float(args.box_score_thresh),
+        detections_per_img=int(args.box_detections_per_img),
+        nms_thresh=float(args.box_nms_thresh),
+        focal_loss_alpha=float(args.focal_alpha),
+        focal_loss_gamma=float(args.focal_gamma),
     )
     model.to(device)
-
-    # Apply custom ROI classification loss (Weighted CE / Focal Loss / OHEM)
-    _cls_weight = None
-    _focal_alpha = None
-    effective_cls_weight_bg = float(args.cls_weight_bg)
-    effective_cls_weight_lesion = float(args.cls_weight_lesion)
-    low_bg_weight_guard_applied = False
-    if args.cls_loss_type == "weighted_ce":
-        if (
-            train_neg_to_pos_ratio >= 5.0
-            and effective_cls_weight_bg < 1.0
-            and not args.allow_low_bg_weight
-        ):
-            print(
-                f"[Warning] weighted_ce received --cls-weight-bg={effective_cls_weight_bg:.3f} while train neg/pos image ratio is "
-                f"{train_neg_to_pos_ratio:.2f}. Clamping background weight to 1.0 to avoid under-penalizing background FP. "
-                f"Pass --allow-low-bg-weight to keep the lower value."
-            )
-            effective_cls_weight_bg = 1.0
-            low_bg_weight_guard_applied = True
-        _cls_weight = torch.tensor([effective_cls_weight_bg, effective_cls_weight_lesion])
-    if args.cls_loss_type == "focal":
-        _focal_alpha = torch.tensor([float(args.focal_alpha_bg), float(args.focal_alpha_lesion)])
-    apply_custom_roi_loss(
-        model,
-        cls_loss_type=str(args.cls_loss_type),
-        cls_weight=_cls_weight,
-        focal_gamma=float(args.focal_gamma),
-        focal_alpha=_focal_alpha,
-        ohem_enabled=bool(args.ohem),
-        ohem_ratio=float(args.ohem_ratio),
-        ohem_min_samples=int(args.ohem_min_samples),
-    )
-    print(f"[Info] ROI loss: type={args.cls_loss_type}, ohem={args.ohem}")
-    if _cls_weight is not None:
-        print(
-            f"[Info] Effective weighted_ce class weights: background={effective_cls_weight_bg:.3f}, "
-            f"lesion={effective_cls_weight_lesion:.3f}"
-        )
 
     # Freeze low-level backbone layers initially if requested
     if int(args.freeze_epochs) > 0:
@@ -1699,27 +1558,6 @@ def main() -> None:
         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=_effective_epochs, eta_min=1e-6)
 
     history: List[Dict[str, float]] = []
-
-    # Apply ROI / RPN tuning to encourage hard-negative mining
-    try:
-        bs = int(args.roi_batch_size_per_image)
-        model.roi_heads.batch_size_per_image = bs
-        # Use ceiling strategy when computing number of positive ROIs:
-        # ensure int(batch_size * positive_fraction) behaves like ceil(batch_size * fraction)
-        try:
-            pf = float(args.roi_positive_fraction)
-        except Exception:
-            pf = float(0.25)
-        desired_pos = math.ceil(bs * pf) if bs > 0 else 0
-        pos_frac = (desired_pos / bs) if bs > 0 else pf
-        model.roi_heads.positive_fraction = float(pos_frac)
-    except Exception:
-        pass
-    try:
-        setattr(model.rpn, "pre_nms_top_n_train", int(args.rpn_pre_nms_top_n_train))
-        setattr(model.rpn, "post_nms_top_n_train", int(args.rpn_post_nms_top_n_train))
-    except Exception:
-        pass
 
     print(f"Total usable images: {len(usable_indices)}; positives: {len(pos_indices)}; negatives: {len(neg_indices)}")
     print(
@@ -1908,7 +1746,6 @@ def main() -> None:
             accumulation_steps,
             warmup_scheduler,
             disable_tqdm=args.hide_progress_bar,
-            rpn_objectness_loss_scale=float(args.rpn_objectness_loss_scale),
         )
 
         # Unfreeze backbone after configured freeze epochs
@@ -1954,10 +1791,8 @@ def main() -> None:
             "epoch": float(epoch + 1),
             "train_loss": float(avg_loss),
             "lr": float(optimizer.param_groups[0]["lr"]),
-            "loss_classifier": float(avg_sublosses.get("loss_classifier", 0.0)),
-            "loss_box_reg": float(avg_sublosses.get("loss_box_reg", 0.0)),
-            "loss_objectness": float(avg_sublosses.get("loss_objectness", 0.0)),
-            "loss_rpn_box_reg": float(avg_sublosses.get("loss_rpn_box_reg", 0.0)),
+            "classification": float(avg_sublosses.get("classification", 0.0)),
+            "bbox_regression": float(avg_sublosses.get("bbox_regression", 0.0)),
             "val_precision": float(val_metrics["precision"]),
             "val_recall": float(val_metrics["recall"]),
             "val_f1": float(val_metrics["f1"]),
@@ -1989,10 +1824,10 @@ def main() -> None:
                 "images_root": str(images_root),
                 "positive_only": bool(args.positive_only),
                 "history": history,
-                "torchvision_model": "fasterrcnn_resnet50_fpn_v2",
+                "torchvision_model": "retinanet_resnet50_fpn_v2",
                 "anchor_sizes": str(args.anchor_sizes),
-                "roi_batch_size_per_image": int(args.roi_batch_size_per_image),
-                "roi_positive_fraction": float(args.roi_positive_fraction),
+                "focal_loss_alpha": float(args.focal_alpha),
+                "focal_loss_gamma": float(args.focal_gamma),
                 "val_ratio": float(args.val_ratio),
                 "val_score_threshold": float(args.val_score_threshold),
                 "val_iou_threshold": float(args.val_iou_threshold),
@@ -2002,20 +1837,17 @@ def main() -> None:
                 "best_val_precision": float(val_metrics["precision"]),
                 "best_val_recall": float(val_metrics["recall"]),
                 "best_val_f1": float(val_metrics["f1"]),
-                "cls_loss_type": str(args.cls_loss_type),
-                "ohem_enabled": bool(args.ohem),
-                "effective_cls_weight_bg": float(effective_cls_weight_bg),
-                "effective_cls_weight_lesion": float(effective_cls_weight_lesion),
-                "low_bg_weight_guard_applied": bool(low_bg_weight_guard_applied),
                 "crop_breast_region": bool(crop_breast_region),
                 "breast_crop_margin": float(breast_crop_margin),
                 "box_fg_iou_thresh": float(args.box_fg_iou_thresh),
+                "box_bg_iou_thresh": float(args.box_bg_iou_thresh),
                 "warmup_positive_epochs": int(args.warmup_positive_epochs),
                 "warmup_balanced_epochs": int(warmup_balanced_epochs),
                 "only_use": float(only_use),
                 "train_neg_to_pos_ratio": float(train_neg_to_pos_ratio),
                 "val_neg_to_pos_ratio": float(val_neg_to_pos_ratio),
                 "box_score_thresh": float(args.box_score_thresh),
+                "box_nms_thresh": float(args.box_nms_thresh),
                 "box_detections_per_img": int(args.box_detections_per_img),
                 "split_summary": split_summary,
             }
@@ -2036,10 +1868,8 @@ def main() -> None:
         )
         print(
             (
-                f"  Train sub-losses: loss_classifier={record['loss_classifier']:.6f}, "
-                f"loss_box_reg={record['loss_box_reg']:.6f}, "
-                f"loss_objectness={record['loss_objectness']:.6f}, "
-                f"loss_rpn_box_reg={record['loss_rpn_box_reg']:.6f}"
+                f"  Train sub-losses: classification={record.get('classification', 0.0):.6f}, "
+                f"bbox_regression={record.get('bbox_regression', 0.0):.6f}"
             )
         )
         print(
@@ -2062,10 +1892,10 @@ def main() -> None:
         "images_root": str(images_root),
         "positive_only": bool(args.positive_only),
         "history": history,
-        "torchvision_model": "fasterrcnn_resnet50_fpn_v2",
+        "torchvision_model": "retinanet_resnet50_fpn_v2",
         "anchor_sizes": str(args.anchor_sizes),
-        "roi_batch_size_per_image": int(args.roi_batch_size_per_image),
-        "roi_positive_fraction": float(args.roi_positive_fraction),
+        "focal_loss_alpha": float(args.focal_alpha),
+        "focal_loss_gamma": float(args.focal_gamma),
         "val_ratio": float(args.val_ratio),
         "val_score_threshold": float(args.val_score_threshold),
         "val_iou_threshold": float(args.val_iou_threshold),
@@ -2073,14 +1903,10 @@ def main() -> None:
         "min_delta": float(args.min_delta),
         "best_epoch": int(best_epoch),
         "best_val_f1": float(best_val_f1 if best_val_f1 != -float("inf") else 0.0),
-        "cls_loss_type": str(args.cls_loss_type),
-        "ohem_enabled": bool(args.ohem),
-        "effective_cls_weight_bg": float(effective_cls_weight_bg),
-        "effective_cls_weight_lesion": float(effective_cls_weight_lesion),
-        "low_bg_weight_guard_applied": bool(low_bg_weight_guard_applied),
         "crop_breast_region": bool(crop_breast_region),
         "breast_crop_margin": float(breast_crop_margin),
         "box_fg_iou_thresh": float(args.box_fg_iou_thresh),
+        "box_bg_iou_thresh": float(args.box_bg_iou_thresh),
         "warmup_positive_epochs": int(args.warmup_positive_epochs),
         "warmup_balanced_epochs": int(warmup_balanced_epochs),
         "only_use": float(only_use),
