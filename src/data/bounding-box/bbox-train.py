@@ -16,13 +16,13 @@ python src/data/bounding-box/bbox-train.py \
     --post-warmup-lr 0.001 \
     --warmup-balanced-epochs 5 \
     --warmup-pos-weight-ratio 3.0 \
-    --full-train-pos-weight-ratio 0.0 \
+    --full-train-pos-weight-ratio 2.0 \
     --freeze-epochs 0 \
     --augment \
     --aug-hflip-prob 0.5 \
     --aug-brightness-delta 0.2 \
     --aug-rotation-max-deg 8.0 \
-    --anchor-sizes 16,32,64,128,256 \
+    --anchor-sizes 32,64,128,256,512 \
     --focal-alpha 0.75 \
     --focal-gamma 2.0 \
     --box-fg-iou-thresh 0.4 \
@@ -1913,6 +1913,7 @@ def main() -> None:
         "train_neg_to_pos_ratio": float(train_neg_to_pos_ratio),
         "val_neg_to_pos_ratio": float(val_neg_to_pos_ratio),
         "box_score_thresh": float(args.box_score_thresh),
+        "box_nms_thresh": float(args.box_nms_thresh),
         "box_detections_per_img": int(args.box_detections_per_img),
         "split_summary": split_summary,
     }
