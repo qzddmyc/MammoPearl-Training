@@ -212,6 +212,12 @@ Prompts for improvement:
 
 from __future__ import annotations
 
+import os
+# Prevent libgomp warning when OMP_NUM_THREADS is set to "" or "0"
+_omp = os.environ.get("OMP_NUM_THREADS", "")
+if not _omp or not _omp.isdigit() or int(_omp) < 1:
+    os.environ["OMP_NUM_THREADS"] = "1"
+
 import argparse
 import json
 import atexit
