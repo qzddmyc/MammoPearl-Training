@@ -16,14 +16,14 @@ python src/data/bounding-box/bbox-train.py \
     --post-warmup-lr 0.001 \
     --warmup-balanced-epochs 5 \
     --warmup-pos-weight-ratio 3.0 \
-    --full-train-pos-weight-ratio 2.0 \
+    --full-train-pos-weight-ratio 0.0 \
     --freeze-epochs 0 \
     --augment \
     --aug-hflip-prob 0.5 \
     --aug-brightness-delta 0.2 \
     --aug-rotation-max-deg 8.0 \
     --anchor-sizes 32,64,128,256,512 \
-    --focal-alpha 0.75 \
+    --focal-alpha 0.5 \
     --focal-gamma 2.0 \
     --box-fg-iou-thresh 0.4 \
     --box-bg-iou-thresh 0.3 \
@@ -207,6 +207,25 @@ Prompts for improvement:
        （800×1333px）下 p90 宽度为 419px，而原最大 anchor 仅 256px，导致大病灶
        无有效 anchor 匹配；同时 16px/32px anchor 在数据集中覆盖不足 5% 的病灶，
        属于无效噪声。新配置将 IoU≥0.4 覆盖率从 91.0% 提升至 97.1%。
+    ** 注：rec_35 实际结果证明，仅改这两项不够——pos_weight=2.0 消除了全负
+       batch 的 FP 抑制梯度，导致 BestThreshF1 从 0.1357 退步至 0.0981，
+       FP@0.5 从 100–450 暴涨至 550–1500。rec_35 在 epoch 14 提前终止。
+-----------
+36. 基于 rec_34/rec_35 对比数据，精准修复两项 Focal Loss 相关的超参设置：
+    a. 撤销 pos_weight 改动：将 --full-train-pos-weight-ratio 从 2.0 恢复为 0.0。
+       rec_35 vs rec_34 的直接对比（相同架构，仅 pos_weight 不同）显示，
+       FP@0.5 从 100–450 暴涨至 550–1500（3–4 倍增幅）。根因：pos_weight=0.0
+       时约 49% 的有效 batch 为全负样本，这些 batch 对 Focal Loss 提供了纯 FP
+       抑制梯度；pos_weight=2.0 消除了这些 batch，模型失去"不要乱预测"的信号。
+    b. 降低 focal_alpha：将 --focal-alpha 从 0.75 改为 0.5。torchvision RetinaNet
+       中 alpha 是正类（病灶）的损失权重，1-alpha 是负类（背景）的权重。
+       原始 RetinaNet 论文使用 alpha=0.25（背景权重 0.75）；我们此前设 0.75
+       导致背景权重仅 0.25，高置信 FP 的背景梯度贡献仅为正常的 1/4。将 alpha
+       降至 0.5 使背景权重翻倍（0.25→0.50），对所有高置信 FP 的惩罚强度提升
+       2 倍，同时保持正负类梯度平衡，不至于压垮病灶学习。
+    保留 anchor_sizes=32,64,128,256,512（覆盖率 97.1% 有效）。
+    预期：FP@0.1 降至 50–400 范围，best_thresh 提前稳定在 0.3，
+    BestThreshF1 突破 rec_34 的 0.1357 上限，目标 0.16–0.20。
 
 """
 
