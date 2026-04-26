@@ -12,6 +12,7 @@
 *.pth
 *.pt
 *.bak
+*.zip
 
 /tmp/
 
