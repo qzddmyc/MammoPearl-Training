@@ -1221,9 +1221,21 @@ def build_model(
             else:
                 raw_sd = ckpt
             # Strip common prefixes: module., encoder., backbone., body.
+            # Then remap RadImageNet-style numeric Sequential indices to
+            # torchvision ResNet named layers:
+            #   0 -> conv1,  1 -> bn1,  4 -> layer1,  5 -> layer2,
+            #   6 -> layer3, 7 -> layer4
+            _idx_to_resnet = {
+                "0": "conv1", "1": "bn1",
+                "4": "layer1", "5": "layer2",
+                "6": "layer3", "7": "layer4",
+            }
             stripped: Dict[str, Any] = {}
             for k, v in raw_sd.items():
                 k = re.sub(r"^(module\.|encoder\.|backbone\.|body\.)+", "", k)
+                m = re.match(r"^(\d+)\.(.*)", k)
+                if m and m.group(1) in _idx_to_resnet:
+                    k = f"{_idx_to_resnet[m.group(1)]}.{m.group(2)}"
                 stripped[k] = v
             missing, unexpected = model.backbone.body.load_state_dict(stripped, strict=False)
             print(f"[Info] Loaded medical backbone from: {medical_backbone_path}")
