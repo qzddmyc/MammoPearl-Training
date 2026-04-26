@@ -1195,11 +1195,14 @@ def build_model(
             print(f"[Warning] Could not load RetinaNet pretrained weights: {exc}")
 
     # Step 2: Build model with 2 classes and no COCO weights.
+    # Note: do NOT pass anchor_generator to retinanet_resnet50_fpn_v2() —
+    # current torchvision passes it positionally inside the factory function,
+    # so passing it again as a kwarg raises "got multiple values" TypeError.
+    # We replace model.anchor_generator after construction instead.
     try:
         model = retinanet_resnet50_fpn_v2(
             weights=None,
             num_classes=num_classes,
-            anchor_generator=anchor_generator,
             score_thresh=score_thresh,
             nms_thresh=nms_thresh,
             detections_per_img=detections_per_img,
@@ -1207,8 +1210,23 @@ def build_model(
             bg_iou_thresh=bg_iou_thresh,
         )
     except TypeError:
-        # Older torchvision may not accept all kwargs; retry with minimal args.
+        # Very old torchvision: retry with minimal args, then patch below.
         model = retinanet_resnet50_fpn_v2(weights=None, num_classes=num_classes)
+        try:
+            model.score_thresh = score_thresh
+            model.nms_thresh = nms_thresh
+            model.detections_per_img = detections_per_img
+            model.fg_iou_thresh = fg_iou_thresh
+            model.bg_iou_thresh = bg_iou_thresh
+        except AttributeError:
+            print("[Warning] Could not patch score_thresh/detections_per_img on old torchvision model.")
+    # Replace anchor generator (safe on all torchvision versions).
+    model.anchor_generator = anchor_generator
+    print(
+        f"[Info] Model params: score_thresh={model.score_thresh}, "
+        f"nms_thresh={model.nms_thresh}, "
+        f"detections_per_img={model.detections_per_img}"
+    )
 
     # Step 3: Restore backbone weights.
     # Priority: medical_backbone_path > COCO pretrained (backbone_state_dict).
@@ -1968,7 +1986,7 @@ def main() -> None:
             no_improve_epochs += 1
 
         print(
-            f"Epoch {epoch + 1:03d}/{int(args.epochs):03d} | "
+            f"[Milestone] Epoch {epoch + 1:03d}/{int(args.epochs):03d} | "
             f"train_loss={avg_loss:.4f} | "
             f"val_precision={val_metrics['precision']:.4f} | "
             f"val_recall={val_metrics['recall']:.4f} | "
