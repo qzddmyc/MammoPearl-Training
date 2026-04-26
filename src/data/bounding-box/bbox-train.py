@@ -244,6 +244,29 @@ Prompts for improvement:
     最大 recall 仅 26.6%，BestThreshF1 增幅仅 4.7%（0.1357→0.1421）。
     超参数调整空间已接近耗尽，问题本质在于 COCO 预训练特征对乳腺病灶
     的语义表达能力不足。
+    ── rec_37 三项 bug 修复（训练过程中发现）──
+    c. RadImageNet key 映射修复（commit e201432）：
+       RadImageNet ResNet50.pt 使用数字索引键（backbone.0.weight 等），
+       与 torchvision 的命名键（conv1.weight、layer1.*.weight 等）不匹配，
+       导致全部 318 个骨干参数被当作 unexpected 跳过，权重实际未加载。
+       修复：剥离 backbone. 前缀后，额外映射
+       0→conv1, 1→bn1, 4→layer1, 5→layer2, 6→layer3, 7→layer4。
+       验证：Missing=0, Unexpected=0。
+    d. anchor_generator 关键字参数冲突修复（commit 6c63ca0）：
+       当前 torchvision 已在工厂函数内部以位置参数传入 anchor_generator，
+       我们再以 kwarg 方式传入时触发 TypeError，except 块静默吞掉了
+       anchor_sizes、detections_per_img、fg/bg_iou_thresh 等全部参数，
+       回退至 torchvision 默认值（detections_per_img=300 等）。
+       rec_33–rec_36 及 rec_37 前两次均受此影响，所有自定义检测参数均未生效。
+       修复：不再向工厂函数传 anchor_generator，改为构建后赋值
+       model.anchor_generator = anchor_generator。
+    e. RetinaNet head 重建修复：
+       工厂函数按默认 9 anchors/location（3 scales×3 aspects）建造 head；
+       替换 anchor_generator 后实际产生 3 anchors/location，
+       head 输出通道数不匹配，在 classification_head.compute_loss 时触发
+       IndexError: shape [67200] != [201600, 2]。
+       修复：替换 anchor_generator 后立即用正确的 num_anchors 重建
+       model.head（RetinaNetHead + GroupNorm32）。
 
 """
 
@@ -1228,7 +1251,31 @@ def build_model(
         f"detections_per_img={model.detections_per_img}"
     )
 
-    # Step 3: Restore backbone weights.
+    # Rebuild detection head to match our anchor count.
+    # The v2 factory builds heads for 9 anchors/location (3 scales × 3 aspects);
+    # our generator uses 1 scale × 3 aspects = 3 anchors/location.
+    # Mismatched dimensions cause an IndexError in classification_head.compute_loss.
+    try:
+        from torchvision.models.detection.retinanet import RetinaNetHead
+        from functools import partial
+        _num_anchors = anchor_generator.num_anchors_per_location()[0]
+        _in_channels = model.backbone.out_channels
+        try:
+            model.head = RetinaNetHead(
+                _in_channels, _num_anchors, num_classes,
+                norm_layer=partial(torch.nn.GroupNorm, 32),
+            )
+        except TypeError:
+            # Older torchvision RetinaNetHead may not accept norm_layer.
+            model.head = RetinaNetHead(_in_channels, _num_anchors, num_classes)
+        print(
+            f"[Info] Rebuilt RetinaNet head: "
+            f"in_channels={_in_channels}, num_anchors={_num_anchors}, num_classes={num_classes}"
+        )
+    except Exception as exc:
+        print(f"[Warning] Could not rebuild RetinaNet head ({exc}); head may have wrong anchor count.")
+
+
     # Priority: medical_backbone_path > COCO pretrained (backbone_state_dict).
     if medical_backbone_path is not None:
         try:
