@@ -30,6 +30,7 @@ python src/data/bounding-box/bbox-train.py \
     --box-nms-thresh 0.3 \
     --box-detections-per-img 10 \
     --patience 15 \
+    --medical-backbone-path models/raw/ResNet50.pt \
     --hide-progress-bar
 
 本文件介绍：
@@ -226,6 +227,23 @@ Prompts for improvement:
     保留 anchor_sizes=32,64,128,256,512（覆盖率 97.1% 有效）。
     预期：FP@0.1 降至 50–400 范围，best_thresh 提前稳定在 0.3，
     BestThreshF1 突破 rec_34 的 0.1357 上限，目标 0.16–0.20。
+-----------
+37. 数据预处理 + 医学预训练 backbone 双重升级（rec_37）：
+    a. CLAHE 对比度增强（方向 A）：在 normalize_image() 的灰度图路径中，
+       将 CLAHE（clipLimit=2.0, tileGridSize=8×8）应用于转换为 RGB 前的
+       灰度图，增强钼靶图像的局部对比度，使病灶与周围腺体的灰度差异更清晰，
+       改善特征提取质量。CLAHE 作用于训练集和验证集全部图像（非仅增强）。
+    b. 医学预训练 backbone（方向 C）：在 build_model() 的 Step 3 中，
+       新增 medical_backbone_path 参数；若提供，则用 RadImageNet ResNet50
+       权重覆盖 COCO backbone，大幅缩短迁移链
+       （ImageNet/CXR → 多模态放射图像 → 乳腺钼靶），使特征空间更接近
+       乳腺影像语义。加载时自动剥离 module./encoder./backbone./body. 等
+       前缀，以 strict=False 方式匹配 model.backbone.body；若加载失败则
+       自动回退至 COCO 权重。
+    背景：rec_34/35/36 共 63 个 epoch 中，best_thresh 几乎始终锁在 0.1，
+    最大 recall 仅 26.6%，BestThreshF1 增幅仅 4.7%（0.1357→0.1421）。
+    超参数调整空间已接近耗尽，问题本质在于 COCO 预训练特征对乳腺病灶
+    的语义表达能力不足。
 
 """
 
@@ -243,6 +261,7 @@ import atexit
 import datetime
 import math
 import random
+import re
 import signal
 import time
 from collections import defaultdict
@@ -294,6 +313,8 @@ def read_image_unicode(path: Path) -> np.ndarray:
 def normalize_image(img: np.ndarray) -> np.ndarray:
     """Convert image to RGB uint8 with 3 channels."""
     if img.ndim == 2:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        img = clahe.apply(img)
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
     elif img.ndim == 3:
         if img.shape[2] == 4:
@@ -1140,6 +1161,7 @@ def build_model(
     nms_thresh: float = 0.5,
     focal_loss_alpha: float = 0.75,
     focal_loss_gamma: float = 2.0,
+    medical_backbone_path: Optional[str] = None,
 ) -> torch.nn.Module:
     """Build RetinaNet with ResNet50-FPN backbone.
 
@@ -1188,8 +1210,33 @@ def build_model(
         # Older torchvision may not accept all kwargs; retry with minimal args.
         model = retinanet_resnet50_fpn_v2(weights=None, num_classes=num_classes)
 
-    # Step 3: Restore pretrained backbone.
-    if backbone_state_dict is not None:
+    # Step 3: Restore backbone weights.
+    # Priority: medical_backbone_path > COCO pretrained (backbone_state_dict).
+    if medical_backbone_path is not None:
+        try:
+            ckpt = torch.load(medical_backbone_path, map_location="cpu")
+            # Accept checkpoint files that store weights under common keys
+            if isinstance(ckpt, dict):
+                raw_sd = ckpt.get("state_dict", ckpt.get("model", ckpt))
+            else:
+                raw_sd = ckpt
+            # Strip common prefixes: module., encoder., backbone., body.
+            stripped: Dict[str, Any] = {}
+            for k, v in raw_sd.items():
+                k = re.sub(r"^(module\.|encoder\.|backbone\.|body\.)+", "", k)
+                stripped[k] = v
+            missing, unexpected = model.backbone.body.load_state_dict(stripped, strict=False)
+            print(f"[Info] Loaded medical backbone from: {medical_backbone_path}")
+            if missing:
+                print(f"[Info]   Missing keys ({len(missing)}): {missing[:3]}")
+            if unexpected:
+                print(f"[Info]   Unexpected keys ({len(unexpected)}): {unexpected[:3]}")
+        except Exception as exc:
+            print(f"[Warning] Could not load medical backbone ({exc}). Falling back to COCO weights.")
+            if backbone_state_dict is not None:
+                model.backbone.load_state_dict(backbone_state_dict)
+                print("[Info] Loaded RetinaNet_ResNet50_FPN_V2 pretrained backbone weights.")
+    elif backbone_state_dict is not None:
         model.backbone.load_state_dict(backbone_state_dict)
         print("[Info] Loaded RetinaNet_ResNet50_FPN_V2 pretrained backbone weights.")
 
@@ -1463,6 +1510,20 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    # Medical pretrained backbone (rec_37+)
+    parser.add_argument(
+        "--medical-backbone-path",
+        type=str,
+        default=None,
+        help=(
+            "Path to a medical-domain pretrained ResNet50 checkpoint (e.g. RadImageNet). "
+            "If provided, backbone weights are loaded from this file instead of COCO pretrained, "
+            "shortening the ImageNet→COCO→mammography transfer chain. "
+            "Supports checkpoints with state_dict/model keys and common prefixes "
+            "(module., encoder., backbone., body.) which are stripped automatically."
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -1574,6 +1635,7 @@ def main() -> None:
         nms_thresh=float(args.box_nms_thresh),
         focal_loss_alpha=float(args.focal_alpha),
         focal_loss_gamma=float(args.focal_gamma),
+        medical_backbone_path=args.medical_backbone_path if args.medical_backbone_path else None,
     )
     model.to(device)
 

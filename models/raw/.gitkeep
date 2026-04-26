@@ -1,0 +1,4 @@
+# Place raw/pretrained backbone weights here (not committed to git).
+# Example: ResNet50.pt  (RadImageNet pretrained ResNet50)
+#
+# Download: https://drive.google.com/file/d/1RHt2GnuOYlc_gcoTETtBDSW73mFyRAtR/view
