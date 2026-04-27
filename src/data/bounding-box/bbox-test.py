@@ -276,6 +276,7 @@ def build_model(
     nms_thresh: float = 0.5,
     focal_loss_alpha: float = 0.75,
     focal_loss_gamma: float = 2.0,
+    input_min_size: int = 800,
 ) -> torch.nn.Module:
     """Build RetinaNet (retinanet_resnet50_fpn_v2) for inference.
 
@@ -291,6 +292,8 @@ def build_model(
         nms_thresh: IoU threshold for NMS.
         focal_loss_alpha: Positive class weight in Focal Loss.
         focal_loss_gamma: Focusing exponent in Focal Loss.
+        input_min_size: Shorter side of the image after RetinaNet resize.
+            Must match the value used during training (stored in checkpoint meta).
 
     When anchor_sizes is None the torchvision default AnchorGenerator is kept
     (9 anchors/location: 3 scales x 3 aspects), which matches rec_38 checkpoints.
@@ -328,6 +331,10 @@ def build_model(
         aspect_ratios = tuple([(0.5, 1.0, 2.0) for _ in range(len(anchor_sizes))])
         anchor_generator = AnchorGenerator(sizes=anchor_sizes, aspect_ratios=aspect_ratios)
         model.anchor_generator = anchor_generator
+
+    if input_min_size != 800:
+        model.transform.min_size = (input_min_size,)
+        model.transform.max_size = int(input_min_size * 1333 / 800)
 
     try:
         model.head.classification_head.focal_loss_alpha = focal_loss_alpha
@@ -559,7 +566,8 @@ def main() -> None:
     box_nms_thresh = float(meta.get("box_nms_thresh", 0.5))
     focal_loss_alpha = float(meta.get("focal_loss_alpha", 0.75))
     focal_loss_gamma = float(meta.get("focal_loss_gamma", 2.0))
-    print(f"[Info] box_score_thresh={box_score_thresh}, box_detections_per_img={box_detections_per_img}, nms_thresh={box_nms_thresh}")
+    input_min_size = int(meta.get("input_min_size", 800))
+    print(f"[Info] box_score_thresh={box_score_thresh}, box_detections_per_img={box_detections_per_img}, nms_thresh={box_nms_thresh}, input_min_size={input_min_size}")
     print(f"[Info] Focal Loss: alpha={focal_loss_alpha}, gamma={focal_loss_gamma}")
     score_threshold = args.score_threshold if args.score_threshold is not None else float(meta.get("val_score_threshold", 0.5))
     iou_threshold = args.iou_threshold if args.iou_threshold is not None else float(meta.get("val_iou_threshold", 0.5))
@@ -592,6 +600,7 @@ def main() -> None:
         nms_thresh=box_nms_thresh,
         focal_loss_alpha=focal_loss_alpha,
         focal_loss_gamma=focal_loss_gamma,
+        input_min_size=input_min_size,
     )
     model.to(device)
 
@@ -611,6 +620,26 @@ def main() -> None:
     )
 
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
+
+    # Recall sweep: evaluate at score_threshold = 0.1 / 0.3 / 0.5
+    # This is aligned with the [Recall] log line in bbox-train.py
+    gt_total = metrics["gt_boxes"]
+    recall_thresholds = [0.1, 0.3, 0.5]
+    recall_parts = []
+    for st in recall_thresholds:
+        m, _ = evaluate(
+            model=model,
+            loader=loader,
+            device=device,
+            score_threshold=st,
+            iou_threshold=iou_threshold,
+        )
+        tp = m["tp"]
+        fp = m["fp"]
+        rec = tp / gt_total if gt_total else 0.0
+        recall_parts.append(f"Recall@{st}={rec:.3f}({tp}/{gt_total}) FP={fp}")
+    print(f"[Recall] GT_boxes={gt_total} | iou_thresh={iou_threshold} | " + " | ".join(recall_parts))
+
     if meta:
         print("Checkpoint meta:")
         print(json.dumps(meta, ensure_ascii=False, indent=2))

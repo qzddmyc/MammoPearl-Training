@@ -22,14 +22,15 @@ python src/data/bounding-box/bbox-train.py \
     --aug-hflip-prob 0.5 \
     --aug-brightness-delta 0.2 \
     --aug-rotation-max-deg 8.0 \
-    --copy-paste-prob 0.4 \
-    --copy-paste-max-pastes 2 \
-    --focal-alpha 0.5 \
+    --focal-alpha 0.8 \
     --focal-gamma 2.0 \
     --box-fg-iou-thresh 0.4 \
     --box-bg-iou-thresh 0.3 \
-    --box-nms-thresh 0.3 \
-    --box-detections-per-img 10 \
+    --box-nms-thresh 0.5 \
+    --box-score-thresh 0.001 \
+    --box-detections-per-img 20 \
+    --input-min-size 1200 \
+    --recall-stop \
     --patience 15 \
     --medical-backbone-path models/raw/ResNet50.pt \
     --hide-progress-bar
@@ -304,6 +305,29 @@ Prompts for improvement:
     e. 新增 CLI 参数：
        - --copy-paste-prob（默认 0.0）：copy-paste 触发概率。
        - --copy-paste-max-pastes（默认 2）：每张负样本最多粘贴数量。
+-----------
+39. 路线 3 改进 + 召回率优先策略（针对 rec_38 F1 停滞、并重新定位任务目标）：
+    背景：bbox 检测器的最终用途是为"是否患病"分类器提供病灶位置特征，
+    检测器本身不需要精确分类，只需要高召回率（不漏病灶），FP 增多可以接受。
+    a. 新增 --input-min-size 参数（默认 800，推荐 1200）：
+       控制 RetinaNet 内置 resize transform 的短边目标尺寸（model.transform.min_size）。
+       原始图像 912×1520，resize 后 P10 最小病灶仅 28px，低于最小 anchor（32px）。
+       提升至 1200 后，resize scale 从 0.877 变为 1.316，病灶 P10 增至约 42px，
+       覆盖 P3 anchor（32–50px），降低约 14% 的病灶因分辨率不足而被漏检的概率。
+    b. 将 --focal-alpha 从 0.5 提升至 0.8：正样本（病灶）loss 权重是负样本的 4 倍，
+       漏检（FN）的惩罚远大于误报（FP），驱动模型输出更高召回率。
+    c. 将 --box-nms-thresh 从 0.3 放宽至 0.5：减少同一病灶的重复框被 NMS 压制，
+       避免因 NMS 过激进而丢失真实病灶框。
+    d. 将 --box-score-thresh 从 0.05 降至 0.001，--box-detections-per-img 从 10 增至 20：
+       几乎输出所有候选框，召回率上限不再受推理端阈值约束；由后续分类器决定置信度。
+    e. 关闭 copy-paste（--copy-paste-prob 0.0）：rec_38 对比 rec_37 F1 下降
+       （0.052 < 0.070），copy-paste 合成样本与真实病灶分布差异导致验证集性能下降。
+    f. train/test 双侧同步：bbox-test.py build_model() 和 meta 读取均已更新，
+       从 checkpoint meta["input_min_size"] 恢复训练时的 resize 设置。
+    g. 新增 --recall-stop 标志（默认关闭）：开启后以 Recall@0.1（TP@0.1 / GT框总数）
+       代替 BestThreshF1 作为早停和最佳 checkpoint 的判断指标，与召回率优先目标对齐。
+    h. 日志新增 [Recall] 行：每 epoch 打印 GT_boxes 总数、Recall@0.1/0.3/0.5 及绝对
+       TP/GT 数字，方便追踪召回率改善趋势；早停日志同步显示当前监控指标名称。
 
 """
 
@@ -1439,6 +1463,7 @@ def build_model(
     focal_loss_alpha: float = 0.75,
     focal_loss_gamma: float = 2.0,
     medical_backbone_path: Optional[str] = None,
+    input_min_size: int = 800,
 ) -> torch.nn.Module:
     """Build RetinaNet (retinanet_resnet50_fpn_v2) with ResNet50-FPN backbone.
 
@@ -1465,6 +1490,9 @@ def build_model(
         focal_loss_gamma: Focusing exponent in Focal Loss.
         medical_backbone_path: Path to RadImageNet ResNet50 checkpoint; if
             None, COCO backbone weights are kept.
+        input_min_size: Shorter side of the image after RetinaNet's built-in
+            resize transform.  Default 800 matches torchvision default.  Raise
+            to 1200 to keep small lesions larger relative to anchors.
     """
     if retinanet_resnet50_fpn_v2 is None:
         raise RuntimeError(
@@ -1527,10 +1555,16 @@ def build_model(
     # which allows the COCO-pretrained head to load with matching dimensions.
     if anchor_generator is not None:
         model.anchor_generator = anchor_generator
+    # Override the built-in resize transform min_size so that small lesions
+    # stay larger after rescaling and better match the smallest anchors.
+    if input_min_size != 800:
+        model.transform.min_size = (input_min_size,)
+        model.transform.max_size = int(input_min_size * 1333 / 800)
     print(
         f"[Info] Model params: score_thresh={model.score_thresh}, "
         f"nms_thresh={model.nms_thresh}, "
-        f"detections_per_img={model.detections_per_img}"
+        f"detections_per_img={model.detections_per_img}, "
+        f"input_min_size={model.transform.min_size[0]}"
     )
 
     # Load COCO weights into the 2-class model with strict=False.
@@ -1824,6 +1858,8 @@ def parse_args() -> argparse.Namespace:
 
     # Inference-time box filtering
     parser.add_argument("--box-score-thresh", type=float, default=0.05, help="Score threshold for inference-time box filtering")
+    parser.add_argument("--input-min-size", type=int, default=800, help="Shorter side of the image after RetinaNet resize transform (default 800). Raise to 1200 to make small lesions larger relative to anchors.")
+    parser.add_argument("--recall-stop", action="store_true", help="Use Recall@0.1 (TP@0.1 / GT boxes) instead of BestThreshF1 as the early-stopping metric. Recommended for recall-first training.")
     parser.add_argument("--box-detections-per-img", type=int, default=100, help="Max detections per image at inference time")
     parser.add_argument("--box-nms-thresh", type=float, default=0.5, help="NMS IoU threshold for post-prediction duplicate suppression; lower (e.g. 0.3) removes more overlapping FP boxes")
     parser.add_argument("--disable-breast-crop", action="store_true", help="Disable breast-region cropping and train on the full processed image")
@@ -2019,6 +2055,7 @@ def main() -> None:
         focal_loss_alpha=float(args.focal_alpha),
         focal_loss_gamma=float(args.focal_gamma),
         medical_backbone_path=args.medical_backbone_path if args.medical_backbone_path else None,
+        input_min_size=int(args.input_min_size),
     )
     model.to(device)
 
@@ -2086,6 +2123,7 @@ def main() -> None:
             print("[Warning] No positive training samples; disabling positive-only warmup")
 
     best_val_f1 = -float("inf")
+    best_recall_at_low_thresh = -float("inf")
     best_epoch = 0
     no_improve_epochs = 0
 
@@ -2284,16 +2322,26 @@ def main() -> None:
             "val_fn": float(val_metrics["fn"]),
             "val_raw_preds": float(val_metrics.get("raw_preds", 0)),
             "val_avg_raw_preds_per_image": float(val_metrics.get("avg_raw_preds_per_image", 0)),
+            "val_recall_at_01": float(val_metrics.get("tp@0.1", val_metrics["tp"])) / max(float(val_metrics.get("gt_boxes", 1)), 1),
+            "val_recall_at_03": float(val_metrics.get("tp@0.3", 0)) / max(float(val_metrics.get("gt_boxes", 1)), 1),
+            "val_recall_at_05": float(val_metrics.get("tp@0.5", 0)) / max(float(val_metrics.get("gt_boxes", 1)), 1),
         }
         history.append(record)
 
         # Use best-threshold F1 for checkpoint selection so we don't miss epochs
         # where the model is better at a threshold other than val_score_threshold.
         current_f1 = float(val_metrics.get("best_thresh_f1", val_metrics["f1"]))
-        improved = current_f1 > (best_val_f1 + float(args.min_delta))
+        # Recall-first: also track recall@0.1 (TP@0.1 / total GT boxes).
+        # When --recall-stop is set, early stopping is driven by recall@0.1 instead of F1.
+        gt_boxes_total = float(val_metrics.get("gt_boxes", max(val_metrics["tp"] + val_metrics["fn"], 1)))
+        recall_at_01 = float(val_metrics.get("tp@0.1", val_metrics["tp"])) / max(gt_boxes_total, 1)
+        current_stop_metric = recall_at_01 if args.recall_stop else current_f1
+        best_stop_metric = best_recall_at_low_thresh if args.recall_stop else best_val_f1
+        improved = current_stop_metric > (best_stop_metric + float(args.min_delta))
 
         if improved:
             best_val_f1 = current_f1
+            best_recall_at_low_thresh = recall_at_01
             best_epoch = epoch + 1
             no_improve_epochs = 0
 
@@ -2318,6 +2366,7 @@ def main() -> None:
                 "best_val_precision": float(val_metrics["precision"]),
                 "best_val_recall": float(val_metrics["recall"]),
                 "best_val_f1": float(val_metrics["f1"]),
+                "best_val_recall_at_01": float(recall_at_01),
                 "crop_breast_region": bool(crop_breast_region),
                 "breast_crop_margin": float(breast_crop_margin),
                 "box_fg_iou_thresh": float(args.box_fg_iou_thresh),
@@ -2330,6 +2379,7 @@ def main() -> None:
                 "box_score_thresh": float(args.box_score_thresh),
                 "box_nms_thresh": float(args.box_nms_thresh),
                 "box_detections_per_img": int(args.box_detections_per_img),
+                "input_min_size": int(args.input_min_size),
                 "split_summary": split_summary,
             }
             # Save the best checkpoint, not the last one.
@@ -2353,15 +2403,32 @@ def main() -> None:
                 f"bbox_regression={record.get('bbox_regression', 0.0):.6f}"
             )
         )
+        # Recall-at-threshold summary: shows how many GT lesions are found at each threshold.
+        # TP / GT boxes = recall. Goal: maximise TP@0.1 (recall with lenient threshold).
+        gt_total = int(val_metrics.get("gt_boxes", 0))
+        tp_01 = int(val_metrics.get("tp@0.1", 0))
+        tp_03 = int(val_metrics.get("tp@0.3", 0))
+        tp_05 = int(val_metrics.get("tp@0.5", 0))
+        recall_01 = tp_01 / max(gt_total, 1)
+        recall_03 = tp_03 / max(gt_total, 1)
+        recall_05 = tp_05 / max(gt_total, 1)
+        stop_label = "recall@0.1" if args.recall_stop else "BestThreshF1"
+        best_stop_val = best_recall_at_low_thresh if args.recall_stop else best_val_f1
+        print(
+            f"  [Recall] GT_boxes={gt_total} | "
+            f"Recall@0.1={recall_01:.3f}({tp_01}/{gt_total}) | "
+            f"Recall@0.3={recall_03:.3f}({tp_03}/{gt_total}) | "
+            f"Recall@0.5={recall_05:.3f}({tp_05}/{gt_total})"
+        )
         print(
             f"  Val counts: TP={int(val_metrics['tp'])}, FP={int(val_metrics['fp'])}, FN={int(val_metrics['fn'])} | "
-            f"best_BestThreshF1={best_val_f1:.4f} (epoch {best_epoch})"
+            f"best_{stop_label}={best_stop_val:.4f} (epoch {best_epoch})"
         )
 
         if int(args.patience) > 0 and no_improve_epochs >= int(args.patience):
             print(
-                f"[EarlyStopping] val_F1 has not improved for {int(args.patience)} consecutive epochs. "
-                f"Stopping at epoch {epoch + 1}."
+                f"[EarlyStopping] Stop metric ({stop_label}) has not improved for "
+                f"{int(args.patience)} consecutive epochs. Stopping at epoch {epoch + 1}."
             )
             break
 
@@ -2384,6 +2451,8 @@ def main() -> None:
         "min_delta": float(args.min_delta),
         "best_epoch": int(best_epoch),
         "best_val_f1": float(best_val_f1 if best_val_f1 != -float("inf") else 0.0),
+        "best_val_recall_at_01": float(best_recall_at_low_thresh if best_recall_at_low_thresh != -float("inf") else 0.0),
+        "recall_stop": bool(args.recall_stop),
         "crop_breast_region": bool(crop_breast_region),
         "breast_crop_margin": float(breast_crop_margin),
         "box_fg_iou_thresh": float(args.box_fg_iou_thresh),
@@ -2396,11 +2465,12 @@ def main() -> None:
         "box_score_thresh": float(args.box_score_thresh),
         "box_nms_thresh": float(args.box_nms_thresh),
         "box_detections_per_img": int(args.box_detections_per_img),
+        "input_min_size": int(args.input_min_size),
         "split_summary": split_summary,
     }
 
     print(f"Best checkpoint saved at: {save_path}")
-    print(f"Best epoch: {best_epoch}, best val_F1: {final_meta['best_val_f1']:.4f}")
+    print(f"Best epoch: {best_epoch}, best val_F1: {final_meta['best_val_f1']:.4f}, best Recall@0.1: {final_meta['best_val_recall_at_01']:.4f}")
     print(json.dumps(final_meta, ensure_ascii=False, indent=2))
 
 
