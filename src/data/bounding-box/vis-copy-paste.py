@@ -8,7 +8,7 @@ Saves a 2x2 grid image for each tested sample to tmp/copy_paste_test/:
   Bottom-right: Pasted result image with synthesized GT boxes drawn
 
 Usage (from repo root, Git Bash):
-    python src/data/bounding-box/test_copy_paste.py
+    python src/data/bounding-box/vis-copy-paste.py
 """
 
 import sys
