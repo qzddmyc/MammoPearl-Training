@@ -58,6 +58,9 @@ def read_image_unicode(path: Path) -> np.ndarray:
 
 def normalize_image(img: np.ndarray) -> np.ndarray:
     if img.ndim == 2:
+        # Apply CLAHE to match bbox-train.py preprocessing (rec_37+).
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        img = clahe.apply(img)
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
     elif img.ndim == 3:
         if img.shape[2] == 4:
@@ -274,29 +277,57 @@ def build_model(
     focal_loss_alpha: float = 0.75,
     focal_loss_gamma: float = 2.0,
 ) -> torch.nn.Module:
-    """Build RetinaNet with ResNet50-FPN backbone, matching bbox-train.py build_model()."""
+    """Build RetinaNet (retinanet_resnet50_fpn_v2) for inference.
+
+    Mirrors the architecture of bbox-train.py build_model() at inference time.
+    Does NOT load COCO/RadImageNet weights — weights are loaded from the
+    saved checkpoint afterwards.
+
+    Args:
+        anchor_sizes: Per-FPN-level size tuples.  ``None`` keeps torchvision
+            default (9 anchors/location), required for rec_38+ checkpoints.
+        score_thresh: Model-internal score threshold for post-NMS filtering.
+        detections_per_img: Max detections kept per image after NMS.
+        nms_thresh: IoU threshold for NMS.
+        focal_loss_alpha: Positive class weight in Focal Loss.
+        focal_loss_gamma: Focusing exponent in Focal Loss.
+
+    When anchor_sizes is None the torchvision default AnchorGenerator is kept
+    (9 anchors/location: 3 scales x 3 aspects), which matches rec_38 checkpoints.
+    Custom anchor_sizes are applied via model.anchor_generator assignment *after*
+    construction to avoid the 'got multiple values' TypeError in newer torchvision.
+    """
     if retinanet_resnet50_fpn_v2 is None:
         raise RuntimeError(
             "torchvision RetinaNet v2 not found. Please upgrade torchvision (>=0.14)."
         )
 
-    if anchor_sizes is None:
-        anchor_sizes = ((16,), (32,), (64,), (128,), (256,))
-
-    aspect_ratios = tuple([(0.5, 1.0, 2.0) for _ in range(len(anchor_sizes))])
-    anchor_generator = AnchorGenerator(sizes=anchor_sizes, aspect_ratios=aspect_ratios)
-
+    # Build with torchvision defaults first (no anchor_generator kwarg — newer
+    # torchvision already passes it positionally inside the factory function).
     try:
         model = retinanet_resnet50_fpn_v2(
             weights=None,
             num_classes=num_classes,
-            anchor_generator=anchor_generator,
             score_thresh=score_thresh,
             nms_thresh=nms_thresh,
             detections_per_img=detections_per_img,
         )
     except TypeError:
         model = retinanet_resnet50_fpn_v2(weights=None, num_classes=num_classes)
+        try:
+            model.score_thresh = score_thresh
+            model.nms_thresh = nms_thresh
+            model.detections_per_img = detections_per_img
+        except AttributeError:
+            pass
+
+    # Replace anchor_generator only when custom sizes are explicitly requested.
+    # When anchor_sizes is None the torchvision default (9 anchors/location) is
+    # kept — required for rec_38 checkpoints whose head was built that way.
+    if anchor_sizes is not None:
+        aspect_ratios = tuple([(0.5, 1.0, 2.0) for _ in range(len(anchor_sizes))])
+        anchor_generator = AnchorGenerator(sizes=anchor_sizes, aspect_ratios=aspect_ratios)
+        model.anchor_generator = anchor_generator
 
     try:
         model.head.classification_head.focal_loss_alpha = focal_loss_alpha
@@ -510,9 +541,18 @@ def main() -> None:
     ckpt = torch.load(ckpt_path, map_location=device)
     meta = ckpt.get("meta", {})
 
-    anchor_str = args.anchor_sizes if args.anchor_sizes is not None else meta.get("anchor_sizes", "16,32,64,128,256")
-    anchor_sizes = tuple((int(s.strip()),) for s in str(anchor_str).split(",") if s.strip())
-    print(f"[Info] Using anchor sizes: {anchor_str}")
+    # "16,32,64,128,256" is the sentinel value written to meta when the training
+    # command used the default anchor arg, which maps to anchor_sizes=None (i.e.
+    # the torchvision default 9 anchors/location).  Reproduce the same logic here
+    # so test model head dimensions match the checkpoint.
+    _DEFAULT_ANCHOR_SENTINEL = "16,32,64,128,256"
+    anchor_str = args.anchor_sizes if args.anchor_sizes is not None else meta.get("anchor_sizes", _DEFAULT_ANCHOR_SENTINEL)
+    if str(anchor_str).strip() == _DEFAULT_ANCHOR_SENTINEL:
+        anchor_sizes = None  # torchvision default 9 anchors/location
+        print(f"[Info] anchor_sizes='{anchor_str}' → torchvision default (9 anchors/location)")
+    else:
+        anchor_sizes = tuple((int(s.strip()),) for s in str(anchor_str).split(",") if s.strip())
+        print(f"[Info] Using custom anchor sizes: {anchor_str}")
 
     box_score_thresh = args.box_score_thresh if args.box_score_thresh is not None else float(meta.get("box_score_thresh", 0.05))
     box_detections_per_img = args.box_detections_per_img if args.box_detections_per_img is not None else int(meta.get("box_detections_per_img", 100))

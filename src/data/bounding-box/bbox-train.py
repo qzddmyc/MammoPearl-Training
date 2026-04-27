@@ -1,4 +1,4 @@
-# 使用 fasterrcnn_resnet50_fpn 模型对数据集进行训练
+# 使用 retinanet_resnet50_fpn_v2 模型对数据集进行训练（rec_34 起从 Faster R-CNN 切换至 RetinaNet）
 
 # 使用这个模型去训练会耗费很长的时间，需要注意
 
@@ -371,7 +371,11 @@ def read_image_unicode(path: Path) -> np.ndarray:
 
 
 def normalize_image(img: np.ndarray) -> np.ndarray:
-    """Convert image to RGB uint8 with 3 channels."""
+    """Convert image to RGB uint8 with 3 channels.
+
+    For grayscale (2-D) inputs, CLAHE contrast enhancement
+    (clipLimit=2.0, tileGridSize=8×8) is applied before RGB conversion.
+    """
     if img.ndim == 2:
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         img = clahe.apply(img)
@@ -1382,7 +1386,7 @@ def validate_one_epoch(
 
     avg_raw_preds = float(total_raw_preds / max(total_images, 1))
     if avg_raw_preds > 200:
-        print(f"[Warning] avg_raw_preds_per_image={avg_raw_preds:.1f} > 200, RPN/ROI may not suppress background effectively")
+        print(f"[Warning] avg_raw_preds_per_image={avg_raw_preds:.1f} > 200, RetinaNet may not be suppressing background anchors effectively")
 
     # Print multi-threshold summary and compute best-threshold F1
     parts = []
@@ -1436,13 +1440,31 @@ def build_model(
     focal_loss_gamma: float = 2.0,
     medical_backbone_path: Optional[str] = None,
 ) -> torch.nn.Module:
-    """Build RetinaNet with ResNet50-FPN backbone.
+    """Build RetinaNet (retinanet_resnet50_fpn_v2) with ResNet50-FPN backbone.
 
-    Loads COCO-pretrained backbone weights then builds a fresh classification
-    head for ``num_classes`` (2 = background + lesion).  Focal Loss alpha and
-    gamma are set on the classification head after construction.
+    Steps:
+      1. Fetch full COCO-pretrained state_dict; strip cls_logits keys (shape
+         mismatch: 91-class vs num_classes).
+      2. Build model with weights=None, num_classes=num_classes (default
+         9 anchors/location when anchor_sizes is None, so COCO head loads cleanly).
+      3. Load stripped COCO weights strict=False (backbone + FPN + regression head).
+      4. Optionally overwrite backbone.body with RadImageNet weights
+         (medical_backbone_path).
+      5. Average conv1 channel weights for grayscale-as-3channel input.
 
-    anchor_sizes: sequence of tuples, one tuple per FPN level.
+    Args:
+        anchor_sizes: Per-FPN-level size tuples.  ``None`` keeps torchvision
+            default (3 scales x 3 aspects = 9 anchors/location), required for
+            COCO head weight compatibility.
+        fg_iou_thresh: Anchor IoU threshold to be assigned as positive.
+        bg_iou_thresh: Anchor IoU threshold to be assigned as negative.
+        score_thresh: Model-internal score threshold for post-NMS filtering.
+        detections_per_img: Max detections kept per image after NMS.
+        nms_thresh: IoU threshold for NMS.
+        focal_loss_alpha: Positive class weight in Focal Loss.
+        focal_loss_gamma: Focusing exponent in Focal Loss.
+        medical_backbone_path: Path to RadImageNet ResNet50 checkpoint; if
+            None, COCO backbone weights are kept.
     """
     if retinanet_resnet50_fpn_v2 is None:
         raise RuntimeError(
@@ -1513,17 +1535,19 @@ def build_model(
 
     # Load COCO weights into the 2-class model with strict=False.
     # backbone + FPN + head regression branch will load cleanly.
-    # head classification branch (91-class → 2-class) will be skipped due to shape mismatch
-    # — that is intentional: classification head is randomly initialised for num_classes=2,
-    #   while regression head retains COCO anchor regression priors.
+    # head classification branch (91-class → 2-class) has a shape mismatch:
+    # strict=False cannot skip shape mismatches (only missing/unexpected keys).
+    # So we manually remove cls_logits keys from coco_state_dict first,
+    # then load the rest — classification head stays randomly initialised.
     if coco_state_dict is not None:
+        cls_logits_keys = [k for k in coco_state_dict if "cls_logits" in k]
+        for k in cls_logits_keys:
+            del coco_state_dict[k]
         missing, unexpected = model.load_state_dict(coco_state_dict, strict=False)
-        cls_skipped = [k for k in missing if "classification" in k]
-        other_missing = [k for k in missing if "classification" not in k]
         print(
             f"[Info] Loaded COCO weights (strict=False): "
-            f"{len(cls_skipped)} cls-head keys skipped (shape mismatch, expected), "
-            f"{len(other_missing)} other missing, {len(unexpected)} unexpected"
+            f"{len(cls_logits_keys)} cls_logits keys removed (shape mismatch, expected), "
+            f"{len(missing)} missing, {len(unexpected)} unexpected"
         )
     else:
         print("[Warning] No COCO weights loaded; model starts from random initialisation.")

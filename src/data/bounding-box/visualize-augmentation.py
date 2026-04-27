@@ -1,7 +1,7 @@
 # Visualize breast-region crop and data augmentation on images that have GT bounding boxes.
 #
 # Usage:
-#   python src/data/bounding-box/bbox-visualize-augmentation.py \
+#   python src/data/bounding-box/visualize-augmentation.py \
 #       --num-images 20 \
 #       --hflip-prob 0.5 \
 #       --max-rotation-deg 8.0 \
