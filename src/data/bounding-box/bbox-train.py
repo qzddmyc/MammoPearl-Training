@@ -22,7 +22,8 @@ python src/data/bounding-box/bbox-train.py \
     --aug-hflip-prob 0.5 \
     --aug-brightness-delta 0.2 \
     --aug-rotation-max-deg 8.0 \
-    --anchor-sizes 32,64,128,256,512 \
+    --copy-paste-prob 0.4 \
+    --copy-paste-max-pastes 2 \
     --focal-alpha 0.5 \
     --focal-gamma 2.0 \
     --box-fg-iou-thresh 0.4 \
@@ -35,11 +36,12 @@ python src/data/bounding-box/bbox-train.py \
 
 本文件介绍：
 
-Train a breast lesion bounding-box detector from VinDr detection CSV.
+Train a breast lesion bounding-box detector from VinDr-Mammo detection CSV.
 
 This script reads `data/raw/vindr_detection_folds.csv`, matches each row to
-`data/processed/images_png/<patient_id>/<image_id>`, and trains a Faster
-R-CNN detector to predict lesion bounding boxes (xmin, ymin, xmax, ymax).
+`data/processed/images_png/<patient_id>/<image_id>`, and trains a RetinaNet
+(retinanet_resnet50_fpn_v2) detector to predict lesion bounding boxes
+(xmin, ymin, xmax, ymax).
 
 Model checkpoint is saved to `models/bbox_resnet50.pth`.
 
@@ -267,6 +269,41 @@ Prompts for improvement:
        IndexError: shape [67200] != [201600, 2]。
        修复：替换 anchor_generator 后立即用正确的 num_anchors 重建
        model.head（RetinaNetHead + GroupNorm32）。
+-----------
+38. COCO head 保留 + RadImageNet backbone + copy-paste 数据增强（rec_38）：
+    a. 根因分析：rec_37 在 head 重建（e 项修复）时将 3 anchors/location 的新
+       head 完全随机初始化，同时丢失了 COCO 回归 head 中 8.8M 参数的预训练先验；
+       加之从未有过 COCO 类级别的分类先验，导致 BestThreshF1 从 rec_36 的 0.1421
+       退步至 0.0700。
+    b. 保留 COCO head 策略：构建 weights=None、num_classes=2 的模型（9 anchors/
+       location，torchvision 默认），然后以 strict=False 加载完整 COCO state_dict；
+       分类 head 因 91→2 类形状不匹配自动跳过（随机初始化），回归 head 和 FPN
+       完整加载。不再手动重建 head，不再传 anchor_generator。
+    c. RadImageNet backbone 覆盖（保留）：COCO weights 加载后，以 strict=False
+       用 RadImageNet ResNet50 权重覆盖 backbone.body，使特征提取器贴近放射影像
+       语义。conv1 仍做 3 通道均值适配（灰度图输入）。
+    d. Copy-paste 数据增强（CopyPasteWrapper 类，--copy-paste-prob 0.4）：
+       - 触发条件：仅对负样本（无标注框）以 paste_prob 概率触发。
+       - Donor 采样：从正样本（有框）中随机抽取，对每个 bbox 扩展 30% 后裁出
+         包含病灶的 crop。
+       - Tissue 约束：在均值图（mean_img > 0.05）的乳腺组织区域内随机选取
+         粘贴位置；最多尝试 5 次，要求粘贴窗口内 70% 以上像素为组织。
+       - LCC mask（去除黑色背景）：对 crop 做 Otsu 阈值 + 3×3 dilate +
+         connectedComponents，取最大前景区域，消除矩形 crop 内的黑色残留。
+       - Feathering（alpha 渐变）：对 LCC mask 做 distanceTransform，
+         alpha_map = clip(dist / 5, 0, 1)，使病灶边缘平滑融合。
+       - 亮度对齐（P95 基准）：取 crop 和目标区域内病灶像素各自的第 95 百分位
+         亮度，按比值缩放 crop（clamp 0.5~2.0），使粘贴病灶亮度匹配背景组织。
+         使用 P95 而非均值，避免黑色像素将均值拉低导致亮度估计偏差。
+       - 中心压暗（高斯 gamma map）：对亮度对齐后的 crop 施加中心 gamma=0.75、
+         边缘 gamma→1.0 的高斯 gamma 映射，模拟病灶中心密度较高的自然外观。
+       - Feathered blend：crop_adj * alpha_t + background * (1 - alpha_t)。
+       - 每张负样本最多粘贴 max_pastes（默认 2）个病灶，粘贴结果同时写入 targets。
+       - 重叠检测：每次粘贴前检查候选框与已粘贴框的 IoU，若 > 0.3 则跳过
+         本次粘贴，避免像素覆盖和重复监督信号。
+    e. 新增 CLI 参数：
+       - --copy-paste-prob（默认 0.0）：copy-paste 触发概率。
+       - --copy-paste-max-pastes（默认 2）：每张负样本最多粘贴数量。
 
 """
 
@@ -753,6 +790,219 @@ class TrainAugmentWrapper(torch.utils.data.Dataset):
         return img, target
 
 
+class CopyPasteWrapper(torch.utils.data.Dataset):
+    """Copy-paste augmentation: paste lesion crops from positive samples onto negative images.
+
+    With probability ``paste_prob``, a negative sample is selected and one
+    randomly-chosen positive sample's lesion crop is pasted onto it.  All other
+    samples are returned unchanged.  The wrapper is applied *after*
+    TrainAugmentWrapper so the pasted crops have already been flipped/rotated.
+
+    Args:
+        dataset: The underlying dataset (may already be wrapped by TrainAugmentWrapper).
+        positive_indices: Indices in *dataset* that correspond to positive images.
+            These are sampled when choosing a crop donor.
+        paste_prob: Probability that a negative sample is chosen as the paste target.
+        max_pastes: Maximum number of crops to paste per target image (chosen uniformly
+            from [1, max_pastes]).
+    """
+
+    def __init__(
+        self,
+        dataset: torch.utils.data.Dataset,
+        positive_indices: List[int],
+        paste_prob: float = 0.4,
+        max_pastes: int = 2,
+    ) -> None:
+        self.dataset = dataset
+        self.positive_indices = list(positive_indices)
+        self.paste_prob = float(paste_prob)
+        self.max_pastes = int(max_pastes)
+        if not self.positive_indices:
+            print("[Warning] CopyPasteWrapper: no positive indices supplied; augmentation disabled.")
+
+    def __len__(self) -> int:
+        return len(self.dataset)  # type: ignore[arg-type]
+
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        img, target = self.dataset[index]
+
+        # Only augment negative images (no GT boxes) and only with paste_prob probability.
+        if (
+            not self.positive_indices
+            or target["boxes"].shape[0] > 0
+            or random.random() > self.paste_prob
+        ):
+            return img, target
+
+        # img: [C, H, W] float32 tensor
+        _, H, W = img.shape
+        img = img.clone()
+        new_boxes: List[torch.Tensor] = []
+
+        # Compute tissue bounding box on the target image.
+        # Pixels with mean value > 0.05 across channels are considered tissue.
+        # Paste positions are restricted to this bounding box to avoid placing
+        # lesion crops onto black background regions (would teach wrong prior).
+        mean_img = img.mean(dim=0)  # [H, W]
+        tissue_mask = mean_img > 0.05
+        tissue_rows = tissue_mask.any(dim=1).nonzero(as_tuple=False)
+        tissue_cols = tissue_mask.any(dim=0).nonzero(as_tuple=False)
+        if tissue_rows.numel() == 0 or tissue_cols.numel() == 0:
+            # Fully black image; fall back to full image bounds.
+            t_y1, t_x1, t_y2, t_x2 = 0, 0, H, W
+        else:
+            t_y1 = int(tissue_rows[0].item())
+            t_y2 = int(tissue_rows[-1].item()) + 1
+            t_x1 = int(tissue_cols[0].item())
+            t_x2 = int(tissue_cols[-1].item()) + 1
+
+        n_paste = random.randint(1, self.max_pastes)
+        for _ in range(n_paste):
+            donor_idx = random.choice(self.positive_indices)
+            donor_img, donor_target = self.dataset[donor_idx]
+            if donor_target["boxes"].shape[0] == 0:
+                continue
+            # Pick one random box from the donor.
+            bi = random.randrange(donor_target["boxes"].shape[0])
+            x1, y1, x2, y2 = donor_target["boxes"][bi].tolist()
+            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            x2 = max(x2, x1 + 1)
+            y2 = max(y2, y1 + 1)
+            # Clamp crop to donor image bounds.
+            _, dH, dW = donor_img.shape
+            x1c, y1c = max(x1, 0), max(y1, 0)
+            x2c, y2c = min(x2, dW), min(y2, dH)
+            if x2c <= x1c or y2c <= y1c:
+                continue
+            crop = donor_img[:, y1c:y2c, x1c:x2c]  # [C, ch, cw]
+            cH, cW = crop.shape[1], crop.shape[2]
+
+            # Build a lesion mask for the crop via largest-connected-component.
+            # This removes the rectangular frame of black/near-black pixels
+            # surrounding the actual tissue, so only genuine lesion pixels are
+            # pasted (no hard rectangular boundary visible in the result).
+            crop_gray = (crop.mean(dim=0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            _, thresh = cv2.threshold(crop_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            # Light morphological dilation to avoid over-eroding lesion edges.
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            thresh = cv2.dilate(thresh, kernel, iterations=1)
+            n_labels, labels_map = cv2.connectedComponents(thresh, connectivity=8)
+            if n_labels > 1:
+                # Label 0 is background; find the largest foreground label.
+                label_sizes = np.bincount(labels_map.ravel())
+                label_sizes[0] = 0  # exclude background
+                largest_label = int(label_sizes.argmax())
+                lesion_mask = (labels_map == largest_label).astype(np.uint8)  # HxW uint8
+            else:
+                # Fallback: use all non-zero pixels.
+                lesion_mask = (thresh > 0).astype(np.uint8)
+            if lesion_mask.sum() == 0:
+                continue
+
+            # Feathered alpha: distance transform gives each mask pixel its
+            # distance to the nearest edge, clamped to [0, feather_width].
+            # This creates a smooth gradient at the lesion boundary so there
+            # is no hard cut and no residual black fringe.
+            _feather_w = 5  # pixels; wider = softer edge
+            dist_map = cv2.distanceTransform(lesion_mask, cv2.DIST_L2, 3)
+            alpha_map = np.clip(dist_map / float(_feather_w), 0.0, 1.0).astype(np.float32)  # [cH,cW]
+            alpha_t = torch.from_numpy(alpha_map).unsqueeze(0)  # [1, cH, cW]
+
+            # Paste within the tissue bounding box only.
+            avail_w = (t_x2 - t_x1) - cW
+            avail_h = (t_y2 - t_y1) - cH
+            if avail_w < 0 or avail_h < 0:
+                # Tissue region smaller than crop; skip.
+                continue
+            # Try up to 5 random positions; accept only if ≥70% of the paste
+            # region contains tissue (mean pixel > 0.05), preventing lesion
+            # crops from being placed on black background areas outside the
+            # breast contour (the tissue bbox is a rectangle, not the actual shape).
+            placed = False
+            for _attempt in range(5):
+                px = t_x1 + random.randint(0, avail_w)
+                py = t_y1 + random.randint(0, avail_h)
+                region_mean = mean_img[py:py + cH, px:px + cW]
+                tissue_ratio = float((region_mean > 0.05).float().mean().item())
+                if tissue_ratio >= 0.70:
+                    placed = True
+                    break
+            if not placed:
+                continue
+
+            # Step A: Brightness alignment — scale crop P95 to match target region P95
+            # (mask-weighted pixels only).  Using the 95th-percentile focuses on the
+            # brightest tissue pixels and avoids pulling the estimate down via background.
+            target_region = img[:, py:py + cH, px:px + cW]  # [C, cH, cW]
+            _lesion_px_crop   = crop[:, lesion_mask.astype(bool)].reshape(-1)   # 1-D
+            _lesion_px_target = target_region[:, lesion_mask.astype(bool)].reshape(-1)
+            crop_p95   = float(torch.quantile(_lesion_px_crop,   0.95)) if _lesion_px_crop.numel() > 0 else 1e-6
+            target_p95 = float(torch.quantile(_lesion_px_target, 0.95)) if _lesion_px_target.numel() > 0 else 1e-6
+            brightness_scale = float(np.clip(target_p95 / max(crop_p95, 1e-6), 0.5, 2.0))
+            crop_adj = (crop * brightness_scale).clamp(0.0, 1.0)
+
+            # Step B: Center darkening — gaussian-shaped gamma map applied to the
+            # brightness-adjusted crop. Center gamma < 1 (darken), edge gamma → 1.
+            # Gaussian sigma covers ~half the crop so the effect fades to edges.
+            # gamma_center = 0.75 means the brightest center pixel becomes pixel^0.75.
+            _gamma_center = 0.75
+            cy, cx = cH / 2.0, cW / 2.0
+            sigma = max(cy, cx) * 0.5
+            ys = torch.arange(cH, dtype=torch.float32)
+            xs = torch.arange(cW, dtype=torch.float32)
+            dist2 = ((ys.unsqueeze(1) - cy) ** 2 + (xs.unsqueeze(0) - cx) ** 2)
+            gaussian = torch.exp(-dist2 / (2 * sigma ** 2))  # [cH, cW], max=1 at center
+            # gamma_map: center → _gamma_center, edges → 1.0
+            gamma_map = 1.0 - gaussian * (1.0 - _gamma_center)  # [cH, cW]
+            gamma_map = gamma_map.unsqueeze(0)  # [1, cH, cW]
+            # Apply gamma: pixel^gamma_map (only on alpha-weighted region to avoid edge artefacts)
+            crop_adj = torch.pow(crop_adj.clamp(1e-6, 1.0), gamma_map)
+
+            # Step C: Feathered paste: result = crop_adj * alpha + background * (1 - alpha)
+            # Guard against overlap: check IoU of candidate box with already-pasted boxes.
+            # If IoU > 0.3 with any existing box, skip this paste to avoid pixel corruption
+            # and duplicate/overlapping supervision signals.
+            candidate_box = torch.tensor(
+                [float(px), float(py), float(px + cW), float(py + cH)]
+            )
+            overlap = False
+            for prev_box in new_boxes:
+                ix1 = max(candidate_box[0], prev_box[0])
+                iy1 = max(candidate_box[1], prev_box[1])
+                ix2 = min(candidate_box[2], prev_box[2])
+                iy2 = min(candidate_box[3], prev_box[3])
+                inter = max(0.0, float(ix2 - ix1)) * max(0.0, float(iy2 - iy1))
+                if inter > 0:
+                    area_a = float((candidate_box[2] - candidate_box[0]) * (candidate_box[3] - candidate_box[1]))
+                    area_b = float((prev_box[2] - prev_box[0]) * (prev_box[3] - prev_box[1]))
+                    iou = inter / max(area_a + area_b - inter, 1e-6)
+                    if iou > 0.3:
+                        overlap = True
+                        break
+            if overlap:
+                continue
+
+            blended = crop_adj * alpha_t + target_region * (1.0 - alpha_t)
+            img[:, py:py + cH, px:px + cW] = blended
+            new_boxes.append(candidate_box)
+
+        if new_boxes:
+            new_boxes_t = torch.stack(new_boxes, dim=0)  # [N, 4]
+            new_labels = torch.ones((new_boxes_t.shape[0],), dtype=torch.int64)
+            new_area = (new_boxes_t[:, 2] - new_boxes_t[:, 0]) * (new_boxes_t[:, 3] - new_boxes_t[:, 1])
+            new_crowd = torch.zeros((new_boxes_t.shape[0],), dtype=torch.int64)
+            target = {
+                "boxes": new_boxes_t,
+                "labels": new_labels,
+                "image_id": target["image_id"],
+                "area": new_area,
+                "iscrowd": new_crowd,
+            }
+
+        return img, target
+
+
 def summarize_subset(samples: List[Sample], indices: List[int]) -> Dict[str, Any]:
     """Summarize a dataset subset without changing its distribution."""
     if not indices:
@@ -1199,25 +1449,32 @@ def build_model(
             "torchvision RetinaNet v2 not found. Please upgrade torchvision (>=0.14)."
         )
 
+    # When anchor_sizes is None, we let torchvision use its default AnchorGenerator
+    # (3 scales × 3 aspect ratios = 9 anchors/location).  This is required for the
+    # COCO-pretrained head to load cleanly (its output channels match 9 anchors).
+    # Only build a custom AnchorGenerator when the caller explicitly passes sizes.
     if anchor_sizes is None:
-        anchor_sizes = ((16,), (32,), (64,), (128,), (256,))
+        anchor_generator = None  # will be left as-is after factory construction
+    else:
+        aspect_ratios = tuple([(0.5, 1.0, 2.0) for _ in range(len(anchor_sizes))])
+        anchor_generator = AnchorGenerator(sizes=anchor_sizes, aspect_ratios=aspect_ratios)
 
-    aspect_ratios = tuple([(0.5, 1.0, 2.0) for _ in range(len(anchor_sizes))])
-    anchor_generator = AnchorGenerator(sizes=anchor_sizes, aspect_ratios=aspect_ratios)
-
-    # Step 1: Grab pretrained backbone weights before constructing the custom-head model.
-    backbone_state_dict = None
+    # Step 1: Load full COCO-pretrained RetinaNet (backbone + FPN + head).
+    # We keep COCO head weights intact so the detection prior is preserved.
+    # num_classes=91 is the COCO default; we will NOT rebuild the head here.
+    # The anchor_sizes argument is ignored at this step — we patch it below.
+    coco_state_dict = None
     if RetinaNet_ResNet50_FPN_V2_Weights is not None:
         try:
             _pretrained = retinanet_resnet50_fpn_v2(
                 weights=RetinaNet_ResNet50_FPN_V2_Weights.DEFAULT
             )
-            backbone_state_dict = _pretrained.backbone.state_dict()
+            coco_state_dict = _pretrained.state_dict()
             del _pretrained
         except Exception as exc:
-            print(f"[Warning] Could not load RetinaNet pretrained weights: {exc}")
+            print(f"[Warning] Could not load RetinaNet COCO weights: {exc}")
 
-    # Step 2: Build model with 2 classes and no COCO weights.
+    # Step 2: Build model with 2 classes and no weights.
     # Note: do NOT pass anchor_generator to retinanet_resnet50_fpn_v2() —
     # current torchvision passes it positionally inside the factory function,
     # so passing it again as a kwarg raises "got multiple values" TypeError.
@@ -1243,40 +1500,38 @@ def build_model(
             model.bg_iou_thresh = bg_iou_thresh
         except AttributeError:
             print("[Warning] Could not patch score_thresh/detections_per_img on old torchvision model.")
-    # Replace anchor generator (safe on all torchvision versions).
-    model.anchor_generator = anchor_generator
+    # Replace anchor generator only when caller explicitly passed custom sizes.
+    # When anchor_generator is None, the torchvision default (9 anchors/location) is kept,
+    # which allows the COCO-pretrained head to load with matching dimensions.
+    if anchor_generator is not None:
+        model.anchor_generator = anchor_generator
     print(
         f"[Info] Model params: score_thresh={model.score_thresh}, "
         f"nms_thresh={model.nms_thresh}, "
         f"detections_per_img={model.detections_per_img}"
     )
 
-    # Rebuild detection head to match our anchor count.
-    # The v2 factory builds heads for 9 anchors/location (3 scales × 3 aspects);
-    # our generator uses 1 scale × 3 aspects = 3 anchors/location.
-    # Mismatched dimensions cause an IndexError in classification_head.compute_loss.
-    try:
-        from torchvision.models.detection.retinanet import RetinaNetHead
-        from functools import partial
-        _num_anchors = anchor_generator.num_anchors_per_location()[0]
-        _in_channels = model.backbone.out_channels
-        try:
-            model.head = RetinaNetHead(
-                _in_channels, _num_anchors, num_classes,
-                norm_layer=partial(torch.nn.GroupNorm, 32),
-            )
-        except TypeError:
-            # Older torchvision RetinaNetHead may not accept norm_layer.
-            model.head = RetinaNetHead(_in_channels, _num_anchors, num_classes)
+    # Load COCO weights into the 2-class model with strict=False.
+    # backbone + FPN + head regression branch will load cleanly.
+    # head classification branch (91-class → 2-class) will be skipped due to shape mismatch
+    # — that is intentional: classification head is randomly initialised for num_classes=2,
+    #   while regression head retains COCO anchor regression priors.
+    if coco_state_dict is not None:
+        missing, unexpected = model.load_state_dict(coco_state_dict, strict=False)
+        cls_skipped = [k for k in missing if "classification" in k]
+        other_missing = [k for k in missing if "classification" not in k]
         print(
-            f"[Info] Rebuilt RetinaNet head: "
-            f"in_channels={_in_channels}, num_anchors={_num_anchors}, num_classes={num_classes}"
+            f"[Info] Loaded COCO weights (strict=False): "
+            f"{len(cls_skipped)} cls-head keys skipped (shape mismatch, expected), "
+            f"{len(other_missing)} other missing, {len(unexpected)} unexpected"
         )
-    except Exception as exc:
-        print(f"[Warning] Could not rebuild RetinaNet head ({exc}); head may have wrong anchor count.")
+    else:
+        print("[Warning] No COCO weights loaded; model starts from random initialisation.")
 
 
-    # Priority: medical_backbone_path > COCO pretrained (backbone_state_dict).
+    # Step 3: Overwrite backbone.body with RadImageNet weights (if provided).
+    # COCO FPN + head weights loaded in Step 2 are NOT touched here.
+    # Only backbone.body (ResNet50 stem + layers) is overwritten.
     if medical_backbone_path is not None:
         try:
             ckpt = torch.load(medical_backbone_path, map_location="cpu")
@@ -1309,13 +1564,7 @@ def build_model(
             if unexpected:
                 print(f"[Info]   Unexpected keys ({len(unexpected)}): {unexpected[:3]}")
         except Exception as exc:
-            print(f"[Warning] Could not load medical backbone ({exc}). Falling back to COCO weights.")
-            if backbone_state_dict is not None:
-                model.backbone.load_state_dict(backbone_state_dict)
-                print("[Info] Loaded RetinaNet_ResNet50_FPN_V2 pretrained backbone weights.")
-    elif backbone_state_dict is not None:
-        model.backbone.load_state_dict(backbone_state_dict)
-        print("[Info] Loaded RetinaNet_ResNet50_FPN_V2 pretrained backbone weights.")
+            print(f"[Warning] Could not load medical backbone ({exc}). COCO backbone is retained.")
 
     # Step 3.5: Adapt conv1 for grayscale-as-3channel input.
     # Mammogram images are grayscale loaded as 3 identical channels (R=G=B). ImageNet's
@@ -1573,6 +1822,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    # Copy-paste augmentation
+    parser.add_argument("--copy-paste-prob", type=float, default=0.0, help="Probability of applying copy-paste augmentation to a negative training image (0 = disabled, recommended 0.3-0.5)")
+    parser.add_argument("--copy-paste-max-pastes", type=int, default=2, help="Max lesion crops to paste per negative image when copy-paste is enabled")
+
     # Full-training positive sample weight (prevents post-warmup collapse)
     parser.add_argument(
         "--full-train-pos-weight-ratio",
@@ -1694,13 +1947,42 @@ def main() -> None:
     else:
         train_subset = _base_train_subset
 
+    # Optionally wrap with copy-paste augmentation.
+    copy_paste_prob = float(args.copy_paste_prob)
+    if copy_paste_prob > 0.0:
+        # Find positive indices within train_subset (indices relative to train_subset).
+        # train_indices[i] is the index into train_dataset; we need indices into train_subset.
+        _pos_in_subset = [
+            i for i, idx in enumerate(train_indices)
+            if train_dataset.samples[idx].boxes.size > 0
+        ]
+        train_subset = CopyPasteWrapper(
+            train_subset,
+            positive_indices=_pos_in_subset,
+            paste_prob=copy_paste_prob,
+            max_pastes=int(args.copy_paste_max_pastes),
+        )
+        print(
+            f"[Info] Copy-paste augmentation enabled | "
+            f"paste_prob={copy_paste_prob} | max_pastes={args.copy_paste_max_pastes} | "
+            f"donor_pool={len(_pos_in_subset)} positive images"
+        )
+
     if len(train_subset) == 0:
         raise ValueError("Training split is empty after patient-level split and filtering.")
     if len(val_subset) == 0:
         raise ValueError("Validation split is empty. Please check the CSV and splitting logic.")
 
-    # Parse anchor sizes from args
-    anchor_sizes = tuple((int(s.strip()),) for s in str(args.anchor_sizes).split(",") if s.strip())
+    # Parse anchor sizes from args.
+    # When the user does not pass --anchor-sizes (default "16,32,64,128,256" keeps legacy CLI),
+    # we detect that case and pass None to build_model so the COCO-default 9-anchor generator
+    # is retained and the COCO head weights load without shape mismatch.
+    _raw_anchor_arg = str(args.anchor_sizes).strip()
+    _default_anchor_str = "16,32,64,128,256"
+    if _raw_anchor_arg == _default_anchor_str:
+        anchor_sizes = None   # use torchvision default (9 anchors/location)
+    else:
+        anchor_sizes = tuple((int(s.strip()),) for s in _raw_anchor_arg.split(",") if s.strip())
 
     model = build_model(
         num_classes=2,
