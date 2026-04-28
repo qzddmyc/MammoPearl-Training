@@ -16,7 +16,7 @@ python src/data/bounding-box/bbox-train.py \
     --post-warmup-lr 0.001 \
     --warmup-balanced-epochs 5 \
     --warmup-pos-weight-ratio 3.0 \
-    --full-train-pos-weight-ratio 0.0 \
+    --full-train-pos-weight-ratio 3.0 \
     --freeze-epochs 0 \
     --augment \
     --aug-hflip-prob 0.5 \
@@ -30,6 +30,7 @@ python src/data/bounding-box/bbox-train.py \
     --box-score-thresh 0.001 \
     --box-detections-per-img 20 \
     --input-min-size 1200 \
+    --classification-loss-scale 2.0 \
     --recall-stop \
     --patience 15 \
     --medical-backbone-path models/raw/ResNet50.pt \
@@ -328,6 +329,24 @@ Prompts for improvement:
        代替 BestThreshF1 作为早停和最佳 checkpoint 的判断指标，与召回率优先目标对齐。
     h. 日志新增 [Recall] 行：每 epoch 打印 GT_boxes 总数、Recall@0.1/0.3/0.5 及绝对
        TP/GT 数字，方便追踪召回率改善趋势；早停日志同步显示当前监控指标名称。
+-----------
+40. 针对 rec_39 全量阶段 Recall@0.1 停滞在 0.03–0.15 的问题，进行两项修复（rec_40）：
+    根因：全量训练阶段（epoch 6+）正负比 1:10.49，--full-train-pos-weight-ratio=0.0
+    导致 effective batch（8 张）中平均仅 0.76 张正样本图，每轮梯度更新中来自病灶的
+    分类信号极度稀疏；同时 classification loss 和 bbox_regression loss 等权叠加，
+    bbox_regression loss（~0.030）在全量阶段几乎不变，classification loss 的有效
+    波动被稀释。
+    a. 恢复全量阶段正样本过采样：将 --full-train-pos-weight-ratio 从 0.0 改为 3.0。
+       WeightedRandomSampler 使正样本被采到的概率是负样本的 3 倍，effective batch
+       中正样本图从平均 0.76 张提升至约 2.3 张（正负比 ~1:2.5），梯度更新频次提升
+       约 3 倍。注：rec_35 曾出现 pos_weight=2.0 导致 FP 爆炸，但彼时用的是
+       focal_alpha=0.5（正负类等权），现在 focal_alpha=0.8（病灶权重是背景的 4 倍）
+       可以提供足够的 FP 抑制梯度，两者协同不会再出现 FP 爆炸问题。
+    b. 新增 --classification-loss-scale 参数（默认 1.0，rec_40 使用 2.0）：
+       在 train_one_epoch 中将 loss_dict["classification"] 乘以该系数后再求和。
+       RetinaNet 只有 classification 和 bbox_regression 两个 loss，bbox_regression
+       在全量阶段已趋于稳定（~0.030），乘以 2.0 使分类信号占总 loss 的比例从
+       ~64% 提升至 ~78%，强化模型区分病灶与背景的训练压力。
 
 """
 
@@ -1699,6 +1718,7 @@ def train_one_epoch(
     accumulation_steps: int,
     warmup_scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
     disable_tqdm: bool = False,
+    classification_loss_scale: float = 1.0,
 ) -> Tuple[float, int, Dict[str, float]]:
     """Train one epoch with gradient accumulation and optional iter-level LinearLR warmup.
 
@@ -1729,8 +1749,11 @@ def train_one_epoch(
             optimizer.zero_grad(set_to_none=True)
             continue
 
-        # Weighted loss: upscale loss_objectness to strengthen RPN background suppression.
-        # Other sub-losses keep their default weight of 1.0.
+        # Apply classification loss scale to strengthen lesion vs background discrimination.
+        # bbox_regression loss keeps weight 1.0.
+        if classification_loss_scale != 1.0 and "classification" in loss_dict:
+            loss_dict = dict(loss_dict)
+            loss_dict["classification"] = loss_dict["classification"] * classification_loss_scale
         loss = sum(loss for loss in loss_dict.values())
 
         # accumulate named sub-losses for reporting
@@ -1862,6 +1885,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recall-stop", action="store_true", help="Use Recall@0.1 (TP@0.1 / GT boxes) instead of BestThreshF1 as the early-stopping metric. Recommended for recall-first training.")
     parser.add_argument("--box-detections-per-img", type=int, default=100, help="Max detections per image at inference time")
     parser.add_argument("--box-nms-thresh", type=float, default=0.5, help="NMS IoU threshold for post-prediction duplicate suppression; lower (e.g. 0.3) removes more overlapping FP boxes")
+    parser.add_argument("--classification-loss-scale", type=float, default=1.0, help="Multiply the RetinaNet classification loss by this factor before summing with bbox_regression loss. Values > 1.0 (e.g. 2.0) strengthen the signal for distinguishing lesions from background, counteracting extreme class imbalance.")
     parser.add_argument("--disable-breast-crop", action="store_true", help="Disable breast-region cropping and train on the full processed image")
     parser.add_argument("--breast-crop-margin", type=float, default=0.05, help="Relative padding added around the detected breast crop")
     parser.add_argument("--hide-progress-bar", action="store_true", help="Suppress tqdm progress bars during training and validation")
@@ -2108,6 +2132,9 @@ def main() -> None:
                 is_pos = train_dataset.samples[train_indices[j]].boxes.size > 0
                 _warmup_weights.append(_pos_weight if is_pos else 1.0)
             print(f"[Info] Balanced warmup: {warmup_balanced_epochs} epochs, pos_weight_ratio={_pos_weight}, train_size={len(train_indices)}")
+        _cls_loss_scale = float(args.classification_loss_scale)
+        if _cls_loss_scale != 1.0:
+            print(f"[Info] classification_loss_scale={_cls_loss_scale} (classification loss will be multiplied by this factor)")
         else:
             warmup_balanced_epochs = 0
             print("[Warning] No positive training samples; disabling balanced warmup")
@@ -2265,6 +2292,7 @@ def main() -> None:
             accumulation_steps,
             warmup_scheduler,
             disable_tqdm=args.hide_progress_bar,
+            classification_loss_scale=float(args.classification_loss_scale),
         )
 
         # Unfreeze backbone after configured freeze epochs
