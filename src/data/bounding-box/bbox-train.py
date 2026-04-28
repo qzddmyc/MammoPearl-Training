@@ -15,20 +15,21 @@ python src/data/bounding-box/bbox-train.py \
     --lr 0.005 \
     --post-warmup-lr 0.001 \
     --warmup-balanced-epochs 5 \
-    --warmup-pos-weight-ratio 3.0 \
-    --full-train-pos-weight-ratio 3.0 \
+    --warmup-pos-weight-ratio 10.0 \
+    --full-train-pos-weight-ratio 10.0 \
     --freeze-epochs 0 \
     --augment \
     --aug-hflip-prob 0.5 \
     --aug-brightness-delta 0.2 \
     --aug-rotation-max-deg 8.0 \
-    --focal-alpha 0.8 \
+    --focal-alpha 0.5 \
     --focal-gamma 2.0 \
     --box-fg-iou-thresh 0.4 \
     --box-bg-iou-thresh 0.3 \
     --box-nms-thresh 0.5 \
     --box-score-thresh 0.001 \
     --box-detections-per-img 20 \
+    --val-detections-per-img 300 \
     --input-min-size 1200 \
     --classification-loss-scale 2.0 \
     --recall-stop \
@@ -347,6 +348,29 @@ Prompts for improvement:
        RetinaNet 只有 classification 和 bbox_regression 两个 loss，bbox_regression
        在全量阶段已趋于稳定（~0.030），乘以 2.0 使分类信号占总 loss 的比例从
        ~64% 提升至 ~78%，强化模型区分病灶与背景的训练压力。
+-----------
+41. 算法层面修复：验证评估无截断 + 参数重平衡（rec_41）：
+    根因分析（rec_40 失败，更深层退化解）：
+    (1) focal_alpha=0.8 使背景惩罚权重仅 0.2，模型找到最优策略：对每张图输出满额
+        20 个框（消灭 FN cost=0.8），FP 代价（cost=0.2）可忽略。FP@0.1≈43,540，
+        几乎每张图输出满 20 个框（score≥0.1），验证为退化解。
+    (2) validate_one_epoch 中 model(images) 输出受 detections_per_img=20 硬截断，
+        TP@0.1 指标的真实上限被人为压低——即便模型能产生更多正确框，也无法反映在
+        Recall@0.1 上，导致早停和 checkpoint 选择均基于失真的指标。
+    (3) WeightedRandomSampler pos_weight=3.0 在 13596 个 sampled 样本的竞争中被
+        摊薄，有效正样本期望仅约 2.3 张/batch，远未达到 3 倍过采效果。
+    a. 新增 --val-detections-per-img 参数（默认 300）：在 validate_one_epoch 中，
+       进入验证前临时将 model.detections_per_img 设为该值（默认 300），验证结束后
+       恢复训练推理值。这使 TP@0.1 的计算从"20 框里有几个对的"变成"300 框里有
+       几个对的"，TP@0.1 指标不再被推理截断，真实反映模型召回能力，早停和最佳
+       checkpoint 选择基于准确指标。
+    b. focal_alpha 0.8 → 0.5：背景惩罚权重从 0.2 提升至 0.5，迫使模型真正区分
+       病灶与背景，而不是选择"全部输出高分"的退化策略。正负类梯度重新接近平衡
+       （1:1），FP 的 loss 代价显著提升，退化解不再是全局最优。
+    c. pos-weight-ratio 3.0 → 10.0（warmup 和全量阶段均调整）：在 13596 个训练
+       样本中，权重 10.0 使正样本期望提升至约 4.1 张/batch
+       （10×1183 / (10×1183+12413) × 8 ≈ 4.1），更充分地保证每个梯度更新步
+       包含足够的病灶监督信号。
 
 """
 
@@ -1360,9 +1384,18 @@ def validate_one_epoch(
     epoch: int,
     epochs: int,
     disable_tqdm: bool = False,
+    val_detections_per_img: Optional[int] = None,
 ) -> Dict[str, float]:
     """Validate one epoch without gradient computation."""
     model.eval()
+    # Optionally override detections_per_img so evaluation is not truncated at the
+    # training inference cap (e.g. 20 boxes/image).  When val_detections_per_img is set
+    # (e.g. 300), the model can return up to that many boxes per image, allowing TP@0.1
+    # to be measured without the hard ceiling that distorts recall statistics and
+    # early-stopping.  When None, no override is applied (backward-compatible).
+    _orig_det_per_img = getattr(model, "detections_per_img", None)
+    if val_detections_per_img is not None and _orig_det_per_img is not None and _orig_det_per_img != val_detections_per_img:
+        model.detections_per_img = val_detections_per_img
 
     total_tp = 0
     total_fp = 0
@@ -1468,6 +1501,9 @@ def validate_one_epoch(
         result[f"tp@{t}"] = float(multi_stats[t]["tp"])
         result[f"fp@{t}"] = float(multi_stats[t]["fp"])
         result[f"fn@{t}"] = float(multi_stats[t]["fn"])
+    # Restore original detections_per_img so training inference is unaffected.
+    if val_detections_per_img is not None and _orig_det_per_img is not None and _orig_det_per_img != val_detections_per_img:
+        model.detections_per_img = _orig_det_per_img
     return result
 
 
@@ -1884,6 +1920,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-min-size", type=int, default=800, help="Shorter side of the image after RetinaNet resize transform (default 800). Raise to 1200 to make small lesions larger relative to anchors.")
     parser.add_argument("--recall-stop", action="store_true", help="Use Recall@0.1 (TP@0.1 / GT boxes) instead of BestThreshF1 as the early-stopping metric. Recommended for recall-first training.")
     parser.add_argument("--box-detections-per-img", type=int, default=100, help="Max detections per image at inference time")
+    parser.add_argument("--val-detections-per-img", type=int, default=None, help="Max detections per image during validation (temporarily overrides --box-detections-per-img). When set (e.g. 300), prevents TP@threshold statistics from being truncated at the training inference cap, giving an accurate recall estimate for early-stopping and checkpoint selection. When omitted (default), uses the same value as --box-detections-per-img (backward-compatible).")
     parser.add_argument("--box-nms-thresh", type=float, default=0.5, help="NMS IoU threshold for post-prediction duplicate suppression; lower (e.g. 0.3) removes more overlapping FP boxes")
     parser.add_argument("--classification-loss-scale", type=float, default=1.0, help="Multiply the RetinaNet classification loss by this factor before summing with bbox_regression loss. Values > 1.0 (e.g. 2.0) strengthen the signal for distinguishing lesions from background, counteracting extreme class imbalance.")
     parser.add_argument("--disable-breast-crop", action="store_true", help="Disable breast-region cropping and train on the full processed image")
@@ -2319,6 +2356,7 @@ def main() -> None:
             epoch=epoch,
             epochs=int(args.epochs),
             disable_tqdm=args.hide_progress_bar,
+            val_detections_per_img=args.val_detections_per_img,  # None means no override (use model's current value)
         )
 
         # Only step the epoch-level scheduler if we actually performed any optimizer.step()

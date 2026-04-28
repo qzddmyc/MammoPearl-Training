@@ -24,3 +24,26 @@
 8. Do not ask plain-text follow-up questions in the response body; use the `ask_user` tool instead.
 
 Recommended stop phrases to respect include: "结束", "停止", "不用继续", "先这样", "done", "stop", and similar clear endings.
+
+## Script argument backward compatibility
+
+When adding a new command-line argument to an existing Python script in this repository, its default value must preserve the script's existing behavior. A new optional argument must default to `None` (or the equivalent no-op value) so that existing invocations that omit the argument behave exactly as before the argument was introduced. Do not choose a default that silently changes behavior for callers who do not pass the argument.
+
+## Git commit rules
+
+**Never run `git commit`, `git push`, or any other destructive or publishing git command unless the user explicitly instructs you to do so.**
+
+Before proposing a commit, always present the full commit message to the user for confirmation.
+
+Commit messages must follow the **Angular commit convention**:
+
+```
+<type>(<scope>): <short summary in English, imperative mood, ≤72 chars>
+
+[optional body: explain *what* and *why*, not *how*; wrap at 72 chars;
+ use "- " bullet points for multiple items]
+```
+
+Allowed types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`, `style`, `ci`.
+
+The scope should identify the component or record being changed.

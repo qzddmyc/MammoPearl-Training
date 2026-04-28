@@ -1,7 +1,7 @@
 # use:
-# python src/data/bounding-box/bbox-test.py --ckpt-path models/bbox_resnet50.pth
+# python src/data/bounding-box/bbox-test.py --ckpt-path models/bbox_resnet50.pth --recall-sweep-detections-per-img 300
 # or:
-# python src/data/bounding-box/bbox-test.py --ckpt-path models/bbox_resnet50.pth --save-predictions tmp/bbox_test_matches.csv
+# python src/data/bounding-box/bbox-test.py --ckpt-path models/bbox_resnet50.pth --recall-sweep-detections-per-img 300 --save-predictions tmp/bbox_test_matches.csv
 
 # * anchor sizes, internal box filtering, and matching thresholds will be auto-read from checkpoint meta when available.
 
@@ -509,6 +509,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anchor-sizes", type=str, default=None, help="Comma-separated anchor sizes; auto-read from checkpoint meta if omitted")
     parser.add_argument("--box-score-thresh", type=float, default=None, help="Score threshold for model-internal box filtering; auto-read from checkpoint meta if omitted")
     parser.add_argument("--box-detections-per-img", type=int, default=None, help="Max detections per image at inference time; auto-read from checkpoint meta if omitted")
+    parser.add_argument("--recall-sweep-detections-per-img", type=int, default=None, help="Temporarily override model.detections_per_img for the recall sweep (score_threshold=0.1/0.3/0.5). Use a larger value (e.g. 300) to prevent TP statistics from being truncated at the training inference cap. When omitted, uses the same value as --box-detections-per-img (backward-compatible).")
     parser.add_argument("--force-breast-crop", action="store_true", help="Force breast-region cropping even if checkpoint meta does not request it")
     parser.add_argument("--disable-breast-crop", action="store_true", help="Disable breast-region cropping even if checkpoint meta requests it")
     parser.add_argument("--breast-crop-margin", type=float, default=None, help="Override breast crop padding ratio; defaults to checkpoint meta when available")
@@ -622,10 +623,17 @@ def main() -> None:
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
     # Recall sweep: evaluate at score_threshold = 0.1 / 0.3 / 0.5
-    # This is aligned with the [Recall] log line in bbox-train.py
+    # This is aligned with the [Recall] log line in bbox-train.py.
+    # Optionally override detections_per_img so TP@0.1 is not truncated at the
+    # training inference cap (same principle as --val-detections-per-img in bbox-train.py).
     gt_total = metrics["gt_boxes"]
     recall_thresholds = [0.1, 0.3, 0.5]
     recall_parts = []
+    _recall_det = args.recall_sweep_detections_per_img
+    _orig_det = getattr(model, "detections_per_img", None)
+    if _recall_det is not None and _orig_det is not None and _orig_det != _recall_det:
+        model.detections_per_img = _recall_det
+        print(f"[Info] recall sweep: detections_per_img temporarily overridden {_orig_det} → {_recall_det}")
     for st in recall_thresholds:
         m, _ = evaluate(
             model=model,
@@ -638,6 +646,8 @@ def main() -> None:
         fp = m["fp"]
         rec = tp / gt_total if gt_total else 0.0
         recall_parts.append(f"Recall@{st}={rec:.3f}({tp}/{gt_total}) FP={fp}")
+    if _recall_det is not None and _orig_det is not None and _orig_det != _recall_det:
+        model.detections_per_img = _orig_det
     print(f"[Recall] GT_boxes={gt_total} | iou_thresh={iou_threshold} | " + " | ".join(recall_parts))
 
     if meta:
