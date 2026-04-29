@@ -2197,12 +2197,12 @@ def main() -> None:
                 is_pos = train_dataset.samples[train_indices[j]].boxes.size > 0
                 _warmup_weights.append(_pos_weight if is_pos else 1.0)
             print(f"[Info] Balanced warmup: {warmup_balanced_epochs} epochs, pos_weight_ratio={_pos_weight}, train_size={len(train_indices)}")
-        _cls_loss_scale = float(args.classification_loss_scale)
-        if _cls_loss_scale != 1.0:
-            print(f"[Info] classification_loss_scale={_cls_loss_scale} (classification loss will be multiplied by this factor)")
         else:
             warmup_balanced_epochs = 0
             print("[Warning] No positive training samples; disabling balanced warmup")
+        _cls_loss_scale = float(args.classification_loss_scale)
+        if _cls_loss_scale != 1.0:
+            print(f"[Info] classification_loss_scale={_cls_loss_scale} (classification loss will be multiplied by this factor)")
     # Legacy positive-only warmup subset (kept for backward compat but not recommended)
     warmup_train_subset = None
     if warmup_pos_epochs > 0 and warmup_balanced_epochs == 0 and not args.positive_only:
