@@ -33,6 +33,7 @@ python src/data/bounding-box/bbox-train-B.py \
     --recall-stop \
     --patience 15 \
     --medical-backbone-path models/raw/ResNet50.pt \
+    --amp \
     --hide-progress-bar
 
 本文件介绍：
@@ -1096,12 +1097,15 @@ def validate_one_epoch(
 
     pbar = tqdm(loader, desc=f"val {epoch + 1}/{epochs}", leave=False, disable=disable_tqdm)
 
+    amp_enabled = device.type == "cuda"
+
     with torch.no_grad():
         for images, targets in pbar:
             images = [img.to(device) for img in images]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-            outputs = model(images)
+            with torch.cuda.amp.autocast(enabled=amp_enabled):
+                outputs = model(images)
 
             for output, target in zip(outputs, targets):
                 total_images += 1
@@ -1377,6 +1381,7 @@ def train_one_epoch(
     warmup_scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
     disable_tqdm: bool = False,
     classification_loss_scale: float = 1.0,
+    scaler: Optional[torch.cuda.amp.GradScaler] = None,
 ) -> Tuple[float, int, Dict[str, float]]:
     """Train one epoch with gradient accumulation and optional iter-level LinearLR warmup.
 
@@ -1396,11 +1401,15 @@ def train_one_epoch(
     optimizer.zero_grad(set_to_none=True)
     pbar = tqdm(loader, desc=f"epoch {epoch + 1}/{epochs}", leave=False, disable=disable_tqdm)
 
+    amp_enabled = scaler is not None and device.type == "cuda"
+
     for i, (images, targets) in enumerate(pbar):
         images = [img.to(device) for img in images]
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        loss_dict = model(images, targets)
+        with torch.cuda.amp.autocast(enabled=amp_enabled):
+            loss_dict = model(images, targets)
+
         bad_keys = [k for k, v in loss_dict.items() if not torch.isfinite(v)]
         if bad_keys:
             bad_keys_count += 1
@@ -1421,23 +1430,29 @@ def train_one_epoch(
                 try:
                     subloss_sums[k] += float(v.item())
                 except Exception:
-                    # fallback if value cannot be .item()'d
                     subloss_sums[k] += float(v)
 
         if not torch.isfinite(loss):
             optimizer.zero_grad(set_to_none=True)
             continue
 
-        # gradient accumulation (scale before backward)
-        scaled_loss = loss / float(accumulation_steps)
-        scaled_loss.backward()
+        # gradient accumulation
+        if amp_enabled:
+            scaler.scale(loss / float(accumulation_steps)).backward()
+        else:
+            (loss / float(accumulation_steps)).backward()
 
         if (i + 1) % accumulation_steps == 0 or (i + 1) == len(loader):
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            if amp_enabled:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
             optimizer_steps += 1
             optimizer.zero_grad(set_to_none=True)
-            # Only advance the warmup scheduler at the same time as optimizer.step()
             if warmup_scheduler is not None:
                 warmup_scheduler.step()
 
@@ -1559,6 +1574,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-breast-crop", action="store_true", help="Disable breast-region cropping and train on the full processed image")
     parser.add_argument("--breast-crop-margin", type=float, default=0.05, help="Relative padding added around the detected breast crop")
     parser.add_argument("--hide-progress-bar", action="store_true", help="Suppress tqdm progress bars during training and validation")
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help=(
+            "Enable automatic mixed precision (fp16) training via torch.cuda.amp. "
+            "Reduces GPU memory usage by ~40-50%%, allowing two variants to run "
+            "simultaneously on a single GPU. Recommended when VRAM < 24 GiB."
+        ),
+    )
 
     # Data augmentation
     parser.add_argument("--augment", action="store_true", help="Enable random data augmentation (hflip + brightness jitter + optional rotation) on the training set")
@@ -1742,6 +1766,14 @@ def main() -> None:
         input_min_size=int(args.input_min_size),
     )
     model.to(device)
+
+    # AMP GradScaler — only active when --amp is set and CUDA is available
+    scaler: Optional[torch.cuda.amp.GradScaler] = None
+    if args.amp and device.type == "cuda":
+        scaler = torch.cuda.amp.GradScaler()
+        print("[Info] AMP (fp16) enabled — GradScaler active.")
+    elif args.amp:
+        print("[Warning] --amp set but device is not CUDA; AMP disabled.")
 
     # Freeze low-level backbone layers initially if requested
     if int(args.freeze_epochs) > 0:
@@ -1953,6 +1985,7 @@ def main() -> None:
             warmup_scheduler,
             disable_tqdm=args.hide_progress_bar,
             classification_loss_scale=float(args.classification_loss_scale),
+            scaler=scaler,
         )
 
         # Unfreeze backbone after configured freeze epochs
