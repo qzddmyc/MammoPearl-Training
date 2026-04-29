@@ -1104,7 +1104,7 @@ def validate_one_epoch(
             images = [img.to(device) for img in images]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-            with torch.cuda.amp.autocast(enabled=amp_enabled):
+            with torch.amp.autocast("cuda", enabled=amp_enabled):
                 outputs = model(images)
 
             for output, target in zip(outputs, targets):
@@ -1381,7 +1381,7 @@ def train_one_epoch(
     warmup_scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
     disable_tqdm: bool = False,
     classification_loss_scale: float = 1.0,
-    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    scaler: Optional[torch.amp.GradScaler] = None,
 ) -> Tuple[float, int, Dict[str, float]]:
     """Train one epoch with gradient accumulation and optional iter-level LinearLR warmup.
 
@@ -1407,7 +1407,7 @@ def train_one_epoch(
         images = [img.to(device) for img in images]
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        with torch.cuda.amp.autocast(enabled=amp_enabled):
+        with torch.amp.autocast("cuda", enabled=amp_enabled):
             loss_dict = model(images, targets)
 
         bad_keys = [k for k, v in loss_dict.items() if not torch.isfinite(v)]
@@ -1768,9 +1768,9 @@ def main() -> None:
     model.to(device)
 
     # AMP GradScaler — only active when --amp is set and CUDA is available
-    scaler: Optional[torch.cuda.amp.GradScaler] = None
+    scaler: Optional[torch.amp.GradScaler] = None
     if args.amp and device.type == "cuda":
-        scaler = torch.cuda.amp.GradScaler()
+        scaler = torch.amp.GradScaler("cuda")
         print("[Info] AMP (fp16) enabled — GradScaler active.")
     elif args.amp:
         print("[Warning] --amp set but device is not CUDA; AMP disabled.")
