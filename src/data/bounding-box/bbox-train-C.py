@@ -1589,6 +1589,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=0.0005)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help=(
+            "Compute device, e.g. 'cuda', 'cuda:0', 'cuda:1', 'cpu'. "
+            "When omitted, 'cuda' is used if available, else 'cpu'. "
+            "Set explicitly to run multiple variants on different GPUs simultaneously."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--positive-only",
@@ -1740,7 +1750,10 @@ def main() -> None:
             f"Recommended: set --freeze-epochs=0 or --freeze-epochs>={_wbal}."
         )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device is not None:
+        device = torch.device(args.device)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Build the full training split first, then split it into train/validation
     # at the patient level so that the same patient never appears on both sides.
