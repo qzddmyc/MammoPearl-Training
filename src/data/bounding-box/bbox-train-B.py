@@ -1,14 +1,14 @@
-# 使用 retinanet_resnet50_fpn_v2 模型对数据集进行训练（rec_34 起从 Faster R-CNN 切换至 RetinaNet）
-
-# 使用这个模型去训练会耗费很长的时间，需要注意
-
-# If your computer is GREAT, you can use "--fuck-running" to run in a big batch-size (8).
+# 方案 B：FCOS（Feature Pyramid-based Object Detection without Anchors）
+# 基于 bbox-train.py（rec_41），将 RetinaNet 替换为 FCOS。
+# FCOS 是 anchor-free 检测器，每个特征图位置直接预测到四个方向的距离（l/r/t/b），
+# 内置 centerness 分支对偏离 GT 中心的预测施加惩罚，天然减少背景位置的高置信度输出。
+# 没有"67,500 个 anchor / 图"的设计，从根本上改善正负样本比例。
 
 r"""
 
 Use this to run in Git Bash:
 
-python src/data/bounding-box/bbox-train.py \
+python src/data/bounding-box/bbox-train-B.py \
     --epochs 50 \
     --batch-size 2 \
     --accumulation-steps 4 \
@@ -24,14 +24,12 @@ python src/data/bounding-box/bbox-train.py \
     --aug-rotation-max-deg 8.0 \
     --focal-alpha 0.5 \
     --focal-gamma 2.0 \
-    --box-fg-iou-thresh 0.4 \
-    --box-bg-iou-thresh 0.3 \
     --box-nms-thresh 0.5 \
     --box-score-thresh 0.001 \
     --box-detections-per-img 20 \
     --val-detections-per-img 300 \
     --input-min-size 1200 \
-    --classification-loss-scale 2.0 \
+    --classification-loss-scale 1.0 \
     --recall-stop \
     --patience 15 \
     --medical-backbone-path models/raw/ResNet50.pt \
@@ -39,366 +37,21 @@ python src/data/bounding-box/bbox-train.py \
 
 本文件介绍：
 
-Train a breast lesion bounding-box detector from VinDr-Mammo detection CSV.
+方案 B — FCOS 无锚点检测器（基于 rec_41 修改）
 
-This script reads `data/raw/vindr_detection_folds.csv`, matches each row to
-`data/processed/images_png/<patient_id>/<image_id>`, and trains a RetinaNet
-(retinanet_resnet50_fpn_v2) detector to predict lesion bounding boxes
-(xmin, ymin, xmax, ymax).
+核心改动（相对于 bbox-train.py）：
+  1. build_model() 替换为 build_model_fcos()：使用 fcos_resnet50_fpn 而非
+     retinanet_resnet50_fpn_v2。COCO 预训练权重通过 FCOS_ResNet50_FPN_Weights
+     加载；分类 head（91→2 类形状不匹配）自动跳过；backbone + FPN + 回归 head
+     完整加载。focal_loss_alpha/gamma 通过 model.head.classification_head 属性设置。
+  2. subloss_keys 更新：FCOS 有三个 sub-loss：
+     classification / bbox_regression / bbox_ctrness（中心度）。
+  3. 移除 --box-fg-iou-thresh / --box-bg-iou-thresh / --anchor-sizes 参数：
+     FCOS 使用 center-ness + stride-based 位置分配，不做 IoU 锚点匹配，这些参数
+     在 FCOS 中无意义。
+  4. 保留其余所有参数、训练逻辑、验证逻辑不变。
 
-Model checkpoint is saved to `models/bbox_resnet50.pth`.
-
-============================================================================================================
-
-每次改进使用的提示词，以单横线分隔。
-
-Prompts for improvement:
-
-1.  针对训练后期 Loss 卡在 0.19 左右无法下降的问题，需从学习率策略、
-    模型结构和优化器等方面进行系统性干预，打破局部最优解。
-2.  引入学习率 Warmup 机制，防止初始训练时因梯度过大破坏预训练权重，并提供合理的初始学习率设定。
-3.  增加权重衰减（Weight Decay）的配置参数，通过正则化手段有效防止模型在较小数据集上过拟合。
-4.  新增命令行参数 "--fuck-running" 作为算力切换开关：
-    当不含此参数时，代码需在 batch_size=2 的前提下通过累积 4 个 step 再执行 optimizer.step()
-    来变相实现 batch_size=8 的梯度累积；
-    当存在该参数时，直接使用配置的较大 batch_size 进行正常训练，
-    --同时两种模式下都必须保持每个 batch 内合理的正负样本混合比例。--(此行需要剔除，逻辑已删)
- *  fix: 在算得正样本时，需要按照比例上取整，以防止正样本丢失。
-5.  针对 912x1520 的高分辨率医疗影像数据，修改模型的 AnchorGenerator，为其添加 8 和 16 这
-    样更小的 scale 尺寸，以强化微小病灶的检测能力。6. 优化训练策略，除了在 DataLoader 端保持正
-    负样本比之外，还需通过调整模型内部的 ROI 采样比例等参数，变相实现 Hard Negative Mining（挖掘难例）。
-7.  实现渐冻层训练策略：在训练初期主动冻结 ResNet 的 layer1 和 layer2 层，仅训练 FPN 和检测头；
-    在设定的几轮 Epoch 之后，全量解冻这些底层网络进行全局微调。
-8.  强制采用 torchvision 中的 fasterrcnn_resnet50_fpn_v2 版本模型，以利用其更先进的
-    数据增强策略和优化过的 FPN 特征提取结构。
-  * feat: 需要使用 FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT 权重。 
------------
-9.  取消对每一个 epoch、batch 的样本强制比例分配，保留原始的正负样本比例。
-    即，对每个 epoch 使用全量样本（除了被分为验证集的）直接进行训练，
-    另外，每个 epoch 中，在样本内部通过 shuffle=True 来打乱，以防止模型的过拟合。
-10. 从 training 中自行划出约 15% 作为验证集；划分优先按 patient_id 进行，避免同一 patient 同时
-    出现在 train 和 val；划分后尽量保持原始正负分布；验证集完全不参与训练，不参与反向传播。不做任何
-    采样干预，保持真实分布。不使用 shuffle；使用验证集指标作为保存最佳模型的标准，优先推荐 F1；
-    每个 epoch 后，如果当前指标优于历史最佳，则保存 best checkpoint；若验证集指标连续 N 个 epoch 没
-    有提升，则停止训练，N 由参数控制。
-    [注意] 这个版本保存的模型是效果最佳的一轮模型，而不是最终一轮的训练成果。
------------
-11. 引入可切换的 ROI 分类损失策略（通过 --cls-loss-type 切换）：支持标准 CE、Weighted
-    Cross-Entropy 和 Focal Loss 三种模式。Weighted CE 为背景和病灶分别设定不同的类别权重，
-    用于调节正负样本对分类损失的贡献比例；Focal Loss 通过 gamma 参数自动降低简单样本的损失
-    贡献，迫使模型聚焦于困难样本的学习。
-12. 引入在线难例挖掘（OHEM）机制（通过 --ohem 开关启用）：先逐样本计算独立 loss，按困难度
-    降序排列后仅保留前 K 个最困难样本参与反向传播。K 取 --ohem-ratio 和 --ohem-min-samples
-    二者较大值。该策略可与任意损失函数组合使用。
-13. 将训练阶段 RPN 和 ROI Head 的 IoU 匹配阈值提取为命令行可配置参数
-    （--box-fg-iou-thresh / --box-bg-iou-thresh / --rpn-fg-iou-thresh / --rpn-bg-iou-thresh），
-    支持将 ROI 正样本 IoU 阈值从默认 0.5 上调至 0.6/0.7 以减少边界模糊导致的误检。
-14. 新增两阶段训练策略（positive-only warmup，通过 --warmup-positive-epochs 配置）：前 N 个
-    epoch 仅使用正样本图像训练，让模型先学习病灶特征；之后恢复全量样本训练。验证集保持真实分布。
------------
-15. 废弃 Positive-Only Warmup，改用 Balanced Sampling Warmup（通过 --warmup-balanced-epochs
-    和 --warmup-pos-weight-ratio 配置）：前 N 个 epoch 使用 WeightedRandomSampler 对训练集进行
-    加权采样，使正样本被过采样至与负样本接近的数量，同时 RPN 仍能学到背景抑制。warmup 结束后重建
-    optimizer 和 lr_scheduler，切换回全量训练。
-16. 禁止 Focal Loss + OHEM 同时启用：两者功能高度重叠，同时使用会过度稀释梯度信号。新增启动时
-    互斥检查，当同时启用时自动禁用 OHEM 并打印警告。
-17. 修复 CosineAnnealingLR 的 T_max 与 warmup 阶段冲突：将 T_max 设为实际全量训练的 epoch 数
-    （total - warmup），并在 warmup 阶段跳过 epoch-level scheduler step，防止 LR 在 warmup
-    阶段被 cosine 过度拉低。warmup 结束后重建 optimizer 和 scheduler 以获得干净的 LR 曲线。
-18. 在 validate_one_epoch 中增加多阈值验证报告（threshold=0.1/0.3/0.5/0.7/0.9），输出各阈值
-    下的 TP/FP 统计，帮助更全面地理解模型行为，同时不影响 best checkpoint 的选择逻辑。
-19. 在 validate_one_epoch 中增加 RPN proposal 数量监控：记录模型输出的原始 box 数量（threshold
-    之前），当每图平均值超过 200 时输出警告，用于检测 RPN 是否有效抑制背景。
-20. 在 build_model 中暴露 box_score_thresh 和 box_detections_per_img 参数（对应命令行
-    --box-score-thresh 和 --box-detections-per-img），控制推理时的低分框过滤和每图最大检测数。
-21. 新增 --only-use 参数（float，默认 1.0）：在正式训练阶段每个 epoch 仅使用分配数据总量的指定
-    比例。正负样本按原始比例等比缩减，并对正样本设最低保护（不低于原始比例对应的数量）。通过跨
-    epoch 轮转采样机制，确保所有图像在多个 epoch 中均被训练到。
------------
-22. 修复误导性警告：将 scheduler 更新判断从二分支（warmup | else）扩展为四分支，明确区分
-    "warmup 阶段跳过"、"本 epoch 刚重建 optimizer（正常行为）"、"正常 step"、"真正 0 步（异
-    常）"四种情况，避免重建后误报 [Warning] No optimizer.step()。
-23. 新增 --post-warmup-lr 参数（float，默认 None 即沿用 --lr）：balanced warmup 结束后重建
-    optimizer 时使用该 LR 代替原始 --lr，允许以较低学习率进入正式训练阶段，减少 warmup 结束
-    后的梯度震荡。若未传该参数，行为与之前完全一致。
-24. 新增 freeze_epochs / warmup 冲突检测：若 0 < freeze_epochs < warmup_balanced_epochs，
-    则在启动时打印 [Warning]，提示用户该配置会在 warmup 内部触发 optimizer 重建，可能引发
-    FP 反弹，建议设为 0 或 >= warmup_balanced_epochs。
-25. 在每个 epoch 循环开始处打印分割线（"=" * 60 + "Epoch n/N start" + "=" * 60），便于在
-    长日志中快速定位各 epoch 的起止边界。
-26. 在 weighted_ce 模式下新增背景权重保护：若训练集负样本图像明显多于正样本图像，且
-    --cls-weight-bg < 1.0，则默认将背景权重钳制到 1.0 并打印告警；只有显式传入
-    --allow-low-bg-weight 时才允许保留更低的背景权重，以避免背景分类损失被过度削弱、导致
-    bbox 误检（FP）爆炸。
-27. 启动时打印 train/val 的 neg/pos image ratio，并对 --only-use < 1.0 做阳性样本量预警：
-    若估算每轮可见正样本图像过少，则提示该配置可能导致正式训练阶段学习不足与 FP 反弹。同步
-    更新推荐命令：默认不再推荐 --only-use 0.3，并将 --cls-weight-bg 推荐值调整为 1.0。
-28. 为了更符合“病灶区域的初步框选”目标，在训练和验证阶段默认启用乳房主体区域裁剪：
-    先在 processed 图像上检测乳房主体轮廓，再对图像进行裁剪，并将 bbox 同步重映射到裁剪后
-    的局部坐标系，减少大面积黑色背景和非乳房区域对 detector 的干扰。
-29. 将乳房主体裁剪的开关和边缘留白提取为参数（--disable-breast-crop / --breast-crop-margin），
-    并把裁剪配置写入 checkpoint meta，要求测试脚本优先读取同一配置，保持训练/测试口径一致。
------------
-30. 新增随机数据增强支持（通过 --augment 启用），仅作用于训练集：
-    - 随机水平翻转（--aug-hflip-prob，默认 0.5）；
-    - 随机亮度扰动（--aug-brightness-delta，默认 ±0.2）；
-    - 随机小角度旋转（--aug-rotation-max-deg，默认 0.0，推荐 5~10）：
-      只对单框图像执行（多框跳过以避免 pivot 歧义）；旋转轴为 bbox 中心；
-      bbox 以 center-preserve 方式更新（中心旋转，尺寸不变）；
-      旋转后调用 detect_breast_region 二次裁剪去除黑角。
-    用 TrainAugmentWrapper 包裹训练 Subset，不创建额外数据集实例。
-31. 修复 RPN 正样本 IoU 阈值：将 --rpn-fg-iou-thresh 默认值从 0.7 降低到 0.5。
-    背景：处理后图像中典型病灶（resize 后约 225×167px）与最优 anchor（256px）的最大 IoU 仅
-    约 0.57，低于原始默认值 0.7，导致病灶 anchor 落入"灰色区间"被忽略，RPN 无法有效学习
-    病灶位置。降低阈值后这些 anchor 将被标记为正样本，显著改善 RPN 召回。
-32. 新增全训练阶段持续加权采样（--full-train-pos-weight-ratio，默认 0.0 即禁用）：在
-    balanced warmup 结束进入全量训练后，若该参数 > 0，则继续使用 WeightedRandomSampler
-    对正样本保持轻微过采样（如 3.0 表示正样本被采到的概率是负样本的 3 倍），防止模型因
-    图像级 10:1 负正比而坍缩至"什么都不预测"的极端状态。
------------
-33. 针对"FP 极高、置信度普遍 > 0.9、F1 长期低于 0.02"的训练失效问题，进行系统性修复：
-    a. 参数调整：将 --warmup-balanced-epochs 从 8 缩短至 5、--warmup-pos-weight-ratio 从
-       10.0 降至 3.0（减少 warmup 过采压力）；将 --full-train-pos-weight-ratio 从 3.0 改
-       为 0.0（全量训练阶段不再强制过采样，让背景梯度充分抑制 FP）；将
-       --cls-weight-bg 从 1.0 提高至 2.5（直接加大 FP 的 loss 惩罚）；将
-       --cls-weight-lesion 提高至 2.0（加大 FN 惩罚）；将 --box-detections-per-img 从
-       100 降至 10（推理端限制每图最大输出框数）。
-    b. 新增 --box-nms-thresh 参数（默认 0.5，推荐 0.3）：暴露 Faster R-CNN 的 NMS IoU
-       阈值，降低后可更积极地去除空间相近的重复 FP 框，直接减少推理输出量。
-    c. 新增 --rpn-objectness-loss-scale 参数（默认 1.0，推荐 3.0）：在 train_one_epoch
-       中将 loss_objectness 乘以该系数后再计入总 loss，强化 RPN 拒绝背景区域的训练信号，
-       从 proposal 生成端压低进入 ROI head 的背景框数量。
-    d. 修复 checkpoint 选择逻辑：validate_one_epoch 额外追踪每个阈值（0.1/0.3/0.5/0.7/
-       0.9）的 FN，计算各阈值 F1，返回最优阈值及 best_thresh_f1；main() 改用
-       best_thresh_f1 代替固定阈值 F1 来判断是否保存最佳 checkpoint，避免因 score
-       threshold 选取不当而丢弃真正最优的 epoch。
------------
-34. 彻底切换检测框架：从 Faster R-CNN 迁移至 RetinaNet_ResNet50_FPN_V2，同时完成
-    医学影像灰度输入适配，从根本上解决两阶段 RPN 瓶颈与 Focal Loss 无法原生作用于
-    proposal 生成阶段的双重缺陷：
-    a. 架构替换：删除 fasterrcnn_resnet50_fpn_v2 / FastRCNNPredictor / roi_heads
-       monkey-patch 及相关 import；新增 retinanet_resnet50_fpn_v2 import。RetinaNet
-       是单阶段检测器，直接在 FPN 各尺度特征图上预测，彻底消除了 RPN "漏斗" 瓶颈
-       （Faster R-CNN 中约 70% GT box 从未进入 ROI Head 的根本原因）。
-    b. 删除自定义 loss 模块：移除 FocalLoss 类、_custom_fastrcnn_loss 函数、
-       apply_custom_roi_loss 函数（约 120 行），因为 RetinaNet 已原生集成
-       Focal Loss，无需 monkey-patch。
-    c. 重写 build_model()：加载 COCO 预训练 backbone 权重 →
-       构建 2 类 RetinaNet（num_classes=2）→ 通过
-       model.head.classification_head.focal_loss_alpha/gamma 直接设置 Focal Loss
-       参数，无需外部注入。新增参数 --focal-alpha（默认 0.75，面向 10:1 不平衡数据
-       比 RetinaNet 原始论文 0.25 更高，确保病灶梯度足够）。
-    d. 新增灰度 conv1 均值初始化（方向二轻量实现）：钼靶图像为灰度图，以 R=G=B
-       形式加载为 3 通道。ImageNet 预训练的 conv1 三个通道权重来自不同颜色语义，
-       对等值输入不适合。在 build_model() 中对 conv1 的 3 通道权重取均值后广播
-       覆盖，使三个通道初始化完全一致，减少训练初期的通道间梯度不平衡。
-    e. 简化 train_one_epoch()：移除 rpn_objectness_loss_scale 参数及相关加权逻辑；
-       subloss_keys 改为 RetinaNet 的 ("classification", "bbox_regression")。
-    f. 精简 parse_args()：删除 Faster R-CNN 专有参数（--roi-batch-size-per-image、
-       --roi-positive-fraction、--rpn-*、--cls-loss-type、--cls-weight-*、
-       --ohem、--allow-low-bg-weight、--rpn-objectness-loss-scale，共约 13 个）；
-       新增 --focal-alpha（默认 0.75）；保留 --focal-gamma（默认 2.0）；
-       --box-fg-iou-thresh 和 --box-bg-iou-thresh 现在直接映射到 RetinaNet 的
-       anchor 正负样本 IoU 阈值。
-    g. 更新推荐命令：简化至 24 行，去掉所有 RPN/ROI 参数，直接通过
-       --focal-alpha 0.75 --focal-gamma 2.0 控制 Focal Loss。
------------
-35. 修复两项影响 rec_34 收敛的根因缺陷，无架构改动：
-    a. 正样本权重恢复：将 --full-train-pos-weight-ratio 从 0.0 改为 2.0。
-       rec_34 中该参数意外为 0，导致暖机阶段结束后所有正样本权重变为 0，约 49%
-       的有效 batch（8 张图）完全由负样本组成，分类头在这些 batch 中梯度为 0，
-       模型在主训练阶段实际上无法从正样本中学习。
-    b. Anchor 尺寸上移：将 --anchor-sizes 从 16,32,64,128,256 改为
-       32,64,128,256,512。数据验证显示 VinDr-Mammo 病灶在模型内部分辨率
-       （800×1333px）下 p90 宽度为 419px，而原最大 anchor 仅 256px，导致大病灶
-       无有效 anchor 匹配；同时 16px/32px anchor 在数据集中覆盖不足 5% 的病灶，
-       属于无效噪声。新配置将 IoU≥0.4 覆盖率从 91.0% 提升至 97.1%。
-    ** 注：rec_35 实际结果证明，仅改这两项不够——pos_weight=2.0 消除了全负
-       batch 的 FP 抑制梯度，导致 BestThreshF1 从 0.1357 退步至 0.0981，
-       FP@0.5 从 100–450 暴涨至 550–1500。rec_35 在 epoch 14 提前终止。
------------
-36. 基于 rec_34/rec_35 对比数据，精准修复两项 Focal Loss 相关的超参设置：
-    a. 撤销 pos_weight 改动：将 --full-train-pos-weight-ratio 从 2.0 恢复为 0.0。
-       rec_35 vs rec_34 的直接对比（相同架构，仅 pos_weight 不同）显示，
-       FP@0.5 从 100–450 暴涨至 550–1500（3–4 倍增幅）。根因：pos_weight=0.0
-       时约 49% 的有效 batch 为全负样本，这些 batch 对 Focal Loss 提供了纯 FP
-       抑制梯度；pos_weight=2.0 消除了这些 batch，模型失去"不要乱预测"的信号。
-    b. 降低 focal_alpha：将 --focal-alpha 从 0.75 改为 0.5。torchvision RetinaNet
-       中 alpha 是正类（病灶）的损失权重，1-alpha 是负类（背景）的权重。
-       原始 RetinaNet 论文使用 alpha=0.25（背景权重 0.75）；我们此前设 0.75
-       导致背景权重仅 0.25，高置信 FP 的背景梯度贡献仅为正常的 1/4。将 alpha
-       降至 0.5 使背景权重翻倍（0.25→0.50），对所有高置信 FP 的惩罚强度提升
-       2 倍，同时保持正负类梯度平衡，不至于压垮病灶学习。
-    保留 anchor_sizes=32,64,128,256,512（覆盖率 97.1% 有效）。
-    预期：FP@0.1 降至 50–400 范围，best_thresh 提前稳定在 0.3，
-    BestThreshF1 突破 rec_34 的 0.1357 上限，目标 0.16–0.20。
------------
-37. 数据预处理 + 医学预训练 backbone 双重升级（rec_37）：
-    a. CLAHE 对比度增强（方向 A）：在 normalize_image() 的灰度图路径中，
-       将 CLAHE（clipLimit=2.0, tileGridSize=8×8）应用于转换为 RGB 前的
-       灰度图，增强钼靶图像的局部对比度，使病灶与周围腺体的灰度差异更清晰，
-       改善特征提取质量。CLAHE 作用于训练集和验证集全部图像（非仅增强）。
-    b. 医学预训练 backbone（方向 C）：在 build_model() 的 Step 3 中，
-       新增 medical_backbone_path 参数；若提供，则用 RadImageNet ResNet50
-       权重覆盖 COCO backbone，大幅缩短迁移链
-       （ImageNet/CXR → 多模态放射图像 → 乳腺钼靶），使特征空间更接近
-       乳腺影像语义。加载时自动剥离 module./encoder./backbone./body. 等
-       前缀，以 strict=False 方式匹配 model.backbone.body；若加载失败则
-       自动回退至 COCO 权重。
-    背景：rec_34/35/36 共 63 个 epoch 中，best_thresh 几乎始终锁在 0.1，
-    最大 recall 仅 26.6%，BestThreshF1 增幅仅 4.7%（0.1357→0.1421）。
-    超参数调整空间已接近耗尽，问题本质在于 COCO 预训练特征对乳腺病灶
-    的语义表达能力不足。
-    ── rec_37 三项 bug 修复（训练过程中发现）──
-    c. RadImageNet key 映射修复（commit e201432）：
-       RadImageNet ResNet50.pt 使用数字索引键（backbone.0.weight 等），
-       与 torchvision 的命名键（conv1.weight、layer1.*.weight 等）不匹配，
-       导致全部 318 个骨干参数被当作 unexpected 跳过，权重实际未加载。
-       修复：剥离 backbone. 前缀后，额外映射
-       0→conv1, 1→bn1, 4→layer1, 5→layer2, 6→layer3, 7→layer4。
-       验证：Missing=0, Unexpected=0。
-    d. anchor_generator 关键字参数冲突修复（commit 6c63ca0）：
-       当前 torchvision 已在工厂函数内部以位置参数传入 anchor_generator，
-       我们再以 kwarg 方式传入时触发 TypeError，except 块静默吞掉了
-       anchor_sizes、detections_per_img、fg/bg_iou_thresh 等全部参数，
-       回退至 torchvision 默认值（detections_per_img=300 等）。
-       rec_33–rec_36 及 rec_37 前两次均受此影响，所有自定义检测参数均未生效。
-       修复：不再向工厂函数传 anchor_generator，改为构建后赋值
-       model.anchor_generator = anchor_generator。
-    e. RetinaNet head 重建修复：
-       工厂函数按默认 9 anchors/location（3 scales×3 aspects）建造 head；
-       替换 anchor_generator 后实际产生 3 anchors/location，
-       head 输出通道数不匹配，在 classification_head.compute_loss 时触发
-       IndexError: shape [67200] != [201600, 2]。
-       修复：替换 anchor_generator 后立即用正确的 num_anchors 重建
-       model.head（RetinaNetHead + GroupNorm32）。
------------
-38. COCO head 保留 + RadImageNet backbone + copy-paste 数据增强（rec_38）：
-    a. 根因分析：rec_37 在 head 重建（e 项修复）时将 3 anchors/location 的新
-       head 完全随机初始化，同时丢失了 COCO 回归 head 中 8.8M 参数的预训练先验；
-       加之从未有过 COCO 类级别的分类先验，导致 BestThreshF1 从 rec_36 的 0.1421
-       退步至 0.0700。
-    b. 保留 COCO head 策略：构建 weights=None、num_classes=2 的模型（9 anchors/
-       location，torchvision 默认），然后以 strict=False 加载完整 COCO state_dict；
-       分类 head 因 91→2 类形状不匹配自动跳过（随机初始化），回归 head 和 FPN
-       完整加载。不再手动重建 head，不再传 anchor_generator。
-    c. RadImageNet backbone 覆盖（保留）：COCO weights 加载后，以 strict=False
-       用 RadImageNet ResNet50 权重覆盖 backbone.body，使特征提取器贴近放射影像
-       语义。conv1 仍做 3 通道均值适配（灰度图输入）。
-    d. Copy-paste 数据增强（CopyPasteWrapper 类，--copy-paste-prob 0.4）：
-       - 触发条件：仅对负样本（无标注框）以 paste_prob 概率触发。
-       - Donor 采样：从正样本（有框）中随机抽取，对每个 bbox 扩展 30% 后裁出
-         包含病灶的 crop。
-       - Tissue 约束：在均值图（mean_img > 0.05）的乳腺组织区域内随机选取
-         粘贴位置；最多尝试 5 次，要求粘贴窗口内 70% 以上像素为组织。
-       - LCC mask（去除黑色背景）：对 crop 做 Otsu 阈值 + 3×3 dilate +
-         connectedComponents，取最大前景区域，消除矩形 crop 内的黑色残留。
-       - Feathering（alpha 渐变）：对 LCC mask 做 distanceTransform，
-         alpha_map = clip(dist / 5, 0, 1)，使病灶边缘平滑融合。
-       - 亮度对齐（P95 基准）：取 crop 和目标区域内病灶像素各自的第 95 百分位
-         亮度，按比值缩放 crop（clamp 0.5~2.0），使粘贴病灶亮度匹配背景组织。
-         使用 P95 而非均值，避免黑色像素将均值拉低导致亮度估计偏差。
-       - 中心压暗（高斯 gamma map）：对亮度对齐后的 crop 施加中心 gamma=0.75、
-         边缘 gamma→1.0 的高斯 gamma 映射，模拟病灶中心密度较高的自然外观。
-       - Feathered blend：crop_adj * alpha_t + background * (1 - alpha_t)。
-       - 每张负样本最多粘贴 max_pastes（默认 2）个病灶，粘贴结果同时写入 targets。
-       - 重叠检测：每次粘贴前检查候选框与已粘贴框的 IoU，若 > 0.3 则跳过
-         本次粘贴，避免像素覆盖和重复监督信号。
-    e. 新增 CLI 参数：
-       - --copy-paste-prob（默认 0.0）：copy-paste 触发概率。
-       - --copy-paste-max-pastes（默认 2）：每张负样本最多粘贴数量。
------------
-39. 路线 3 改进 + 召回率优先策略（针对 rec_38 F1 停滞、并重新定位任务目标）：
-    背景：bbox 检测器的最终用途是为"是否患病"分类器提供病灶位置特征，
-    检测器本身不需要精确分类，只需要高召回率（不漏病灶），FP 增多可以接受。
-    a. 新增 --input-min-size 参数（默认 800，推荐 1200）：
-       控制 RetinaNet 内置 resize transform 的短边目标尺寸（model.transform.min_size）。
-       原始图像 912×1520，resize 后 P10 最小病灶仅 28px，低于最小 anchor（32px）。
-       提升至 1200 后，resize scale 从 0.877 变为 1.316，病灶 P10 增至约 42px，
-       覆盖 P3 anchor（32–50px），降低约 14% 的病灶因分辨率不足而被漏检的概率。
-    b. 将 --focal-alpha 从 0.5 提升至 0.8：正样本（病灶）loss 权重是负样本的 4 倍，
-       漏检（FN）的惩罚远大于误报（FP），驱动模型输出更高召回率。
-    c. 将 --box-nms-thresh 从 0.3 放宽至 0.5：减少同一病灶的重复框被 NMS 压制，
-       避免因 NMS 过激进而丢失真实病灶框。
-    d. 将 --box-score-thresh 从 0.05 降至 0.001，--box-detections-per-img 从 10 增至 20：
-       几乎输出所有候选框，召回率上限不再受推理端阈值约束；由后续分类器决定置信度。
-    e. 关闭 copy-paste（--copy-paste-prob 0.0）：rec_38 对比 rec_37 F1 下降
-       （0.052 < 0.070），copy-paste 合成样本与真实病灶分布差异导致验证集性能下降。
-    f. train/test 双侧同步：bbox-test.py build_model() 和 meta 读取均已更新，
-       从 checkpoint meta["input_min_size"] 恢复训练时的 resize 设置。
-    g. 新增 --recall-stop 标志（默认关闭）：开启后以 Recall@0.1（TP@0.1 / GT框总数）
-       代替 BestThreshF1 作为早停和最佳 checkpoint 的判断指标，与召回率优先目标对齐。
-    h. 日志新增 [Recall] 行：每 epoch 打印 GT_boxes 总数、Recall@0.1/0.3/0.5 及绝对
-       TP/GT 数字，方便追踪召回率改善趋势；早停日志同步显示当前监控指标名称。
------------
-40. 针对 rec_39 全量阶段 Recall@0.1 停滞在 0.03–0.15 的问题，进行两项修复（rec_40）：
-    根因：全量训练阶段（epoch 6+）正负比 1:10.49，--full-train-pos-weight-ratio=0.0
-    导致 effective batch（8 张）中平均仅 0.76 张正样本图，每轮梯度更新中来自病灶的
-    分类信号极度稀疏；同时 classification loss 和 bbox_regression loss 等权叠加，
-    bbox_regression loss（~0.030）在全量阶段几乎不变，classification loss 的有效
-    波动被稀释。
-    a. 恢复全量阶段正样本过采样：将 --full-train-pos-weight-ratio 从 0.0 改为 3.0。
-       WeightedRandomSampler 使正样本被采到的概率是负样本的 3 倍，effective batch
-       中正样本图从平均 0.76 张提升至约 2.3 张（正负比 ~1:2.5），梯度更新频次提升
-       约 3 倍。注：rec_35 曾出现 pos_weight=2.0 导致 FP 爆炸，但彼时用的是
-       focal_alpha=0.5（正负类等权），现在 focal_alpha=0.8（病灶权重是背景的 4 倍）
-       可以提供足够的 FP 抑制梯度，两者协同不会再出现 FP 爆炸问题。
-    b. 新增 --classification-loss-scale 参数（默认 1.0，rec_40 使用 2.0）：
-       在 train_one_epoch 中将 loss_dict["classification"] 乘以该系数后再求和。
-       RetinaNet 只有 classification 和 bbox_regression 两个 loss，bbox_regression
-       在全量阶段已趋于稳定（~0.030），乘以 2.0 使分类信号占总 loss 的比例从
-       ~64% 提升至 ~78%，强化模型区分病灶与背景的训练压力。
------------
-41. 算法层面修复：验证评估无截断 + 参数重平衡（rec_41）：
-    根因分析（rec_40 失败，更深层退化解）：
-    (1) focal_alpha=0.8 使背景惩罚权重仅 0.2，模型找到最优策略：对每张图输出满额
-        20 个框（消灭 FN cost=0.8），FP 代价（cost=0.2）可忽略。FP@0.1≈43,540，
-        几乎每张图输出满 20 个框（score≥0.1），验证为退化解。
-    (2) validate_one_epoch 中 model(images) 输出受 detections_per_img=20 硬截断，
-        TP@0.1 指标的真实上限被人为压低——即便模型能产生更多正确框，也无法反映在
-        Recall@0.1 上，导致早停和 checkpoint 选择均基于失真的指标。
-    (3) WeightedRandomSampler pos_weight=3.0 在 13596 个 sampled 样本的竞争中被
-        摊薄，有效正样本期望仅约 2.3 张/batch，远未达到 3 倍过采效果。
-    a. 新增 --val-detections-per-img 参数（默认 300）：在 validate_one_epoch 中，
-       进入验证前临时将 model.detections_per_img 设为该值（默认 300），验证结束后
-       恢复训练推理值。这使 TP@0.1 的计算从"20 框里有几个对的"变成"300 框里有
-       几个对的"，TP@0.1 指标不再被推理截断，真实反映模型召回能力，早停和最佳
-       checkpoint 选择基于准确指标。
-    b. focal_alpha 0.8 → 0.5：背景惩罚权重从 0.2 提升至 0.5，迫使模型真正区分
-       病灶与背景，而不是选择"全部输出高分"的退化策略。正负类梯度重新接近平衡
-       （1:1），FP 的 loss 代价显著提升，退化解不再是全局最优。
-    c. pos-weight-ratio 3.0 → 10.0（warmup 和全量阶段均调整）：在 13596 个训练
-       样本中，权重 10.0 使正样本期望提升至约 4.1 张/batch
-       （10×1183 / (10×1183+12413) × 8 ≈ 4.1），更充分地保证每个梯度更新步
-       包含足够的病灶监督信号。
-
------------
-42. 三方向算法改进（rec_42，分支文件 bbox-train-A/B/C.py，原文件不变）：
-
-    根因分析（rec_41 失败，val_precision≈0.0000 退化解）：
-    91% anchor score≥0.5（8 TP / 599,039 predictions），根本原因：67,500 背景
-    anchor / 图 vs 3-5 个病灶 anchor，梯度被背景淹没，模型退化为"全部高置信度"。
-
-    方案 A（bbox-train-A.py）— Anchor-level Hard Negative Mining（HNM）：
-        在原 RetinaNet 框架内 monkey-patch classification_head.compute_loss；
-        对每张图的背景 anchor 计算 per-anchor focal loss，只保留 top-K 最难负样本
-        K = max(n_fg × neg_pos_ratio, min_neg)，彻底解决梯度淹没问题。
-        新增参数：--hnm-neg-pos-ratio 10 --hnm-min-negatives 512
-        调参变化：--classification-loss-scale 1.0，--warmup-pos-weight-ratio 3.0，
-                  --full-train-pos-weight-ratio 3.0
-
-    方案 B（bbox-train-B.py）— FCOS（anchor-free）：
-        将模型从 RetinaNet 替换为 fcos_resnet50_fpn；anchor-free，无 anchor 比例失
-        衡问题；中心度分支（centerness）天然抑制非中心位置的高置信度预测。
-        sub-losses：classification / bbox_regression / bbox_ctrness
-        调参变化：去掉 --box-fg/bg-iou-thresh（FCOS 不使用 anchor matching）
-
-    方案 C（bbox-train-C.py）— U-Net 分割 → 伪框：
-        放弃检测框架，改用 ResNet50 + 4 级解码器（跳跃连接）输出全分辨率热图；
-        使用 BCEWithLogitsLoss（pos_weight=100），验证时通过 cv2.connectedComponents
-        将热图 blob 转换为伪框进行 recall 评估；不再依赖 anchor / NMS。
-        新增参数：--seg-pos-weight 100.0 --seg-val-threshold 0.5
-        去掉参数：所有 RetinaNet 专有参数（focal-*, anchor-sizes, box-*-thresh 等）
+预期效果：消除 RetinaNet anchor 不平衡根因，FCOS centerness 天然抑制非中心背景预测。
 
 """
 
@@ -432,12 +85,16 @@ from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler
 from torchvision.models.detection.rpn import AnchorGenerator
 import torch.nn.functional as F
 try:
-    from torchvision.models.detection import retinanet_resnet50_fpn_v2, RetinaNet_ResNet50_FPN_V2_Weights
-    from torchvision.models.detection.retinanet import RetinaNetClassificationHead
+    from torchvision.models.detection import fcos_resnet50_fpn
+    try:
+        from torchvision.models.detection import FCOS_ResNet50_FPN_Weights
+    except ImportError:
+        FCOS_ResNet50_FPN_Weights = None  # type: ignore
+    from torchvision.models.detection.retinanet import RetinaNetClassificationHead  # head class reused by FCOS
 except Exception:  # pragma: no cover
-    retinanet_resnet50_fpn_v2 = None  # type: ignore
-    RetinaNet_ResNet50_FPN_V2_Weights = None
-    RetinaNetClassificationHead = None
+    fcos_resnet50_fpn = None  # type: ignore
+    FCOS_ResNet50_FPN_Weights = None  # type: ignore
+    RetinaNetClassificationHead = None  # type: ignore
 
 try:
     from tqdm import tqdm
@@ -1537,9 +1194,6 @@ def validate_one_epoch(
 
 def build_model(
     num_classes: int = 2,
-    anchor_sizes: List[Tuple[int, ...]] | None = None,
-    fg_iou_thresh: float = 0.5,
-    bg_iou_thresh: float = 0.4,
     score_thresh: float = 0.05,
     detections_per_img: int = 100,
     nms_thresh: float = 0.5,
@@ -1548,144 +1202,88 @@ def build_model(
     medical_backbone_path: Optional[str] = None,
     input_min_size: int = 800,
 ) -> torch.nn.Module:
-    """Build RetinaNet (retinanet_resnet50_fpn_v2) with ResNet50-FPN backbone.
+    """Build FCOS (fcos_resnet50_fpn) with ResNet50-FPN backbone.
+
+    FCOS is an anchor-free, single-stage detector. Each feature map location
+    directly predicts distances to the four sides of the GT box (l/r/t/b)
+    plus a centerness score that down-weights predictions far from box centers.
+    There are no anchor IoU matching parameters.
 
     Steps:
-      1. Fetch full COCO-pretrained state_dict; strip cls_logits keys (shape
+      1. Load COCO-pretrained FCOS state_dict.  Strip cls_logits keys (shape
          mismatch: 91-class vs num_classes).
-      2. Build model with weights=None, num_classes=num_classes (default
-         9 anchors/location when anchor_sizes is None, so COCO head loads cleanly).
-      3. Load stripped COCO weights strict=False (backbone + FPN + regression head).
-      4. Optionally overwrite backbone.body with RadImageNet weights
-         (medical_backbone_path).
+      2. Build model with weights=None, num_classes=2.
+      3. Load stripped COCO weights strict=False (backbone + FPN + ctrness head).
+      4. Optionally overwrite backbone.body with RadImageNet weights.
       5. Average conv1 channel weights for grayscale-as-3channel input.
-
-    Args:
-        anchor_sizes: Per-FPN-level size tuples.  ``None`` keeps torchvision
-            default (3 scales x 3 aspects = 9 anchors/location), required for
-            COCO head weight compatibility.
-        fg_iou_thresh: Anchor IoU threshold to be assigned as positive.
-        bg_iou_thresh: Anchor IoU threshold to be assigned as negative.
-        score_thresh: Model-internal score threshold for post-NMS filtering.
-        detections_per_img: Max detections kept per image after NMS.
-        nms_thresh: IoU threshold for NMS.
-        focal_loss_alpha: Positive class weight in Focal Loss.
-        focal_loss_gamma: Focusing exponent in Focal Loss.
-        medical_backbone_path: Path to RadImageNet ResNet50 checkpoint; if
-            None, COCO backbone weights are kept.
-        input_min_size: Shorter side of the image after RetinaNet's built-in
-            resize transform.  Default 800 matches torchvision default.  Raise
-            to 1200 to keep small lesions larger relative to anchors.
+      6. Set focal_loss_alpha/gamma on the classification head.
     """
-    if retinanet_resnet50_fpn_v2 is None:
+    if fcos_resnet50_fpn is None:
         raise RuntimeError(
-            "torchvision RetinaNet v2 not found. Please upgrade torchvision (>=0.14)."
+            "torchvision FCOS not found. Please upgrade torchvision (>=0.14)."
         )
 
-    # When anchor_sizes is None, we let torchvision use its default AnchorGenerator
-    # (3 scales × 3 aspect ratios = 9 anchors/location).  This is required for the
-    # COCO-pretrained head to load cleanly (its output channels match 9 anchors).
-    # Only build a custom AnchorGenerator when the caller explicitly passes sizes.
-    if anchor_sizes is None:
-        anchor_generator = None  # will be left as-is after factory construction
-    else:
-        aspect_ratios = tuple([(0.5, 1.0, 2.0) for _ in range(len(anchor_sizes))])
-        anchor_generator = AnchorGenerator(sizes=anchor_sizes, aspect_ratios=aspect_ratios)
-
-    # Step 1: Load full COCO-pretrained RetinaNet (backbone + FPN + head).
-    # We keep COCO head weights intact so the detection prior is preserved.
-    # num_classes=91 is the COCO default; we will NOT rebuild the head here.
-    # The anchor_sizes argument is ignored at this step — we patch it below.
+    # Step 1: Load full COCO-pretrained FCOS (backbone + FPN + head).
     coco_state_dict = None
-    if RetinaNet_ResNet50_FPN_V2_Weights is not None:
+    if FCOS_ResNet50_FPN_Weights is not None:
         try:
-            _pretrained = retinanet_resnet50_fpn_v2(
-                weights=RetinaNet_ResNet50_FPN_V2_Weights.DEFAULT
-            )
+            _pretrained = fcos_resnet50_fpn(weights=FCOS_ResNet50_FPN_Weights.DEFAULT)
             coco_state_dict = _pretrained.state_dict()
             del _pretrained
         except Exception as exc:
-            print(f"[Warning] Could not load RetinaNet COCO weights: {exc}")
+            print(f"[Warning] Could not load FCOS COCO weights: {exc}")
 
-    # Step 2: Build model with 2 classes and no weights.
-    # Note: do NOT pass anchor_generator to retinanet_resnet50_fpn_v2() —
-    # current torchvision passes it positionally inside the factory function,
-    # so passing it again as a kwarg raises "got multiple values" TypeError.
-    # We replace model.anchor_generator after construction instead.
+    # Step 2: Build 2-class FCOS model.
     try:
-        model = retinanet_resnet50_fpn_v2(
+        model = fcos_resnet50_fpn(
             weights=None,
             num_classes=num_classes,
             score_thresh=score_thresh,
             nms_thresh=nms_thresh,
             detections_per_img=detections_per_img,
-            fg_iou_thresh=fg_iou_thresh,
-            bg_iou_thresh=bg_iou_thresh,
         )
     except TypeError:
-        # Very old torchvision: retry with minimal args, then patch below.
-        model = retinanet_resnet50_fpn_v2(weights=None, num_classes=num_classes)
+        model = fcos_resnet50_fpn(weights=None, num_classes=num_classes)
         try:
             model.score_thresh = score_thresh
             model.nms_thresh = nms_thresh
             model.detections_per_img = detections_per_img
-            model.fg_iou_thresh = fg_iou_thresh
-            model.bg_iou_thresh = bg_iou_thresh
         except AttributeError:
-            print("[Warning] Could not patch score_thresh/detections_per_img on old torchvision model.")
-    # Replace anchor generator only when caller explicitly passed custom sizes.
-    # When anchor_generator is None, the torchvision default (9 anchors/location) is kept,
-    # which allows the COCO-pretrained head to load with matching dimensions.
-    if anchor_generator is not None:
-        model.anchor_generator = anchor_generator
-    # Override the built-in resize transform min_size so that small lesions
-    # stay larger after rescaling and better match the smallest anchors.
+            print("[Warning] Could not patch score_thresh/detections_per_img on old torchvision FCOS.")
+
+    # Override resize transform min_size.
     if input_min_size != 800:
         model.transform.min_size = (input_min_size,)
         model.transform.max_size = int(input_min_size * 1333 / 800)
     print(
-        f"[Info] Model params: score_thresh={model.score_thresh}, "
+        f"[Info] FCOS params: score_thresh={model.score_thresh}, "
         f"nms_thresh={model.nms_thresh}, "
         f"detections_per_img={model.detections_per_img}, "
         f"input_min_size={model.transform.min_size[0]}"
     )
 
-    # Load COCO weights into the 2-class model with strict=False.
-    # backbone + FPN + head regression branch will load cleanly.
-    # head classification branch (91-class → 2-class) has a shape mismatch:
-    # strict=False cannot skip shape mismatches (only missing/unexpected keys).
-    # So we manually remove cls_logits keys from coco_state_dict first,
-    # then load the rest — classification head stays randomly initialised.
+    # Step 3: Load COCO weights, skip cls_logits (91→2 class shape mismatch).
     if coco_state_dict is not None:
         cls_logits_keys = [k for k in coco_state_dict if "cls_logits" in k]
         for k in cls_logits_keys:
             del coco_state_dict[k]
         missing, unexpected = model.load_state_dict(coco_state_dict, strict=False)
         print(
-            f"[Info] Loaded COCO weights (strict=False): "
-            f"{len(cls_logits_keys)} cls_logits keys removed (shape mismatch, expected), "
+            f"[Info] Loaded COCO FCOS weights (strict=False): "
+            f"{len(cls_logits_keys)} cls_logits keys removed, "
             f"{len(missing)} missing, {len(unexpected)} unexpected"
         )
     else:
-        print("[Warning] No COCO weights loaded; model starts from random initialisation.")
+        print("[Warning] No COCO weights loaded; FCOS starts from random initialisation.")
 
-
-    # Step 3: Overwrite backbone.body with RadImageNet weights (if provided).
-    # COCO FPN + head weights loaded in Step 2 are NOT touched here.
-    # Only backbone.body (ResNet50 stem + layers) is overwritten.
+    # Step 4: Overwrite backbone.body with RadImageNet weights (if provided).
     if medical_backbone_path is not None:
         try:
             ckpt = torch.load(medical_backbone_path, map_location="cpu")
-            # Accept checkpoint files that store weights under common keys
             if isinstance(ckpt, dict):
                 raw_sd = ckpt.get("state_dict", ckpt.get("model", ckpt))
             else:
                 raw_sd = ckpt
-            # Strip common prefixes: module., encoder., backbone., body.
-            # Then remap RadImageNet-style numeric Sequential indices to
-            # torchvision ResNet named layers:
-            #   0 -> conv1,  1 -> bn1,  4 -> layer1,  5 -> layer2,
-            #   6 -> layer3, 7 -> layer4
             _idx_to_resnet = {
                 "0": "conv1", "1": "bn1",
                 "4": "layer1", "5": "layer2",
@@ -1707,27 +1305,23 @@ def build_model(
         except Exception as exc:
             print(f"[Warning] Could not load medical backbone ({exc}). COCO backbone is retained.")
 
-    # Step 3.5: Adapt conv1 for grayscale-as-3channel input.
-    # Mammogram images are grayscale loaded as 3 identical channels (R=G=B). ImageNet's
-    # conv1 has 3 distinct channel weights optimized for RGB. Averaging them ensures all
-    # three input channels start with the same feature detector, which is the correct
-    # inductive bias for our single-modality input.
+    # Step 5: Adapt conv1 for grayscale-as-3channel input.
     try:
         conv1 = model.backbone.body.conv1
         with torch.no_grad():
-            mean_w = conv1.weight.mean(dim=1, keepdim=True)  # [64, 1, 7, 7]
+            mean_w = conv1.weight.mean(dim=1, keepdim=True)
             conv1.weight.copy_(mean_w.expand_as(conv1.weight))
         print("[Info] conv1 weights averaged across channels for grayscale-as-3channel input.")
     except AttributeError:
         print("[Warning] Could not adapt conv1 (unexpected backbone structure).")
 
-    # Step 4: Set Focal Loss parameters on the classification head.
+    # Step 6: Set Focal Loss parameters on the FCOS classification head.
     try:
         model.head.classification_head.focal_loss_alpha = focal_loss_alpha
         model.head.classification_head.focal_loss_gamma = focal_loss_gamma
-        print(f"[Info] RetinaNet Focal Loss: alpha={focal_loss_alpha}, gamma={focal_loss_gamma}")
+        print(f"[Info] FCOS Focal Loss: alpha={focal_loss_alpha}, gamma={focal_loss_gamma}")
     except AttributeError:
-        print("[Warning] Could not set focal_loss_alpha/gamma on classification head; using defaults.")
+        print("[Warning] Could not set focal_loss_alpha/gamma on FCOS head; using defaults.")
 
     return model
 
@@ -1795,8 +1389,8 @@ def train_one_epoch(
     count = 0
     optimizer_steps = 0
     bad_keys_count = 0
-    # track RetinaNet sub-losses
-    subloss_keys = ("classification", "bbox_regression")
+    # track FCOS sub-losses
+    subloss_keys = ("classification", "bbox_regression", "bbox_ctrness")
     subloss_sums: Dict[str, float] = defaultdict(float)
 
     optimizer.zero_grad(set_to_none=True)
@@ -1917,16 +1511,17 @@ def parse_args() -> argparse.Namespace:
     # Freeze / unfreeze backbone
     parser.add_argument("--freeze-epochs", type=int, default=0, help="Number of epochs to freeze backbone layer1/2 before unfreezing (0 = no freeze)")
 
-    # Anchor tuning
-    parser.add_argument("--anchor-sizes", type=str, default="16,32,64,128,256", help="Comma-separated anchor sizes (one per FPN level)")
+    # Anchor tuning — NOTE: FCOS does not use anchor IoU matching; these params are ignored.
+    parser.add_argument("--anchor-sizes", type=str, default="16,32,64,128,256", help="[UNUSED in FCOS] Kept for CLI compatibility; FCOS uses stride-based assignment, not IoU anchors.")
 
     # LR scheduling
     parser.add_argument("--lr-gamma", type=float, default=0.1)
     parser.add_argument("--lr-step-size", type=int, default=0, help="StepLR step size; 0 to use CosineAnnealingLR")
 
-    # IoU thresholds for anchor assignment (RetinaNet matcher)
-    parser.add_argument("--box-fg-iou-thresh", type=float, default=0.5, help="Foreground IoU threshold for anchor-to-GT matching")
-    parser.add_argument("--box-bg-iou-thresh", type=float, default=0.4, help="Background IoU threshold; anchors below this are negatives")
+    # IoU thresholds — NOTE: FCOS uses center-ness + stride assignment, not IoU-based anchor matching.
+    # These parameters are kept for CLI compatibility but are NOT passed to FCOS build_model().
+    parser.add_argument("--box-fg-iou-thresh", type=float, default=0.5, help="[UNUSED in FCOS] Foreground IoU threshold; kept for CLI compatibility only.")
+    parser.add_argument("--box-bg-iou-thresh", type=float, default=0.4, help="[UNUSED in FCOS] Background IoU threshold; kept for CLI compatibility only.")
 
     # Focal Loss parameters (built in to RetinaNet)
     parser.add_argument("--focal-gamma", type=float, default=2.0, help="Focal loss gamma (higher = more focus on hard examples)")
@@ -2122,22 +1717,9 @@ def main() -> None:
     if len(val_subset) == 0:
         raise ValueError("Validation split is empty. Please check the CSV and splitting logic.")
 
-    # Parse anchor sizes from args.
-    # When the user does not pass --anchor-sizes (default "16,32,64,128,256" keeps legacy CLI),
-    # we detect that case and pass None to build_model so the COCO-default 9-anchor generator
-    # is retained and the COCO head weights load without shape mismatch.
-    _raw_anchor_arg = str(args.anchor_sizes).strip()
-    _default_anchor_str = "16,32,64,128,256"
-    if _raw_anchor_arg == _default_anchor_str:
-        anchor_sizes = None   # use torchvision default (9 anchors/location)
-    else:
-        anchor_sizes = tuple((int(s.strip()),) for s in _raw_anchor_arg.split(",") if s.strip())
-
+    # FCOS does not use anchor sizes or IoU-based fg/bg matching; those args are ignored here.
     model = build_model(
         num_classes=2,
-        anchor_sizes=anchor_sizes,
-        fg_iou_thresh=float(args.box_fg_iou_thresh),
-        bg_iou_thresh=float(args.box_bg_iou_thresh),
         score_thresh=float(args.box_score_thresh),
         detections_per_img=int(args.box_detections_per_img),
         nms_thresh=float(args.box_nms_thresh),
@@ -2406,6 +1988,7 @@ def main() -> None:
             "lr": float(optimizer.param_groups[0]["lr"]),
             "classification": float(avg_sublosses.get("classification", 0.0)),
             "bbox_regression": float(avg_sublosses.get("bbox_regression", 0.0)),
+            "bbox_ctrness": float(avg_sublosses.get("bbox_ctrness", 0.0)),
             "val_precision": float(val_metrics["precision"]),
             "val_recall": float(val_metrics["recall"]),
             "val_f1": float(val_metrics["f1"]),
@@ -2494,7 +2077,8 @@ def main() -> None:
         print(
             (
                 f"  Train sub-losses: classification={record.get('classification', 0.0):.6f}, "
-                f"bbox_regression={record.get('bbox_regression', 0.0):.6f}"
+                f"bbox_regression={record.get('bbox_regression', 0.0):.6f}, "
+                f"bbox_ctrness={record.get('bbox_ctrness', 0.0):.6f}"
             )
         )
         # Recall-at-threshold summary: shows how many GT lesions are found at each threshold.
