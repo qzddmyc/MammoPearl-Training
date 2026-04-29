@@ -1484,7 +1484,7 @@ def parse_args() -> argparse.Namespace:
         "--save-path",
         type=Path,
         default=None,
-        help="Best checkpoint path (default: models/bbox_resnet50.pth)",
+        help="Best checkpoint path (default: models/bbox_fcos_resnet50.B.pth)",
     )
     parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=2)
@@ -1606,7 +1606,7 @@ def main() -> None:
     root = repo_root_from_file()
     csv_path = args.csv_path or (root / "data" / "raw" / "vindr_detection_folds.csv")
     images_root = args.images_root or (root / "data" / "processed" / "images_png")
-    save_path = args.save_path or (root / "models" / "bbox_resnet50.pth")
+    save_path = args.save_path or (root / "models" / "bbox_fcos_resnet50.B.pth")
     crop_breast_region = not bool(args.disable_breast_crop)
     breast_crop_margin = max(0.0, float(args.breast_crop_margin))
 
