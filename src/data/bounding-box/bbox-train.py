@@ -9,14 +9,18 @@ r"""
 Use this to run in Git Bash:
 
 python src/data/bounding-box/bbox-train.py \
+    --clf-epochs 10 \
+    --clf-lr 1e-3 \
+    --clf-pos-weight 10.0 \
+    --clf-threshold 0.5 \
     --epochs 50 \
     --batch-size 2 \
     --accumulation-steps 4 \
     --lr 0.005 \
     --post-warmup-lr 0.001 \
     --warmup-balanced-epochs 5 \
-    --warmup-pos-weight-ratio 10.0 \
-    --full-train-pos-weight-ratio 10.0 \
+    --warmup-pos-weight-ratio 3.0 \
+    --full-train-pos-weight-ratio 0.0 \
     --freeze-epochs 0 \
     --augment \
     --aug-hflip-prob 0.5 \
@@ -27,14 +31,7 @@ python src/data/bounding-box/bbox-train.py \
     --box-fg-iou-thresh 0.4 \
     --box-bg-iou-thresh 0.3 \
     --box-nms-thresh 0.5 \
-    --box-score-thresh 0.001 \
-    --box-detections-per-img 20 \
-    --val-detections-per-img 300 \
-    --input-min-size 1200 \
-    --classification-loss-scale 2.0 \
-    --recall-stop \
     --patience 15 \
-    --medical-backbone-path models/raw/ResNet50.pt \
     --hide-progress-bar
 
 本文件介绍：
@@ -400,6 +397,40 @@ Prompts for improvement:
         新增参数：--seg-pos-weight 100.0 --seg-val-threshold 0.5
         去掉参数：所有 RetinaNet 专有参数（focal-*, anchor-sizes, box-*-thresh 等）
 
+-----------
+43. 图像级二分类器前置过滤（rec_43）：
+    根因分析：训练集中 91% 为负样本图像（12413/13596），RetinaNet 在约 91% 的
+    batch 中接收"无病灶"图像的 anchor 级梯度，分类头同时学习"找到病灶"和"抑制
+    整张正常图像的所有 anchor"两个竞争任务，梯度方向持续对消。从图像层面切断负
+    样本流，将检测器有效训练集的图像级负正比从 10.5:1 降低至约 0.25:1。
+
+    两阶段训练流程：
+    阶段一（图像级分类器，5–10 轮）：在全部 13,596 张训练图像上用 ResNet50 +
+    全局平均池化 + Dropout(0.5) + FC(2048→1) 训练图像级二分类器（has_lesion /
+    no_lesion）；BCEWithLogitsLoss，pos_weight 与训练集负正比匹配（默认 10.0）；
+    Adam 优化器，LR=1e-3，CosineAnnealingLR 衰减。阶段一 checkpoint 保存至
+    models/image_clf.pth，可通过 --clf-checkpoint-path 跳过重新训练复用旧权重。
+    阶段二（RetinaNet 检测器，原始流程）：将阶段一分类器应用于全部训练图像，仅
+    保留预测为"有病灶"（sigmoid > --clf-threshold）的图像进入 RetinaNet 训练集；
+    同时强制保留全部原始正样本图像，防止分类器假阴性导致正样本丢失；验证集保持
+    完整真实分布（不过滤）。
+
+    新增参数：
+    - --clf-epochs（默认 10）：阶段一图像分类器训练轮数。
+    - --clf-lr（默认 1e-3）：阶段一 Adam 学习率。
+    - --clf-pos-weight（默认 10.0）：BCEWithLogitsLoss 正样本权重。
+    - --clf-threshold（默认 0.5）：分类器过滤阈值；sigmoid 高于此值的图像进入
+      检测训练集。
+    - --clf-save-path（默认 models/image_clf.pth）：阶段一 checkpoint 保存路径。
+    - --clf-checkpoint-path（默认 None）：若提供则跳过阶段一，直接加载已有分类
+      器权重，方便复用已训练好的分类器。
+    - --skip-clf-stage（默认关闭）：跳过阶段一，使用完整训练集进行检测，等价于
+      原始 bbox-train.py 的行为。
+
+-----------
+44. 架构彻底切换：将检测问题重构为 patch 级滑窗二分类（rec_44）
+    【此文件未作修改，完整实现在分支文件 bbox-train-D.py 中】
+
 """
 
 from __future__ import annotations
@@ -443,6 +474,12 @@ try:
     from tqdm import tqdm
 except Exception:  # pragma: no cover
     tqdm = lambda x, **kwargs: x  # type: ignore[assignment]
+
+try:
+    from torchvision.models import resnet50 as _resnet50, ResNet50_Weights as _ResNet50Weights
+except Exception:  # pragma: no cover
+    _resnet50 = None  # type: ignore
+    _ResNet50Weights = None  # type: ignore
 
 
 def set_seed(seed: int) -> None:
@@ -1100,6 +1137,152 @@ class CopyPasteWrapper(torch.utils.data.Dataset):
             }
 
         return img, target
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage-1 helpers: image-level binary classifier for training-set pre-filtering
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ImageClassificationDataset(torch.utils.data.Dataset):
+    """Wraps VinDrBboxDataset to return (image_tensor, has_lesion_label) pairs.
+
+    Used for Stage-1 image-level binary classifier training.
+    The underlying dataset already handles breast-crop and CLAHE preprocessing.
+    """
+
+    def __init__(self, base_dataset: torch.utils.data.Dataset, indices: List[int]) -> None:
+        self.base_dataset = base_dataset
+        self.indices = list(indices)
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        real_idx = self.indices[idx]
+        img_tensor, target = self.base_dataset[real_idx]
+        label = 1.0 if target["boxes"].shape[0] > 0 else 0.0
+        return img_tensor, torch.tensor(label, dtype=torch.float32)
+
+
+def build_image_classifier(medical_backbone_path: Optional[str] = None) -> torch.nn.Module:
+    """Build a ResNet50 image-level binary classifier (has_lesion / no_lesion).
+
+    Architecture: ResNet50 (ImageNet pretrained) + AdaptiveAvgPool2d (inside ResNet50) +
+    Dropout(0.5) + FC(2048→1).  conv1 is adapted for grayscale-as-3channel input.
+    Optionally overwrites backbone body with a medical-domain pretrained checkpoint.
+    """
+    if _resnet50 is None:
+        raise RuntimeError("torchvision resnet50 not found; please upgrade torchvision.")
+    try:
+        backbone = _resnet50(weights=_ResNet50Weights.DEFAULT)
+    except Exception:
+        backbone = _resnet50(pretrained=True)  # type: ignore[call-arg]
+
+    in_features = backbone.fc.in_features
+    backbone.fc = torch.nn.Sequential(
+        torch.nn.Dropout(0.5),
+        torch.nn.Linear(in_features, 1),
+    )
+
+    if medical_backbone_path is not None:
+        try:
+            ckpt = torch.load(medical_backbone_path, map_location="cpu")
+            raw_sd = ckpt.get("state_dict", ckpt.get("model", ckpt)) if isinstance(ckpt, dict) else ckpt
+            _idx_to_resnet = {"0": "conv1", "1": "bn1", "4": "layer1", "5": "layer2", "6": "layer3", "7": "layer4"}
+            stripped: Dict[str, Any] = {}
+            for k, v in raw_sd.items():
+                k = re.sub(r"^(module\.|encoder\.|backbone\.|body\.)+", "", k)
+                m = re.match(r"^(\d+)\.(.*)", k)
+                if m and m.group(1) in _idx_to_resnet:
+                    k = f"{_idx_to_resnet[m.group(1)]}.{m.group(2)}"
+                stripped[k] = v
+            missing, unexpected = backbone.load_state_dict(stripped, strict=False)
+            print(f"[Stage-1] Loaded medical backbone: {medical_backbone_path} (missing={len(missing)}, unexpected={len(unexpected)})")
+        except Exception as exc:
+            print(f"[Stage-1 Warning] Could not load medical backbone ({exc}). Using ImageNet weights.")
+
+    try:
+        with torch.no_grad():
+            mean_w = backbone.conv1.weight.mean(dim=1, keepdim=True)
+            backbone.conv1.weight.copy_(mean_w.expand_as(backbone.conv1.weight))
+        print("[Stage-1] conv1 weights averaged for grayscale-as-3channel input.")
+    except AttributeError:
+        pass
+
+    return backbone
+
+
+def train_clf_one_epoch(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+    epochs: int,
+    pos_weight: float = 10.0,
+    disable_tqdm: bool = False,
+) -> float:
+    """Train one epoch of the image-level binary classifier (BCEWithLogitsLoss)."""
+    model.train()
+    criterion = torch.nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor([pos_weight], device=device)
+    )
+    running_loss = 0.0
+    count = 0
+    pbar = tqdm(loader, desc=f"clf {epoch + 1}/{epochs}", leave=False, disable=disable_tqdm)
+    for images, labels in pbar:
+        images = images.to(device)
+        labels = labels.to(device)
+        logits = model(images).squeeze(1)
+        loss = criterion(logits, labels)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        running_loss += float(loss.item())
+        count += 1
+        pbar.set_postfix(loss=f"{loss.item():.4f}")
+    return running_loss / max(count, 1)
+
+
+def run_clf_filter(
+    classifier: torch.nn.Module,
+    base_dataset: torch.utils.data.Dataset,
+    train_indices: List[int],
+    samples: List[Sample],
+    device: torch.device,
+    threshold: float = 0.5,
+) -> List[int]:
+    """Apply image-level classifier to filter negative training images.
+
+    All original positive images are kept unconditionally to prevent false
+    negatives from removing lesion-containing images.  Negative images are
+    kept only when classifier sigmoid output > threshold.
+
+    Returns the filtered (and sorted) list of train_indices.
+    """
+    classifier.eval()
+    orig_positives = {i for i in train_indices if samples[i].boxes.size > 0}
+    neg_indices = [i for i in train_indices if i not in orig_positives]
+    print(f"[Stage-1 Filter] Classifying {len(neg_indices)} negative training images (threshold={threshold})…")
+    clf_keep = set(orig_positives)
+    with torch.no_grad():
+        for real_idx in neg_indices:
+            img_tensor, _ = base_dataset[real_idx]
+            img_tensor = img_tensor.unsqueeze(0).to(device)
+            logit = classifier(img_tensor).squeeze()
+            prob = float(torch.sigmoid(logit).item())
+            if prob > threshold:
+                clf_keep.add(real_idx)
+    filtered = sorted(clf_keep)
+    n_pos = sum(1 for i in filtered if samples[i].boxes.size > 0)
+    n_neg = len(filtered) - n_pos
+    print(
+        f"[Stage-1 Filter] Filtered train set: {len(filtered)} images "
+        f"(pos={n_pos}, neg={n_neg}, neg/pos={n_neg / max(n_pos, 1):.2f}; "
+        f"removed {len(train_indices) - len(filtered)} negative images)"
+    )
+    return filtered
 
 
 def summarize_subset(samples: List[Sample], indices: List[int]) -> Dict[str, Any]:
@@ -2003,6 +2186,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    # ── Stage-1: image-level binary classifier pre-filtering ──────────────────
+    parser.add_argument("--clf-epochs", type=int, default=10,
+        help="Number of training epochs for the Stage-1 image-level binary classifier.")
+    parser.add_argument("--clf-lr", type=float, default=1e-3,
+        help="Adam learning rate for the Stage-1 image classifier.")
+    parser.add_argument("--clf-pos-weight", type=float, default=10.0,
+        help="BCEWithLogitsLoss pos_weight for Stage-1 classifier (match training neg/pos ratio).")
+    parser.add_argument("--clf-threshold", type=float, default=0.5,
+        help="Sigmoid threshold: negative training images with predicted probability above this "
+             "value are kept for Stage-2 RetinaNet training; all original positives are always kept.")
+    parser.add_argument("--clf-save-path", type=str, default=None,
+        help="Path to save the best Stage-1 classifier checkpoint (default: models/image_clf.pth).")
+    parser.add_argument("--clf-checkpoint-path", type=str, default=None,
+        help="If provided, skip Stage-1 training and load an existing classifier from this path.")
+    parser.add_argument("--skip-clf-stage", action="store_true",
+        help="Skip Stage-1 entirely and use the full unfiltered training set for detection, "
+             "equivalent to running the original bbox-train.py.")
+
     return parser.parse_args()
 
 
@@ -2066,6 +2267,59 @@ def main() -> None:
 
     train_indices.sort()
     val_indices.sort()
+
+    # ── Stage 1: Image-level binary classifier training and pre-filtering ─────
+    if not args.skip_clf_stage:
+        print(f"\n{'=' * 60} Stage 1: Image-level binary classifier {'=' * 60}")
+        clf_save_path = Path(args.clf_save_path) if args.clf_save_path else (root / "models" / "image_clf.pth")
+        classifier = build_image_classifier(
+            medical_backbone_path=args.medical_backbone_path if args.medical_backbone_path else None
+        )
+        classifier.to(device)
+
+        if args.clf_checkpoint_path and Path(args.clf_checkpoint_path).exists():
+            print(f"[Stage-1] Loading existing classifier from: {args.clf_checkpoint_path}")
+            ckpt = torch.load(args.clf_checkpoint_path, map_location="cpu")
+            classifier.load_state_dict(ckpt.get("model_state_dict", ckpt))
+        else:
+            clf_dataset = ImageClassificationDataset(train_dataset, train_indices)
+            clf_loader = DataLoader(
+                clf_dataset,
+                batch_size=min(int(args.batch_size) * 8, 32),
+                shuffle=True,
+                num_workers=int(args.num_workers),
+                pin_memory=torch.cuda.is_available(),
+            )
+            clf_optimizer = torch.optim.Adam(classifier.parameters(), lr=float(args.clf_lr), weight_decay=1e-4)
+            _eff_clf = max(1, int(args.clf_epochs))
+            clf_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(clf_optimizer, T_max=_eff_clf, eta_min=1e-6)
+            best_clf_loss = float("inf")
+            for clf_epoch in range(_eff_clf):
+                clf_loss = train_clf_one_epoch(
+                    classifier, clf_loader, clf_optimizer, device,
+                    clf_epoch, _eff_clf,
+                    pos_weight=float(args.clf_pos_weight),
+                    disable_tqdm=args.hide_progress_bar,
+                )
+                clf_scheduler.step()
+                print(f"[Stage-1] Epoch {clf_epoch + 1}/{_eff_clf} | clf_loss={clf_loss:.4f}")
+                if clf_loss < best_clf_loss:
+                    best_clf_loss = clf_loss
+                    clf_save_path.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save({"model_state_dict": classifier.state_dict()}, clf_save_path)
+            print(f"[Stage-1] Best classifier saved to: {clf_save_path}")
+            ckpt = torch.load(clf_save_path, map_location="cpu")
+            classifier.load_state_dict(ckpt["model_state_dict"])
+
+        train_indices = run_clf_filter(
+            classifier, train_dataset, train_indices,
+            train_dataset.samples, device,
+            threshold=float(args.clf_threshold),
+        )
+        del classifier
+        torch.cuda.empty_cache()
+        print(f"{'=' * 60} Stage 2: RetinaNet detector training {'=' * 60}\n")
+    # ── Stage 1 end ────────────────────────────────────────────────────────────
 
     train_summary = summarize_subset(train_dataset.samples, train_indices)
     val_summary = summarize_subset(train_dataset.samples, val_indices)
