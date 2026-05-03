@@ -1160,10 +1160,13 @@ class ImageClassificationDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         real_idx = self.indices[idx]
         img_tensor, target = self.base_dataset[real_idx]
-        # Resize to fixed spatial size so images can be stacked into a batch.
-        # Use bilinear interpolation; img_tensor shape is (C, H, W).
+        # Resize to a fixed smaller size so images can be stacked into a batch.
+        # Full resolution (1520×912) causes CUDA OOM in ResNet50 layer2 due to large
+        # intermediate feature maps.  (512, 320) is 1/3 scale and sufficient for
+        # image-level binary classification; ResNet50 uses GlobalAveragePooling so
+        # spatial size does not affect model accuracy.
         img_tensor = torch.nn.functional.interpolate(
-            img_tensor.unsqueeze(0), size=(1520, 912), mode="bilinear", align_corners=False
+            img_tensor.unsqueeze(0), size=(512, 320), mode="bilinear", align_corners=False
         ).squeeze(0)
         label = 1.0 if target["boxes"].shape[0] > 0 else 0.0
         return img_tensor, torch.tensor(label, dtype=torch.float32)
