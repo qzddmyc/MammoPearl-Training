@@ -231,6 +231,9 @@ def random_augment_fn(
             flipped_boxes[:, 0] = float(w) - boxes[:, 2]
             flipped_boxes[:, 2] = float(w) - boxes[:, 0]
             target = {**target, "boxes": flipped_boxes}
+        # Keep mask spatially aligned with the flipped image.
+        if "masks" in target:
+            target = {**target, "masks": torch.flip(target["masks"], [2])}
 
     # Random small-angle rotation (strategy A: keep output size, zero-fill corners)
     # Only applied to single-bbox images to avoid pivot ambiguity for multi-lesion cases.
@@ -298,6 +301,22 @@ def random_augment_fn(
                     new_target["area"] = area
                 if target_iscrowd is not None:
                     new_target["iscrowd"] = target_iscrowd[keep]
+                # Keep mask spatially aligned: apply the same rotation + crop.
+                # rotated_np still holds the full-size rotated image (before crop),
+                # so its H×W matches the original mask dimensions.
+                masks_val = target.get("masks")
+                if masks_val is not None:
+                    mask_2d = masks_val.squeeze(0).numpy()  # [H_orig, W_orig]
+                    h_rot, w_rot = rotated_np.shape[:2]
+                    rotated_mask_2d = cv2.warpAffine(
+                        mask_2d, M, (w_rot, h_rot),
+                        flags=cv2.INTER_NEAREST,
+                        borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=0,
+                    )
+                    new_target["masks"] = torch.from_numpy(
+                        rotated_mask_2d[int(cy1):int(_cy2), int(cx1):int(_cx2)].copy()
+                    ).unsqueeze(0)
                 target = new_target
 
     # Random brightness/contrast jitter
