@@ -32,6 +32,7 @@ python src/data/bounding-box/bbox-train.py \
     --box-bg-iou-thresh 0.3 \
     --box-nms-thresh 0.5 \
     --patience 15 \
+    --medical-backbone-path models/raw/ResNet50.pt \
     --hide-progress-bar
 
 本文件介绍：
