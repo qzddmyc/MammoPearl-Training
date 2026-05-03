@@ -1160,6 +1160,11 @@ class ImageClassificationDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         real_idx = self.indices[idx]
         img_tensor, target = self.base_dataset[real_idx]
+        # Resize to fixed spatial size so images can be stacked into a batch.
+        # Use bilinear interpolation; img_tensor shape is (C, H, W).
+        img_tensor = torch.nn.functional.interpolate(
+            img_tensor.unsqueeze(0), size=(1520, 912), mode="bilinear", align_corners=False
+        ).squeeze(0)
         label = 1.0 if target["boxes"].shape[0] > 0 else 0.0
         return img_tensor, torch.tensor(label, dtype=torch.float32)
 

@@ -1271,7 +1271,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a patch-level sliding-window lesion detector for VinDr.")
     parser.add_argument("--csv-path", type=Path, default=None, help="Path to vindr_detection_folds.csv")
     parser.add_argument("--images-root", type=Path, default=None, help="Root folder containing processed images_png/<patient_id>/<image_id>")
-    parser.add_argument("--save-path", type=Path, default=None, help="Best checkpoint path (default: models/bbox_resnet50.pth)")
+    parser.add_argument("--save-path", type=Path, default=None, help="Best checkpoint path (default: models/bbox_resnet50.D.pth)")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for patch training DataLoader")
     parser.add_argument("--val-batch-size", type=int, default=32, help="Batch size for sliding-window validation (patch batches per image)")
@@ -1293,6 +1293,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pos-neg-ratio", type=float, default=3.0, help="Negative-to-positive patch sampling ratio per image (hard negatives from same image)")
     parser.add_argument("--clf-pos-weight", type=float, default=5.0, help="BCEWithLogitsLoss pos_weight for patch classifier")
     parser.add_argument("--dropout", type=float, default=0.5, help="Dropout probability before the final FC layer")
+    parser.add_argument("--val-heatmap-threshold", type=float, default=0.5, help="Base binarization threshold for validation heatmap (multi-threshold eval also covers 0.1/0.3/0.7/0.9)")
     parser.add_argument("--val-heatmap-dilation", type=int, default=15, help="Dilation kernel size for merging nearby heatmap activations into bounding boxes")
 
     # Data augmentation
@@ -1322,7 +1323,7 @@ def main() -> None:
     root = repo_root_from_file()
     csv_path = args.csv_path or (root / "data" / "raw" / "vindr_detection_folds.csv")
     images_root = args.images_root or (root / "data" / "processed" / "images_png")
-    save_path = args.save_path or (root / "models" / "bbox_resnet50.pth")
+    save_path = args.save_path or (root / "models" / "bbox_resnet50.D.pth")
 
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV not found: {csv_path}")
