@@ -13,6 +13,7 @@ python src/data/bounding-box/bbox-train-D.py \
     --clf-pos-weight 5.0 \
     --val-heatmap-threshold 0.5 \
     --val-heatmap-dilation 15 \
+    --val-iou-threshold 0.1 \
     --augment \
     --aug-hflip-prob 0.5 \
     --aug-brightness-delta 0.2 \
@@ -81,12 +82,10 @@ import argparse
 import json
 import atexit
 import datetime
-import math
 import random
 import re
 import signal
 import time
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -95,7 +94,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 import torch.nn.functional as F
 try:
     from torchvision.models import resnet50 as _resnet50, ResNet50_Weights as _ResNet50Weights
@@ -158,150 +157,6 @@ def image_to_tensor(img: np.ndarray) -> torch.Tensor:
     """Convert RGB uint8 image to a float tensor in [0, 1]."""
     arr = img.astype(np.float32) / 255.0
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
-
-
-def _rotate_box_centers_preserve(
-    boxes: torch.Tensor,
-    angle_deg: float,
-    img_h: int,
-    img_w: int,
-    pivot_x: float,
-    pivot_y: float,
-) -> torch.Tensor:
-    """Rotate bbox centers around a given pivot; keep original box size.
-
-    Each box center is rotated around (pivot_x, pivot_y).  The box is then
-    reconstructed with its original width and height centered on the new
-    rotated position.  Coordinates are clamped to [0, W] x [0, H].
-    """
-    if boxes.numel() == 0:
-        return boxes.clone()
-
-    rad = math.radians(angle_deg)
-    cos_a, sin_a = math.cos(rad), math.sin(rad)
-
-    orig_w = boxes[:, 2] - boxes[:, 0]
-    orig_h = boxes[:, 3] - boxes[:, 1]
-    box_cx = (boxes[:, 0] + boxes[:, 2]) / 2.0
-    box_cy = (boxes[:, 1] + boxes[:, 3]) / 2.0
-
-    dx = box_cx - pivot_x
-    dy = box_cy - pivot_y
-    new_cx = cos_a * dx - sin_a * dy + pivot_x
-    new_cy = sin_a * dx + cos_a * dy + pivot_y
-
-    new_x1 = (new_cx - orig_w / 2.0).clamp(0.0, float(img_w))
-    new_y1 = (new_cy - orig_h / 2.0).clamp(0.0, float(img_h))
-    new_x2 = (new_cx + orig_w / 2.0).clamp(0.0, float(img_w))
-    new_y2 = (new_cy + orig_h / 2.0).clamp(0.0, float(img_h))
-
-    return torch.stack([new_x1, new_y1, new_x2, new_y2], dim=1)
-
-
-def random_augment_fn(
-    img: torch.Tensor,
-    target: Dict[str, torch.Tensor],
-    hflip_prob: float = 0.5,
-    brightness_delta: float = 0.2,
-    rotation_max_deg: float = 0.0,
-) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Apply random augmentation to a (image tensor, target) pair.
-
-    img: float tensor in [0, 1] of shape [C, H, W].
-    target: dict with 'boxes' in xyxy format and other Faster R-CNN keys.
-
-    Augmentations applied:
-    - Random horizontal flip (probability = hflip_prob)
-    - Random brightness jitter (uniform in [-brightness_delta, +brightness_delta])
-    - Random small-angle rotation using strategy-A (keep original image size, fill
-      empty corners with 0; update boxes via rotated-corner AABB)
-    """
-    _, h, w = img.shape
-
-    # Random horizontal flip
-    if random.random() < hflip_prob:
-        img = torch.flip(img, [2])
-        boxes = target.get("boxes")
-        if boxes is not None and boxes.numel() > 0:
-            flipped_boxes = boxes.clone()
-            flipped_boxes[:, 0] = float(w) - boxes[:, 2]
-            flipped_boxes[:, 2] = float(w) - boxes[:, 0]
-            target = {**target, "boxes": flipped_boxes}
-
-    # Random small-angle rotation (strategy A: keep output size, zero-fill corners)
-    # Only applied to single-bbox images to avoid pivot ambiguity for multi-lesion cases.
-    if rotation_max_deg > 0.0:
-        boxes = target.get("boxes")
-        n_boxes = boxes.shape[0] if boxes is not None else 0
-        if n_boxes == 1:
-            angle = random.uniform(-rotation_max_deg, rotation_max_deg)
-            if abs(angle) > 0.1:  # skip near-zero rotations for efficiency
-                # Rotation pivot = bbox center
-                bx1, by1, bx2, by2 = boxes[0].tolist()
-                pivot_x = (bx1 + bx2) / 2.0
-                pivot_y = (by1 + by2) / 2.0
-
-                # Rotate image tensor via numpy/cv2 (keeps same H x W)
-                img_np = (img.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-                M = cv2.getRotationMatrix2D((pivot_x, pivot_y), angle, 1.0)
-                rotated_np = cv2.warpAffine(
-                    img_np, M, (w, h),
-                    flags=cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_CONSTANT,
-                    borderValue=0,
-                )
-                img = torch.from_numpy(rotated_np.astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
-
-                # Crop away black corners introduced by rotation.
-                # detect_breast_region works on non-zero pixels, so the zero-filled
-                # rotation corners are naturally excluded.
-                crop_box = detect_breast_region(rotated_np, margin_ratio=0.0)
-                rotated_np_cropped, _ = crop_image_and_boxes(rotated_np, np.zeros((0, 4), dtype=np.float32), crop_box)
-                img = torch.from_numpy(rotated_np_cropped.astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
-                # Remap h, w to the cropped size for subsequent box clamping
-                _, h, w = img.shape
-                cx1, cy1, _cx2, _cy2 = crop_box
-
-                # Update bbox: rotate center around pivot, keep original size
-                rotated_boxes = _rotate_box_centers_preserve(boxes, angle, h + cy1, w + cx1, pivot_x, pivot_y)
-                # Remap rotated bbox to crop-local coordinates
-                rotated_boxes[:, 0] -= cx1
-                rotated_boxes[:, 2] -= cx1
-                rotated_boxes[:, 1] -= cy1
-                rotated_boxes[:, 3] -= cy1
-                rotated_boxes[:, 0] = rotated_boxes[:, 0].clamp(0.0, float(w))
-                rotated_boxes[:, 2] = rotated_boxes[:, 2].clamp(0.0, float(w))
-                rotated_boxes[:, 1] = rotated_boxes[:, 1].clamp(0.0, float(h))
-                rotated_boxes[:, 3] = rotated_boxes[:, 3].clamp(0.0, float(h))
-                # Drop degenerate boxes that collapsed after clamp
-                keep = (rotated_boxes[:, 2] > rotated_boxes[:, 0] + 1) & (
-                    rotated_boxes[:, 3] > rotated_boxes[:, 1] + 1
-                )
-                rotated_boxes = rotated_boxes[keep]
-                target_labels = target.get("labels")
-                target_area = target.get("area")
-                target_iscrowd = target.get("iscrowd")
-                new_target: Dict[str, torch.Tensor] = {
-                    **target,
-                    "boxes": rotated_boxes,
-                }
-                if target_labels is not None:
-                    new_target["labels"] = target_labels[keep]
-                if target_area is not None:
-                    area = (rotated_boxes[:, 2] - rotated_boxes[:, 0]) * (
-                        rotated_boxes[:, 3] - rotated_boxes[:, 1]
-                    )
-                    new_target["area"] = area
-                if target_iscrowd is not None:
-                    new_target["iscrowd"] = target_iscrowd[keep]
-                target = new_target
-
-    # Random brightness/contrast jitter
-    if brightness_delta > 0.0:
-        factor = 1.0 + random.uniform(-brightness_delta, brightness_delta)
-        img = torch.clamp(img * factor, 0.0, 1.0)
-
-    return img, target
 
 
 def detect_breast_region(
@@ -513,11 +368,6 @@ class VinDrBboxDataset(Dataset):
         }
         return image_to_tensor(img), target
 
-
-
-def collate_fn(batch):
-    images, targets = zip(*batch)
-    return list(images), list(targets)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -772,83 +622,6 @@ def summarize_subset(samples: List[Sample], indices: List[int]) -> Dict[str, Any
     }
 
 
-def compute_neg_pos_ratio(summary: Dict[str, Any]) -> float:
-    """Return negative-to-positive image ratio for a summarized subset."""
-    positive_images = int(summary.get("positive_images", 0))
-    negative_images = int(summary.get("negative_images", 0))
-    if positive_images <= 0:
-        return float("inf") if negative_images > 0 else 0.0
-    return float(negative_images / positive_images)
-
-
-def warn_on_small_epoch_positive_pool(train_summary: Dict[str, Any], only_use: float) -> None:
-    """Warn when epoch subsampling leaves too few positive images for stable training."""
-    if only_use >= 1.0:
-        return
-
-    positive_images = int(train_summary.get("positive_images", 0))
-    estimated_positive_images = math.ceil(positive_images * only_use)
-    if 0 < estimated_positive_images < 256:
-        print(
-            f"[Warning] --only-use={only_use:.3f} leaves about {estimated_positive_images} positive images per epoch "
-            f"under the current train split. This often weakens lesion learning and can trigger FP rebound; "
-            f"prefer --only-use 1.0 for final detector training."
-        )
-
-
-def select_epoch_subset(
-    train_indices: List[int],
-    samples: List[Sample],
-    epoch: int,
-    only_use: float,
-    seed: int,
-) -> List[int]:
-    """Select a rotating subset of training indices for one epoch.
-
-    Ensures all images are visited across epochs by cycling through
-    positive and negative samples independently.  Positive samples are
-    protected to never fall below the original positive ratio of the subset.
-    """
-    if only_use >= 1.0:
-        return train_indices
-
-    pos_all = [i for i in train_indices if samples[i].boxes.size > 0]
-    neg_all = [i for i in train_indices if samples[i].boxes.size == 0]
-
-    total_target = max(1, math.ceil(len(train_indices) * only_use))
-    original_pos_ratio = len(pos_all) / max(len(train_indices), 1)
-
-    # Protect positive samples: at least the original ratio worth of positives
-    n_pos = max(1, math.ceil(total_target * original_pos_ratio)) if pos_all else 0
-    n_pos = min(n_pos, len(pos_all))
-    n_neg = min(total_target - n_pos, len(neg_all))
-    n_neg = max(0, n_neg)
-
-    selected: List[int] = []
-
-    if pos_all and n_pos > 0:
-        pos_cycles = max(1, math.ceil(len(pos_all) / n_pos))
-        pos_cycle_group = epoch // pos_cycles
-        pos_epoch_in_cycle = epoch % pos_cycles
-        rng_pos = random.Random(seed + 500 + pos_cycle_group * 31)
-        pos_shuffled = pos_all.copy()
-        rng_pos.shuffle(pos_shuffled)
-        start_p = pos_epoch_in_cycle * n_pos
-        selected += [pos_shuffled[j % len(pos_all)] for j in range(start_p, start_p + n_pos)]
-
-    if neg_all and n_neg > 0:
-        neg_cycles = max(1, math.ceil(len(neg_all) / n_neg))
-        neg_cycle_group = epoch // neg_cycles
-        neg_epoch_in_cycle = epoch % neg_cycles
-        rng_neg = random.Random(seed + 700 + neg_cycle_group * 37)
-        neg_shuffled = neg_all.copy()
-        rng_neg.shuffle(neg_shuffled)
-        start_n = neg_epoch_in_cycle * n_neg
-        selected += [neg_shuffled[j % len(neg_all)] for j in range(start_n, start_n + n_neg)]
-
-    return selected
-
-
 def split_train_val_by_patient(
     samples: List[Sample],
     val_ratio: float,
@@ -1000,54 +773,6 @@ def compute_iou_matrix(boxes1: np.ndarray, boxes2: np.ndarray) -> np.ndarray:
     return inter / np.clip(union, a_min=1e-6, a_max=None)
 
 
-def match_predictions_to_gt(
-    pred_boxes: np.ndarray,
-    pred_scores: np.ndarray,
-    gt_boxes: np.ndarray,
-    score_threshold: float,
-    iou_threshold: float,
-) -> Tuple[int, int, int]:
-    """Greedy one-to-one matching to compute TP / FP / FN for one image."""
-    pred_boxes = np.asarray(pred_boxes, dtype=np.float32).reshape(-1, 4)
-    pred_scores = np.asarray(pred_scores, dtype=np.float32).reshape(-1)
-    gt_boxes = np.asarray(gt_boxes, dtype=np.float32).reshape(-1, 4)
-
-    if pred_boxes.shape[0] == 0:
-        return 0, 0, int(gt_boxes.shape[0])
-    if gt_boxes.shape[0] == 0:
-        return 0, int(pred_boxes.shape[0]), 0
-
-    keep = pred_scores >= float(score_threshold)
-    pred_boxes = pred_boxes[keep]
-    pred_scores = pred_scores[keep]
-
-    if pred_boxes.shape[0] == 0:
-        return 0, 0, int(gt_boxes.shape[0])
-
-    order = np.argsort(-pred_scores)
-    pred_boxes = pred_boxes[order]
-
-    ious = compute_iou_matrix(pred_boxes, gt_boxes)
-    matched_gt = np.zeros((gt_boxes.shape[0],), dtype=bool)
-
-    tp = 0
-    for pred_idx in range(pred_boxes.shape[0]):
-        unmatched = np.where(~matched_gt)[0]
-        if unmatched.size == 0:
-            break
-
-        best_rel = int(unmatched[int(np.argmax(ious[pred_idx, unmatched]))])
-        best_iou = float(ious[pred_idx, best_rel])
-
-        if best_iou >= float(iou_threshold):
-            matched_gt[best_rel] = True
-            tp += 1
-
-    fp = int(pred_boxes.shape[0] - tp)
-    fn = int(gt_boxes.shape[0] - tp)
-    return tp, fp, fn
-
-
 def compute_iou_matches(
     pred_boxes: np.ndarray,
     gt_boxes: np.ndarray,
@@ -1120,6 +845,10 @@ def validate_sliding_window(
         for sample_idx in pbar:
             sample = samples[sample_idx]
             gt_boxes = sample.boxes.astype(np.float32)  # (N, 4) xyxy
+            # Filter invalid boxes (same criteria as __getitem__ and _build_index)
+            if gt_boxes.size > 0:
+                keep = (gt_boxes[:, 2] > gt_boxes[:, 0] + 1) & (gt_boxes[:, 3] > gt_boxes[:, 1] + 1)
+                gt_boxes = gt_boxes[keep]
 
             try:
                 img_np = normalize_image(read_image_unicode(sample.image_path))
@@ -1127,9 +856,11 @@ def validate_sliding_window(
                 continue
 
             h, w = img_np.shape[:2]
-            # Build (H, W) heatmap via dense sliding window
+            # Build (H, W) heatmap via dense sliding window.
+            # Each patch contributes its score to the ENTIRE patch area (max-pooling),
+            # not just the center point. This ensures the resulting blobs are at the
+            # correct spatial scale for IoU matching with GT boxes.
             heatmap = np.zeros((h, w), dtype=np.float32)
-            counts_map = np.zeros((h, w), dtype=np.float32)
 
             ps = patch_size
             y_positions = list(range(0, max(1, h - ps + 1), stride)) or [0]
@@ -1153,14 +884,8 @@ def validate_sliding_window(
                 probs = torch.sigmoid(logits).cpu().numpy()
                 for i_b, (py, px, _) in enumerate(batch_items):
                     y2, x2 = min(py + ps, h), min(px + ps, w)
-                    center_y = py + ps // 2
-                    center_x = px + ps // 2
-                    cy = min(center_y, h - 1)
-                    cx = min(center_x, w - 1)
                     score = float(probs[i_b])
-                    if score > heatmap[cy, cx]:
-                        heatmap[cy, cx] = score
-                    counts_map[cy, cx] += 1.0
+                    heatmap[py:y2, px:x2] = np.maximum(heatmap[py:y2, px:x2], score)
 
             # Evaluate at each threshold
             for thresh in multi_thresholds:
@@ -1186,6 +911,17 @@ def validate_sliding_window(
 
     best_thresh = max(f1_per_thresh, key=lambda t: f1_per_thresh[t])
     best_f1 = f1_per_thresh[best_thresh]
+
+    # Print per-threshold summary
+    parts = []
+    for thresh in multi_thresholds:
+        tp = multi_stats[thresh]["tp"]
+        fp = multi_stats[thresh]["fp"]
+        fn = multi_stats[thresh]["fn"]
+        f1 = f1_per_thresh[thresh]
+        parts.append(f"@{thresh}: TP={tp} FP={fp} F1={f1:.4f}")
+    print(f"  [Val] GT_boxes={total_gt_boxes} | {' | '.join(parts)}")
+    print(f"  [BestThresh] F1={best_f1:.4f} @ thresh={best_thresh}")
 
     result: Dict[str, float] = {
         "best_thresh_f1": float(best_f1),
@@ -1250,7 +986,6 @@ def train_one_epoch(
         count += 1
         pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-    print(f"[Sum] count = {count}")
     return running_loss / max(count, 1), optimizer_steps
 
 
@@ -1276,7 +1011,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for patch training DataLoader")
     parser.add_argument("--val-batch-size", type=int, default=32, help="Batch size for sliding-window validation (patch batches per image)")
     parser.add_argument("--val-ratio", type=float, default=0.15)
-    parser.add_argument("--val-iou-threshold", type=float, default=0.5, help="IoU threshold for matching predicted boxes to GT")
+    parser.add_argument("--val-iou-threshold", type=float, default=0.1, help="IoU threshold for matching predicted boxes to GT (0.1 is appropriate for patch-scale predictions vs lesion GT boxes)")
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--min-delta", type=float, default=0.0)
     parser.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate")
@@ -1354,6 +1089,9 @@ def main() -> None:
     )
     train_indices.sort()
     val_indices.sort()
+    # Only validate on positive val images: negatives have no GT boxes and generate
+    # only FP, inflating the denominator and driving F1 toward 0.
+    val_pos_indices = [i for i in val_indices if train_dataset.samples[i].boxes.size > 0]
 
     train_pos_indices = [i for i in train_indices if train_dataset.samples[i].boxes.size > 0]
 
@@ -1371,6 +1109,7 @@ def main() -> None:
     )
     print(f"Train patients: {split_summary['train_patients']} | Val patients: {split_summary['val_patients']}")
     print(f"Positive training images: {len(train_pos_indices)}")
+    print(f"Positive val images (used for validation): {len(val_pos_indices)}")
     print(f"Device: {device}")
     print(f"Patch size: {args.patch_size} | Stride: {args.stride}")
     print(f"Max pos/image: {args.max_pos_per_image} | Pos-neg ratio: {args.pos_neg_ratio}")
@@ -1392,6 +1131,9 @@ def main() -> None:
     best_epoch = -1
 
     for epoch in range(int(args.epochs)):
+        print(f"\n{'─' * 72}")
+        print(f"Epoch {epoch + 1} / {args.epochs}")
+        print(f"{'─' * 72}")
         # Build a new PatchDataset each epoch for varied negative sampling
         patch_dataset = PatchDataset(
             samples=train_dataset.samples,
@@ -1430,7 +1172,7 @@ def main() -> None:
         val_metrics = validate_sliding_window(
             model=model,
             samples=train_dataset.samples,
-            val_indices=val_indices,
+            val_indices=val_pos_indices,
             device=device,
             patch_size=int(args.patch_size),
             stride=int(args.stride),
@@ -1449,9 +1191,13 @@ def main() -> None:
         row.update(val_metrics)
         history.append(row)
 
+        best_tp = int(val_metrics.get(f"tp@{best_thresh}", 0))
+        best_fp = int(val_metrics.get(f"fp@{best_thresh}", 0))
+        best_fn = int(val_metrics.get(f"fn@{best_thresh}", 0))
         print(
             f"Epoch {epoch + 1}/{args.epochs} | loss={avg_loss:.4f} | "
-            f"BestThreshF1={monitor_metric:.4f} @ thresh={best_thresh} | "
+            f"BestThreshF1={monitor_metric:.4f} @ thresh={best_thresh} "
+            f"(TP={best_tp} FP={best_fp} FN={best_fn}) | "
             f"lr={lr_scheduler.get_last_lr()[0]:.6f}"
         )
 
