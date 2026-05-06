@@ -11,7 +11,7 @@ python src/data/bounding-box/bbox-train-D.py \
     --max-pos-per-image 8 \
     --pos-neg-ratio 3.0 \
     --neg-image-patch-count 5000 \
-    --clf-pos-weight 5.0 \
+    --clf-pos-weight 2.0 \
     --val-heatmap-threshold 0.5 \
     --val-heatmap-dilation 15 \
     --val-iou-threshold 0.1 \
@@ -110,6 +110,20 @@ rec_44_upd_2：分析 rec_44_upd_1（Best F1=0.4265, Recall=55%）后的修复�
 参数变化（相对 rec_44_upd_1）：
 - --max-pos-per-image 24→8（恢复原值）
 - --val-heatmap-dilation 5→15（恢复原值）
+
+================
+
+rec_44_upd_3：分析 rec_44_upd_2（Best F1=0.4741, Recall=50.6%, FP=199 @ thresh=0.9）后的修复：
+
+问题根因——clf-pos-weight=5.0 过大导致模型"过度激活"，FP 无法降低：
+  BCEWithLogitsLoss 中正样本梯度权重是负样本的 5 倍，强迫模型将正样本分数拉
+  到极高水平，同时将决策边界整体上移，导致大量负样本 patch 也"误穿"高阈值。
+  表现为：42 个 epoch 中绝大多数 best thresh=0.9，且即使在 thresh=0.9 下仍有
+  199 个 FP（正常情况下 thresh=0.5 应能有效过滤误报）。
+  修复：将 clf-pos-weight 从 5.0 降至 2.0，让模型更保守、分数分布更均匀。
+
+参数变化（相对 rec_44_upd_2）：
+- --clf-pos-weight 5.0→2.0
 
 """
 
