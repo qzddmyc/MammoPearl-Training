@@ -8,16 +8,17 @@ python src/data/bounding-box/bbox-train-D.py \
     --lr 1e-3 \
     --patch-size 256 \
     --stride 64 \
-    --max-pos-per-image 8 \
+    --max-pos-per-image 24 \
     --pos-neg-ratio 3.0 \
+    --neg-image-patch-count 5000 \
     --clf-pos-weight 5.0 \
     --val-heatmap-threshold 0.5 \
-    --val-heatmap-dilation 15 \
+    --val-heatmap-dilation 5 \
     --val-iou-threshold 0.1 \
     --augment \
     --aug-hflip-prob 0.5 \
     --aug-brightness-delta 0.2 \
-    --patience 15 \
+    --patience 20 \
     --medical-backbone-path models/raw/ResNet50.pt \
     --hide-progress-bar
 
@@ -67,6 +68,32 @@ d. 验证推理（密集滑窗 → 热图 → 伪框）：
 - --val-heatmap-dilation（默认 15）：热图连通域膨胀核大小（像素），用于合并
   同一病灶的相邻激活点。
 - --accumulation-steps（保留，默认 1）：梯度累积步数。
+
+================
+
+rec_44_upd_1：分析首轮训练（Best F1=0.4817, Recall=46%）后的针对性修复：
+
+问题一（最关键）——热图标注区域错误：
+  训练标签定义为"GT中心落在 patch 中心 1/3"，但推理时将 patch 分数写入整个
+  256×256 区域，导致热图 blob 约 342px，与典型 100px GT box 的 IoU≈0.07 < 0.1
+  阈值，大量本可检出的病灶被迫计为 FN。
+  修复：推理时改为写入 patch 中心 1/3（86×86px），blob 约 172px，IoU 提升到 ~0.34。
+
+问题二——负样本来源单一：
+  训练负 patch 全来自正样本图的非病灶区域，从未见过真阴性图像（12,413 张）的
+  正常乳腺组织，导致 FP=141（每图 0.62 个）。
+  修复：新增 --neg-image-patch-count 参数，每 epoch 从阴性图像随机采样 N 个
+  patch（标签=0）加入训练，迫使模型学会抑制正常乳腺组织。
+
+问题三——采样方差大导致 F1 振荡：
+  每 epoch 重随机负 patch 使 F1 在 0.33–0.48 间剧烈振荡。
+  缓解：max-pos-per-image 8→24，增大正样本密度以降低 epoch 间方差。
+
+参数变化：
+- --max-pos-per-image 8→24
+- --neg-image-patch-count 0→5000（新参数，默认 0 保留旧行为）
+- --val-heatmap-dilation 15→5（中心1/3 blob 更小，不需要大膨胀）
+- --patience 15→20
 
 """
 
@@ -392,6 +419,8 @@ class PatchDataset(torch.utils.data.Dataset):
       - For each positive image: up to max_pos_per_image positive patches are kept;
         up to max_pos_per_image × pos_neg_ratio negative patches are randomly sampled
         from the same image (hard negatives = normal tissue colocated with disease).
+      - Additionally, neg_image_patch_count patches are sampled from true negative
+        images (no GT boxes) to teach the model normal-tissue appearance and reduce FP.
       - Epoch seed varies the negative sampling across epochs.
     """
 
@@ -399,10 +428,12 @@ class PatchDataset(torch.utils.data.Dataset):
         self,
         samples: "List[Sample]",
         pos_indices: "List[int]",
+        neg_indices: "List[int]",
         patch_size: int = 256,
         stride: int = 64,
         max_pos_per_image: int = 8,
         pos_neg_ratio: float = 3.0,
+        neg_image_patch_count: int = 0,
         augment: bool = False,
         hflip_prob: float = 0.5,
         brightness_delta: float = 0.2,
@@ -417,6 +448,45 @@ class PatchDataset(torch.utils.data.Dataset):
         # (sample_idx, px, py, label)
         self._patch_list: "List[Tuple[int, int, int, float]]" = []
         self._build_index(pos_indices, stride, max_pos_per_image, pos_neg_ratio, seed, epoch)
+        if neg_image_patch_count > 0 and neg_indices:
+            self._add_neg_image_patches(neg_indices, neg_image_patch_count, seed, epoch)
+
+    def _add_neg_image_patches(
+        self,
+        neg_indices: "List[int]",
+        count: int,
+        seed: int,
+        epoch: int,
+    ) -> None:
+        """Sample `count` random patches from true negative images (no GT boxes).
+
+        Patches are extracted at random positions using orig_size from CSV (no
+        image I/O at index-build time).  All patches are labeled 0.0.
+        """
+        rng = random.Random(seed + epoch * 1009 + 7)
+        ps = self.patch_size
+        candidates: "List[Tuple[int, int, int, float]]" = []
+        shuffled_neg = neg_indices.copy()
+        rng.shuffle(shuffled_neg)
+        # Distribute across images; stop once we have enough candidates
+        patches_per_image = max(1, count // max(len(shuffled_neg), 1) + 1)
+        for sample_idx in shuffled_neg:
+            if len(candidates) >= count * 4:  # over-sample, then trim
+                break
+            sample = self.samples[sample_idx]
+            orig_h, orig_w = sample.orig_size
+            if orig_h <= 0 or orig_w <= 0:
+                continue
+            H, W = int(orig_h), int(orig_w)
+            if H < ps or W < ps:
+                continue
+            for _ in range(patches_per_image):
+                px = rng.randint(0, W - ps)
+                py = rng.randint(0, H - ps)
+                candidates.append((sample_idx, px, py, 0.0))
+        rng.shuffle(candidates)
+        self._patch_list.extend(candidates[:count])
+        rng.shuffle(self._patch_list)
 
     def _build_index(
         self,
@@ -883,9 +953,18 @@ def validate_sliding_window(
                 logits = model(batch_tensor).squeeze(1)
                 probs = torch.sigmoid(logits).cpu().numpy()
                 for i_b, (py, px, _) in enumerate(batch_items):
-                    y2, x2 = min(py + ps, h), min(px + ps, w)
                     score = float(probs[i_b])
-                    heatmap[py:y2, px:x2] = np.maximum(heatmap[py:y2, px:x2], score)
+                    # Write the score to the CENTER 1/3 of the patch only.
+                    # This is consistent with the training label definition:
+                    # positive = GT center falls in [px+ps/3, px+2ps/3) x [py+ps/3, py+2ps/3).
+                    # Full-patch marking (prior) created ~342px blobs; IoU with
+                    # a 100px GT box was ~0.07 (<0.1 threshold). Center-1/3 marking
+                    # creates ~172px blobs; IoU with a 100px GT box is ~0.34.
+                    cy1 = py + ps // 3
+                    cy2 = min(py + 2 * ps // 3, h)
+                    cx1 = px + ps // 3
+                    cx2 = min(px + 2 * ps // 3, w)
+                    heatmap[cy1:cy2, cx1:cx2] = np.maximum(heatmap[cy1:cy2, cx1:cx2], score)
 
             # Evaluate at each threshold
             for thresh in multi_thresholds:
@@ -1048,6 +1127,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument("--neg-image-patch-count", type=int, default=0, help="Number of patches to sample from true negative images (no GT boxes) per epoch. 0 disables (legacy behavior).")
     parser.add_argument("--hide-progress-bar", action="store_true", help="Suppress tqdm progress bars")
 
     return parser.parse_args()
@@ -1108,8 +1188,11 @@ def main() -> None:
         f"| Val: {val_summary['images']} images (pos={val_summary['positive_images']}, neg={val_summary['negative_images']})"
     )
     print(f"Train patients: {split_summary['train_patients']} | Val patients: {split_summary['val_patients']}")
-    print(f"Positive training images: {len(train_pos_indices)}")
+    train_neg_indices = [i for i in train_indices if train_dataset.samples[i].boxes.size == 0]
+    print(f"Positive training images: {len(train_pos_indices)} | Negative training images: {len(train_neg_indices)}")
     print(f"Positive val images (used for validation): {len(val_pos_indices)}")
+    if args.neg_image_patch_count > 0:
+        print(f"Neg-image patch count per epoch: {args.neg_image_patch_count}")
     print(f"Device: {device}")
     print(f"Patch size: {args.patch_size} | Stride: {args.stride}")
     print(f"Max pos/image: {args.max_pos_per_image} | Pos-neg ratio: {args.pos_neg_ratio}")
@@ -1131,17 +1214,19 @@ def main() -> None:
     best_epoch = -1
 
     for epoch in range(int(args.epochs)):
-        print(f"\n{'─' * 72}")
+        print(f"\n{'-' * 72}")
         print(f"Epoch {epoch + 1} / {args.epochs}")
-        print(f"{'─' * 72}")
+        print(f"{'-' * 72}")
         # Build a new PatchDataset each epoch for varied negative sampling
         patch_dataset = PatchDataset(
             samples=train_dataset.samples,
             pos_indices=train_pos_indices,
+            neg_indices=train_neg_indices,
             patch_size=int(args.patch_size),
             stride=int(args.stride),
             max_pos_per_image=int(args.max_pos_per_image),
             pos_neg_ratio=float(args.pos_neg_ratio),
+            neg_image_patch_count=int(args.neg_image_patch_count),
             augment=bool(args.augment),
             hflip_prob=float(args.aug_hflip_prob),
             brightness_delta=float(args.aug_brightness_delta),
@@ -1217,7 +1302,7 @@ def main() -> None:
                     "stride": int(args.stride),
                 },
             )
-            print(f"  [Checkpoint] Saved (BestThreshF1={best_metric:.4f}) → {save_path}")
+            print(f"  [Checkpoint] Saved (BestThreshF1={best_metric:.4f}) -> {save_path}")
         else:
             no_improve += 1
             if int(args.patience) > 0 and no_improve >= int(args.patience):
