@@ -8,12 +8,12 @@ python src/data/bounding-box/bbox-train-D.py \
     --lr 1e-3 \
     --patch-size 256 \
     --stride 64 \
-    --max-pos-per-image 24 \
+    --max-pos-per-image 8 \
     --pos-neg-ratio 3.0 \
     --neg-image-patch-count 5000 \
     --clf-pos-weight 5.0 \
     --val-heatmap-threshold 0.5 \
-    --val-heatmap-dilation 5 \
+    --val-heatmap-dilation 15 \
     --val-iou-threshold 0.1 \
     --augment \
     --aug-hflip-prob 0.5 \
@@ -94,6 +94,22 @@ rec_44_upd_1：分析首轮训练（Best F1=0.4817, Recall=46%）后的针对性
 - --neg-image-patch-count 0→5000（新参数，默认 0 保留旧行为）
 - --val-heatmap-dilation 15→5（中心1/3 blob 更小，不需要大膨胀）
 - --patience 15→20
+
+================
+
+rec_44_upd_2：分析 rec_44_upd_1（Best F1=0.4265, Recall=55%）后的修复：
+
+问题根因——dilation 过小导致热图 blob 碎裂，FP 从 141 暴增到 326：
+  中心 1/3 写入区域为 85×85px，stride=64px，相邻两个 stride 距离之外（128px）
+  的 patch 写区域完全不相交（gap=43px）。dilation 从 15→5 后无法桥接碎裂
+  blob，同一病灶区域产生 2-4 个独立预测框，大量 FP。修复：恢复 dilation=15。
+
+同时恢复 max-pos-per-image 8，减小训练集体积（每 epoch ~38k vs ~113k patch），
+缓解 loss 持续下降但 val F1 不跟随的过拟合现象（epoch 4 触顶即 early stop）。
+
+参数变化（相对 rec_44_upd_1）：
+- --max-pos-per-image 24→8（恢复原值）
+- --val-heatmap-dilation 5→15（恢复原值）
 
 """
 
