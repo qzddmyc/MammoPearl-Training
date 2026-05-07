@@ -10,8 +10,8 @@ python src/data/bounding-box/bbox-train-D.py \
     --stride 64 \
     --max-pos-per-image 8 \
     --pos-neg-ratio 3.0 \
-    --neg-image-patch-count 5000 \
-    --clf-pos-weight 2.0 \
+    --neg-image-patch-count 0 \
+    --clf-pos-weight 5.0 \
     --val-heatmap-threshold 0.5 \
     --val-heatmap-dilation 15 \
     --val-iou-threshold 0.1 \
@@ -124,6 +124,26 @@ rec_44_upd_3：分析 rec_44_upd_2（Best F1=0.4741, Recall=50.6%, FP=199 @ thre
 
 参数变化（相对 rec_44_upd_2）：
 - --clf-pos-weight 5.0→2.0
+
+================
+
+rec_44_upd_4：分析 rec_44_upd_3（Best F1=0.4534, Recall=57%, FP=298 @ thresh=0.5）后的修复：
+
+问题根因——neg-image 采样无助于降 FP，且 pos_weight 钟摆效应持续：
+  四轮对照发现，FP 最低的是 rec_44（无 neg-image、pos_weight=5），FP=141。
+  加入 5000 张阴性图像 patch 后 FP 反而升高（199→298），说明：
+  1. "完全正常"的乳腺 patch 是易负样本，无法强化模型对困难负区域的判别；
+     真正有效的负样本是正样本图中的非病灶区域（硬负样本），原机制本就提供。
+  2. pos_weight 在 2.0 和 5.0 之间来回调整，本质是在调整分数校准而非改变
+     模型真实的 Recall/Precision 能力——需要一次纯净的对照实验。
+  方案：去掉 neg-image 采样（恢复 0），恢复 pos_weight=5.0，保留中心 1/3
+  热图修复。这是对 rec_44 唯一的改动，可直接检验热图修复的净收益。
+
+预期：Recall 57%（已稳定）+ FP ≈ 141（rec_44 基线）→ F1 ≈ 0.55+
+
+参数变化（相对 rec_44_upd_3）：
+- --clf-pos-weight 2.0→5.0（恢复）
+- --neg-image-patch-count 5000→0（恢复）
 
 """
 
