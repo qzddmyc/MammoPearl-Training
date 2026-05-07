@@ -11,7 +11,7 @@ Typical workflow
 python tools/mine_fp.py \
     --model-path models/bbox_resnet50.D.pth \
     --out-csv    tmp/fp_mining.csv \
-    --split      train \
+    --split      training \
     --patch-size 256 \
     --stride     64 \
     --fp-threshold 0.5 \
@@ -127,7 +127,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--csv-path",      type=Path,  default=REPO_ROOT / "data" / "raw" / "vindr_detection_folds.csv")
     p.add_argument("--images-root",   type=Path,  default=REPO_ROOT / "data" / "processed" / "images_png")
     p.add_argument("--out-csv",       type=Path,  default=REPO_ROOT / "tmp" / "fp_mining.csv")
-    p.add_argument("--split",         type=str,   default="train")
+    p.add_argument("--split",         type=str,   default="training")
     p.add_argument("--patch-size",    type=int,   default=256)
     p.add_argument("--stride",        type=int,   default=64)
     p.add_argument("--fp-threshold",  type=float, default=0.5,  help="Min model score to consider a patch as FP candidate")
