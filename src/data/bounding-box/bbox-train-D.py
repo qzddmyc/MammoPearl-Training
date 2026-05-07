@@ -22,6 +22,9 @@ python src/data/bounding-box/bbox-train-D.py \
     --medical-backbone-path models/raw/ResNet50.pt \
     --hide-progress-bar
 
+# 若有 FP Mining CSV（先跑 tools/mine_fp.py 生成），追加以下参数：
+#     --fp-mining-csv tmp/fp_mining.csv
+
 
 架构彻底切换：将检测问题重构为 patch 级滑窗二分类（rec_44）：
 
@@ -144,6 +147,24 @@ rec_44_upd_4：分析 rec_44_upd_3（Best F1=0.4534, Recall=57%, FP=298 @ thresh
 参数变化（相对 rec_44_upd_3）：
 - --clf-pos-weight 2.0→5.0（恢复）
 - --neg-image-patch-count 5000→0（恢复）
+
+================
+
+rec_44_upd_5：可视化分析（tools/vis_heatmap.py）揭示两类 FP：
+  A. 病灶附近碎裂框（dilation 不足桥接）→ 已由 dilation=15 部分缓解
+  B. 腺体内部误报（致密腺体与病灶 patch 纹理相似，模型以亮度为代理特征）
+     → dilation/pos_weight 调参无法解决，需要模型见过这些"腺体内难负样本"
+
+修复方向 C——FP Mining（硬负样本挖掘）：
+  新增工具 tools/mine_fp.py，对已训练模型跑训练集推理，收集所有
+  置信度 > fp_threshold 且与 GT IoU < iou_threshold 的 patch 坐标，
+  写入 CSV（image_path, px, py, score）。
+  新增参数 --fp-mining-csv（默认 None）：若指定，在 PatchDataset 构建时
+  将 CSV 中所有 patch 作为标签=0 的硬负样本加入训练集。
+  默认值 None 完全向后兼容，不影响不使用该功能的训练。
+
+新增参数：
+- --fp-mining-csv（默认 None，Path 类型）
 
 """
 
@@ -484,6 +505,7 @@ class PatchDataset(torch.utils.data.Dataset):
         max_pos_per_image: int = 8,
         pos_neg_ratio: float = 3.0,
         neg_image_patch_count: int = 0,
+        fp_mining_csv: "Optional[Path]" = None,
         augment: bool = False,
         hflip_prob: float = 0.5,
         brightness_delta: float = 0.2,
@@ -500,6 +522,48 @@ class PatchDataset(torch.utils.data.Dataset):
         self._build_index(pos_indices, stride, max_pos_per_image, pos_neg_ratio, seed, epoch)
         if neg_image_patch_count > 0 and neg_indices:
             self._add_neg_image_patches(neg_indices, neg_image_patch_count, seed, epoch)
+        if fp_mining_csv is not None:
+            self._load_fp_patches(Path(fp_mining_csv))
+
+    def _load_fp_patches(self, csv_path: "Path") -> None:
+        """Load FP patch coordinates from a mine_fp.py output CSV.
+
+        Each row in the CSV provides an absolute image_path and patch top-left
+        coordinates (px, py).  All loaded patches are assigned label=0.0 and
+        appended to _patch_list.
+
+        The CSV must have columns: image_path, px, py, score
+        (produced by tools/mine_fp.py).
+
+        The sample index is looked up by image_path.  Patches whose image_path
+        does not appear in self.samples are silently skipped.
+        """
+        import csv as _csv
+        # Build a lookup: absolute image_path string -> sample_idx
+        path_to_idx: Dict[str, int] = {
+            str(s.image_path.resolve()): i for i, s in enumerate(self.samples)
+        }
+        loaded = 0
+        try:
+            with open(csv_path, newline="", encoding="utf-8") as f:
+                reader = _csv.DictReader(f)
+                for row in reader:
+                    img_path_str = str(Path(row["image_path"]).resolve())
+                    sample_idx = path_to_idx.get(img_path_str)
+                    if sample_idx is None:
+                        continue
+                    try:
+                        px = int(row["px"])
+                        py = int(row["py"])
+                    except (ValueError, KeyError):
+                        continue
+                    self._patch_list.append((sample_idx, px, py, 0.0))
+                    loaded += 1
+        except FileNotFoundError:
+            print(f"[Warning] FP mining CSV not found: {csv_path}")
+            return
+        random.shuffle(self._patch_list)
+        print(f"[Info] Loaded {loaded} FP mining patches from {csv_path}")
 
     def _add_neg_image_patches(
         self,
@@ -1178,6 +1242,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--neg-image-patch-count", type=int, default=0, help="Number of patches to sample from true negative images (no GT boxes) per epoch. 0 disables (legacy behavior).")
+    parser.add_argument("--fp-mining-csv", type=Path, default=None, help="Path to FP mining CSV produced by tools/mine_fp.py. Patches in this CSV are added as hard negatives (label=0) every epoch. Default None disables (backward compatible).")
     parser.add_argument("--hide-progress-bar", action="store_true", help="Suppress tqdm progress bars")
 
     return parser.parse_args()
@@ -1277,6 +1342,7 @@ def main() -> None:
             max_pos_per_image=int(args.max_pos_per_image),
             pos_neg_ratio=float(args.pos_neg_ratio),
             neg_image_patch_count=int(args.neg_image_patch_count),
+            fp_mining_csv=args.fp_mining_csv,
             augment=bool(args.augment),
             hflip_prob=float(args.aug_hflip_prob),
             brightness_delta=float(args.aug_brightness_delta),
