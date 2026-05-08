@@ -506,6 +506,7 @@ class PatchDataset(torch.utils.data.Dataset):
         pos_neg_ratio: float = 3.0,
         neg_image_patch_count: int = 0,
         fp_mining_csv: "Optional[Path]" = None,
+        fp_mining_max: int = 0,
         augment: bool = False,
         hflip_prob: float = 0.5,
         brightness_delta: float = 0.2,
@@ -523,9 +524,9 @@ class PatchDataset(torch.utils.data.Dataset):
         if neg_image_patch_count > 0 and neg_indices:
             self._add_neg_image_patches(neg_indices, neg_image_patch_count, seed, epoch)
         if fp_mining_csv is not None:
-            self._load_fp_patches(Path(fp_mining_csv))
+            self._load_fp_patches(Path(fp_mining_csv), max_patches=fp_mining_max)
 
-    def _load_fp_patches(self, csv_path: "Path") -> None:
+    def _load_fp_patches(self, csv_path: "Path", max_patches: int = 0) -> None:
         """Load FP patch coordinates from a mine_fp.py output CSV.
 
         Each row in the CSV provides an absolute image_path and patch top-left
@@ -535,6 +536,9 @@ class PatchDataset(torch.utils.data.Dataset):
         The CSV must have columns: image_path, px, py, score
         (produced by tools/mine_fp.py).
 
+        If max_patches > 0, only the top-max_patches rows by score (descending)
+        are kept, so the hardest false positives are prioritised.
+
         The sample index is looked up by image_path.  Patches whose image_path
         does not appear in self.samples are silently skipped.
         """
@@ -543,7 +547,7 @@ class PatchDataset(torch.utils.data.Dataset):
         path_to_idx: Dict[str, int] = {
             str(s.image_path.resolve()): i for i, s in enumerate(self.samples)
         }
-        loaded = 0
+        rows_buf: "List[Tuple[int, int, int, float]]" = []
         try:
             with open(csv_path, newline="", encoding="utf-8") as f:
                 reader = _csv.DictReader(f)
@@ -555,15 +559,22 @@ class PatchDataset(torch.utils.data.Dataset):
                     try:
                         px = int(row["px"])
                         py = int(row["py"])
+                        score = float(row["score"])
                     except (ValueError, KeyError):
                         continue
-                    self._patch_list.append((sample_idx, px, py, 0.0))
-                    loaded += 1
+                    rows_buf.append((sample_idx, px, py, score))
         except FileNotFoundError:
             print(f"[Warning] FP mining CSV not found: {csv_path}")
             return
+        # Sort by score descending and cap if requested
+        rows_buf.sort(key=lambda x: x[3], reverse=True)
+        if max_patches > 0:
+            rows_buf = rows_buf[:max_patches]
+        for sample_idx, px, py, score in rows_buf:
+            self._patch_list.append((sample_idx, px, py, 0.0))
         random.shuffle(self._patch_list)
-        print(f"[Info] Loaded {loaded} FP mining patches from {csv_path}")
+        cap_msg = f" (capped at {max_patches})" if max_patches > 0 else ""
+        print(f"[Info] Loaded {len(rows_buf)} FP mining patches from {csv_path}{cap_msg}")
 
     def _add_neg_image_patches(
         self,
@@ -1243,6 +1254,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--neg-image-patch-count", type=int, default=0, help="Number of patches to sample from true negative images (no GT boxes) per epoch. 0 disables (legacy behavior).")
     parser.add_argument("--fp-mining-csv", type=Path, default=None, help="Path to FP mining CSV produced by tools/mine_fp.py. Patches in this CSV are added as hard negatives (label=0) every epoch. Default None disables (backward compatible).")
+    parser.add_argument("--fp-mining-max", type=int, default=5000, help="Maximum number of FP mining patches to load from --fp-mining-csv. Rows are sorted by score descending so the hardest FPs are kept. 0 = no cap (use all rows). Default 5000.")
     parser.add_argument("--hide-progress-bar", action="store_true", help="Suppress tqdm progress bars")
 
     return parser.parse_args()
@@ -1343,6 +1355,7 @@ def main() -> None:
             pos_neg_ratio=float(args.pos_neg_ratio),
             neg_image_patch_count=int(args.neg_image_patch_count),
             fp_mining_csv=args.fp_mining_csv,
+            fp_mining_max=int(args.fp_mining_max),
             augment=bool(args.augment),
             hflip_prob=float(args.aug_hflip_prob),
             brightness_delta=float(args.aug_brightness_delta),
