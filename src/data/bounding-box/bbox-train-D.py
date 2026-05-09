@@ -1149,7 +1149,8 @@ def validate_sliding_window(
         fp = multi_stats[thresh]["fp"]
         fn = multi_stats[thresh]["fn"]
         f1 = f1_per_thresh[thresh]
-        parts.append(f"@{thresh}: TP={tp} FP={fp} F1={f1:.4f}")
+        recall_t = tp / max(tp + fn, 1)
+        parts.append(f"@{thresh}: TP={tp} FP={fp} FN={fn} Rec={recall_t:.3f} F1={f1:.4f}")
     print(f"  [Val] GT_boxes={total_gt_boxes} | {' | '.join(parts)}")
     print(f"  [BestThresh] F1={best_f1:.4f} @ thresh={best_thresh}")
 
@@ -1434,10 +1435,12 @@ def main() -> None:
         best_tp = int(val_metrics.get(f"tp@{best_thresh}", 0))
         best_fp = int(val_metrics.get(f"fp@{best_thresh}", 0))
         best_fn = int(val_metrics.get(f"fn@{best_thresh}", 0))
+        best_recall = best_tp / max(best_tp + best_fn, 1)
+        best_prec = best_tp / max(best_tp + best_fp, 1)
         print(
             f"Epoch {epoch + 1}/{args.epochs} | loss={avg_loss:.4f} | "
             f"BestThreshF1={monitor_metric:.4f} @ thresh={best_thresh} "
-            f"(TP={best_tp} FP={best_fp} FN={best_fn}) | "
+            f"(TP={best_tp} FP={best_fp} FN={best_fn} Recall={best_recall:.3f} Prec={best_prec:.3f}) | "
             f"lr={lr_scheduler.get_last_lr()[0]:.6f}"
         )
 
@@ -1457,7 +1460,7 @@ def main() -> None:
                     "stride": int(args.stride),
                 },
             )
-            print(f"  [Checkpoint] Saved (BestThreshF1={best_metric:.4f}) -> {save_path}")
+            print(f"  [Checkpoint] Epoch {epoch + 1} | Saved (BestThreshF1={best_metric:.4f}) -> {save_path}")
         else:
             no_improve += 1
             if int(args.patience) > 0 and no_improve >= int(args.patience):
