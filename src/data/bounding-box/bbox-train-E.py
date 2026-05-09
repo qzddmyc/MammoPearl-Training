@@ -427,8 +427,12 @@ def build_unet(
                 k: v for k, v in imagenet_model.state_dict().items()
                 if not k.startswith("fc")
             }
-            missing, unexpected = model.encoder.load_state_dict(encoder_sd, strict=False)
-            print(f"[Info] Loaded ImageNet weights into encoder (missing={len(missing)}, unexpected={len(unexpected)})")
+            _result = model.encoder.load_state_dict(encoder_sd, strict=False)
+            if _result is not None:
+                missing, unexpected = _result
+                print(f"[Info] Loaded ImageNet weights into encoder (missing={len(missing)}, unexpected={len(unexpected)})")
+            else:
+                print("[Info] Loaded ImageNet weights into encoder.")
         except Exception as exc:
             print(f"[Warning] Could not load ImageNet weights into encoder: {exc}")
 
@@ -448,8 +452,12 @@ def build_unet(
                 if m and m.group(1) in _idx_to_resnet:
                     k = f"{_idx_to_resnet[m.group(1)]}.{m.group(2)}"
                 stripped[k] = v
-            missing, unexpected = model.encoder.load_state_dict(stripped, strict=False)
-            print(f"[Info] Loaded RadImageNet backbone into encoder (missing={len(missing)}, unexpected={len(unexpected)})")
+            _result = model.encoder.load_state_dict(stripped, strict=False)
+            if _result is not None:
+                missing, unexpected = _result
+                print(f"[Info] Loaded RadImageNet backbone into encoder (missing={len(missing)}, unexpected={len(unexpected)})")
+            else:
+                print("[Info] Loaded RadImageNet backbone into encoder.")
         except Exception as exc:
             print(f"[Warning] Could not load medical backbone ({exc}). Keeping ImageNet weights.")
 
@@ -753,9 +761,9 @@ def main() -> None:
             pass
 
     for epoch in range(int(args.epochs)):
-        print(f"\n{'─' * 72}")
+        print(f"\n{'-' * 72}")
         print(f"Epoch {epoch + 1} / {args.epochs}")
-        print(f"{'─' * 72}")
+        print(f"{'-' * 72}")
 
         train_dataset = SegDataset(
             samples=all_samples,
