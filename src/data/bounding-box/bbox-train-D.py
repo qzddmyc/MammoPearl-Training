@@ -7,7 +7,7 @@ python src/data/bounding-box/bbox-train-D.py \
     --batch-size 64 \
     --lr 1e-3 \
     --patch-size 256 \
-    --stride 64 \
+    --stride 32 \
     --max-pos-per-image 8 \
     --pos-neg-ratio 3.0 \
     --neg-image-patch-count 0 \
@@ -165,6 +165,32 @@ rec_44_upd_5：可视化分析（tools/vis_heatmap.py）揭示两类 FP：
 
 新增参数：
 - --fp-mining-csv（默认 None，Path 类型）
+
+================
+
+rec_44_upd_6：分析 rec_44_upd_5（FP Mining 方案，Best F1=0.3794）失败后的调整：
+
+FP Mining + pos_weight=5 组合导致梯度冲突：
+  FP mining patch 均为 score 接近 1.0 的高置信度样本，标签却为 0；
+  pos_weight=5 同时强推正样本打高分，与 FP mining 梯度方向相互对抗，
+  导致训练 loss 比 upd_4 高出 39%（1.007 vs 0.725），模型学不到有效信息。
+
+当前五轮实验的核心瓶颈：
+  Recall 卡在 46-57%，根本原因是 stride=64 的滑窗覆盖密度不足。
+  病灶 GT box 典型尺寸 100px，中心 1/3 写入区域 85px，步长 64px 时
+  小病灶附近可能只有 1-2 个 patch 以 IoU>0.1 覆盖其中心，漏检率高。
+
+修复：stride 从 64→32（覆盖密度 ×4），使得：
+  - 每个位置被更多 patch 覆盖，小病灶 Recall 预期提升
+  - 热图 blob 更密集（相邻 patch 中心 1/3 区域自然重叠），dilation 效果更稳定
+  - FP mining 停用（回到 upd_4 的干净基线）
+
+参数变化（相对 rec_44_upd_5/upd_4）：
+- --stride 64→32
+- --fp-mining-csv 停用（不传此参数）
+
+代价：验证推理时间 ×4（每张图 patch 数量 ×4），训练时间基本不变
+（max-pos-per-image=8 限制正 patch 数，负 patch 数按比例，总量不变）
 
 """
 
