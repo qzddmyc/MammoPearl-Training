@@ -432,6 +432,10 @@ Prompts for improvement:
 44. 架构彻底切换：将检测问题重构为 patch 级滑窗二分类（rec_44）
     【此文件未作修改，完整实现在分支文件 bbox-train-D.py 中】
 
+-----------
+45. 方向 E：U-Net 全图分割检测
+    【此文件未作修改，完整实现在分支文件 bbox-train-E.py 中】
+
 """
 
 from __future__ import annotations
