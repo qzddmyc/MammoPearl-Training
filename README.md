@@ -63,7 +63,7 @@ bash ./build_dataset.sh
     • CLAHE 对比度增强（提升局部微小病灶可见度）
     │
     ▼
-[Stage 1 — 病灶框检测]  src/data/bounding-box/
+[Stage 1 - 病灶框检测]  src/data/bounding-box/
     • 模型：RetinaNet (ResNet-50 FPN v2)
     • 目标：高召回率（漏检不可接受，误报可容忍）
     • 输出：病灶候选框列表 + 各框置信度分数
@@ -73,7 +73,7 @@ bash ./build_dataset.sh
     └─── 检出病灶框  → 框位置 + 置信度作为附加特征
                               │
                               ▼
-                    [Stage 2 — 患病分类]  （下游，待实现）
+                    [Stage 2 - 患病分类]  （下游，待实现）
                         • 输入：原图 + 病灶框位置 + 置信度
                         • 目标：判断是否患病 / 病灶类型
                         • 病灶框的存在及置信度作为先验权重
