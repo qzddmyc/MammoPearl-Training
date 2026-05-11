@@ -1,8 +1,8 @@
 # 乳腺癌传统机器学习分类系统
 
-> **数据集**：VinDr Mammography（经处理版本）  
-> **方法**：手工特征 + 传统机器学习（无深度学习依赖）  
-> **代码目录**：`src/data/recognition-traditional/`  
+> **数据集**：VinDr Mammography（经处理版本）
+> **方法**：手工特征 + 传统机器学习（无深度学习依赖）
+> **代码目录**：`src/data/recognition-traditional/`
 > **入口脚本**：`run_pipeline.py`
 
 ---
@@ -15,7 +15,7 @@
 原始影像
   │
   ▼
-[Step 0] 分割乳腺区域（生成掩码）
+[Step 0] 分割乳腺区域（可选，生成掩码，当前未接入采样流程）
   │
   ▼
 [Step 1] 采样——把图像切成一个个 128×128 的小块
@@ -298,25 +298,24 @@ src/data/recognition-traditional/
 
 ```bash
 # 完整训练（Stage-1 + Stage-2）
-# --skip-mask：掩码当前未被采样逻辑使用，跳过生成节省时间
-python src/data/recognition-traditional/run_pipeline.py --skip-mask
+python src/data/recognition-traditional/run_pipeline.py
 
 # 只训练 Stage-1
-python src/data/recognition-traditional/run_pipeline.py --stage 1 --skip-mask
+python src/data/recognition-traditional/run_pipeline.py --stage 1
 
 # 只训练 Stage-2（需要已有 Stage-1 模型）
-python src/data/recognition-traditional/run_pipeline.py --stage 2 --skip-mask
+python src/data/recognition-traditional/run_pipeline.py --stage 2
 
 # 只跑评估（复用已保存的模型）
-python src/data/recognition-traditional/run_pipeline.py --eval-only --skip-mask
+python src/data/recognition-traditional/run_pipeline.py --eval-only
 
 # 对单张图像做滑窗检测
 python src/data/recognition-traditional/run_pipeline.py \
     --infer data/processed/images_png/<patient_id>/<image_id>.png \
     --stride 32 --nms-iou 0.3
 
-# 强制重新生成乳腺掩码
-python src/data/recognition-traditional/run_pipeline.py --force-mask
+# 先生成乳腺掩码再训练（但掩码生成与否与训练本身无关）
+python src/data/recognition-traditional/run_pipeline.py --generate-mask
 ```
 
 ---
@@ -325,8 +324,8 @@ python src/data/recognition-traditional/run_pipeline.py --force-mask
 
 1. **特征缓存**：基础特征（Stage-1 用）在首次提取后保存为 `.npy`；修改了 `STAGE2_MERGE_MAP` 后需手动删除缓存（`output/features/` 下的 `.npy` 文件），否则标签不会更新。
 
-2. **掩码现状（已知问题）**：`generate_masks()` 可以生成乳腺区域掩码，但 `build_dataset()` 的采样逻辑**目前没有读取这些掩码**——难负样本挖掘直接用积分图法在全图最亮区域采样，没有用掩码限制采样范围。因此，即使不生成掩码，采样和训练结果也完全相同，这也是命令中默认加 `--skip-mask` 的原因。如需改进（比如排除图像四角的黑色背景区域，只在乳腺内部采样），需要在 `build_dataset()` 里加入掩码读取和应用的逻辑。
+2. **掩码生成（当前未接入采样）**：默认不生成掩码；如需生成请加 `--generate-mask`，但掩码当前未被采样逻辑实际使用——`build_dataset()` 的难负样本挖掘用积分图法在全图采样，不依赖掩码文件。如需改进，需在 `build_dataset()` 里加入掩码读取和边界过滤的逻辑。
 
-3. **唯一外部依赖**：整个传统 ML 模块只有掩码生成步骤需要调用 `src/data/segment/segment.py`，其余模块均自包含。
+3. **外部依赖**：整个传统 ML 模块自包含，唯一例外是掩码生成步骤依赖 `src/data/segment/segment.py`，需单独安装其依赖环境（仅使用 `--generate-mask` 时才需要）。
 
 4. **image_id 含后缀**：CSV 中 `image_id` 字段已包含 `.png`，路径拼接时不需要再额外加后缀。

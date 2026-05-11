@@ -30,10 +30,10 @@ python src/data/segment/segment-test.py
 
 基于手工特征（GLCM 纹理、LBP、Wavelet、Gabor 滤波等）和传统机器学习算法（SVM + XGBoost），实现了一套无深度学习依赖的双阶段乳腺癌分类系统。
 
-代码位于 `src/data/recognition-traditional/`，完整训练命令（`--skip-mask` 表示跳过掩码生成，掩码当前未被采样逻辑实际使用）：
+代码位于 `src/data/recognition-traditional/`，完整训练命令：
 
 ```bash
-python src/data/recognition-traditional/run_pipeline.py --skip-mask
+python src/data/recognition-traditional/run_pipeline.py
 ```
 
 详细说明（特征提取方法、训练成果、算法说明）请参见 [docs/recognition-traditional.md](./recognition-traditional.md)。

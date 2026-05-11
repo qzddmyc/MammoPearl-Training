@@ -14,7 +14,12 @@
 *.bak
 *.zip
 
-src/data/recognition-traditional/output/
+/src/data/recognition-traditional/output/features/*
+!/src/data/recognition-traditional/output/features/.gitkeep
+/src/data/recognition-traditional/output/models/*
+!/src/data/recognition-traditional/output/models/.gitkeep
+/src/data/recognition-traditional/output/reports/*
+!/src/data/recognition-traditional/output/reports/.gitkeep
 
 /tmp/
 

@@ -2,11 +2,11 @@
 
 Usage
 -----
-# Full pipeline (generate masks → train → evaluate)
+# Full pipeline (train → evaluate), no mask generation
 python run_pipeline.py
 
-# Skip mask generation (masks already exist)
-python run_pipeline.py --skip-mask
+# Generate breast-region masks before training
+python run_pipeline.py --generate-mask
 
 # Only run evaluation with pre-trained models
 python run_pipeline.py --eval-only
@@ -141,9 +141,9 @@ def build_features(split: str, extended: bool = False) -> tuple[np.ndarray, np.n
 # Pipeline stages
 # ---------------------------------------------------------------------------
 
-def run_stage1(skip_mask: bool = False, force_retrain: bool = False) -> None:
-    """Generate masks → build features → train Stage-1."""
-    if not skip_mask:
+def run_stage1(generate_mask: bool = False, force_retrain: bool = False) -> None:
+    """Generate masks (optional) → build features → train Stage-1."""
+    if generate_mask:
         generate_masks()
 
     X_train, y1_train, _ = build_features("training", extended=False)
@@ -423,10 +423,10 @@ def _parse_args() -> argparse.Namespace:
         description="Traditional breast-cancer classification pipeline"
     )
     parser.add_argument(
-        "--skip-mask",
+        "--generate-mask",
         action="store_true",
         default=False,
-        help="Skip mask generation (masks already exist in data/segmented/).",
+        help="Generate breast-region masks before training (requires src/data/segment/segment.py).",
     )
     parser.add_argument(
         "--eval-only",
@@ -440,12 +440,6 @@ def _parse_args() -> argparse.Namespace:
         choices=[1, 2],
         default=None,
         help="Run only a specific stage (1 or 2). Default: run both stages.",
-    )
-    parser.add_argument(
-        "--force-mask",
-        action="store_true",
-        default=False,
-        help="Force mask regeneration even if masks already exist.",
     )
     parser.add_argument(
         "--infer",
@@ -480,15 +474,13 @@ def main() -> None:
         run_eval_only()
         return
 
-    skip_mask = args.skip_mask and not args.force_mask
-
     if args.stage == 1:
-        run_stage1(skip_mask=skip_mask)
+        run_stage1(generate_mask=args.generate_mask)
     elif args.stage == 2:
         run_stage2()
     else:
         # Full pipeline
-        run_stage1(skip_mask=skip_mask)
+        run_stage1(generate_mask=args.generate_mask)
         run_stage2()
 
 

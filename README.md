@@ -27,7 +27,7 @@ MammoPearl-Training/
 │       ├── pre-process/    # 数据预处理
 │       ├── segment/        # 图像分隔
 │       ├── bounding-box/   # 深度学习路线 - 病灶框检测
-│       └── recognition-traditional/  # 传统 ML 路线 - 病灶分类
+│       └── recognition-traditional/  # 传统机器学习路线 - 病灶分类
 │
 ├── tools/                  # 工具文件
 ├── models/                 # 训练产出的模型
@@ -84,7 +84,7 @@ bash ./build_dataset.sh
 
 **设计逻辑**：Stage 1 只负责"是否有可疑区域"及"在哪里"，Stage 2 利用这些位置信息进行更精确的患病判断。
 
-### 传统 ML 路线
+### 传统机器学习路线
 
 独立于深度学习路线，采用 **两阶段级联** 策略完成病灶分类。
 
