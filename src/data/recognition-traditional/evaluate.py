@@ -17,7 +17,7 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
-from config import FINDING_COLS, REPORT_DIR
+from config import FINDING_COLS, REPORT_DIR, STAGE2_MERGED_NAMES
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +82,7 @@ def evaluate_stage2(
     """
     if class_names is None:
         all_classes = sorted(set(y_true.tolist()) | set(y_pred.tolist()))
-        class_names = [FINDING_COLS[c] if 0 <= c < len(FINDING_COLS) else str(c)
+        class_names = [STAGE2_MERGED_NAMES[c] if 0 <= c < len(STAGE2_MERGED_NAMES) else str(c)
                        for c in all_classes]
 
     kappa = float(cohen_kappa_score(y_true, y_pred))

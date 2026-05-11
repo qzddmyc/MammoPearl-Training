@@ -95,3 +95,40 @@ STAGE1_DECISION_THRESHOLD = 0.3
 # Stage-2 (multi-class) training parameters
 # ---------------------------------------------------------------------------
 STAGE2_MODEL = "xgboost"       # "xgboost" | "lightgbm"
+
+# Merge mapping: original 10-class index → 4 merged class index.
+# Rationale: classes with very few training samples cannot be learned
+# reliably; grouping by clinical similarity improves model coverage.
+# Focal_Asymmetry is kept with other asymmetry types because separating
+# it (50 vs 52 samples) hurt Macro F1 significantly (0.568 → 0.449).
+#
+# Original index → FINDING_COLS[index]
+#   0  Architectural_Distortion  ┐
+#   1  Asymmetry                 ├─→ 0  Asymmetry_Distortion  (~102 test)
+#   2  Focal_Asymmetry           │
+#   3  Global_Asymmetry          ┘
+#   4  Mass                      ──→ 1  Mass                  (~232 test)
+#   5  Nipple_Retraction         ┐
+#   6  Skin_Retraction           ├─→ 2  Skin_Other            (~20 test)
+#   7  Skin_Thickening           │
+#   9  Suspicious_Lymph_Node     ┘
+#   8  Suspicious_Calcification  ──→ 3  Suspicious_Calcification (~86 test)
+STAGE2_MERGE_MAP: dict[int, int] = {
+    0: 0,  # Architectural_Distortion  → Asymmetry_Distortion
+    1: 0,  # Asymmetry                 → Asymmetry_Distortion
+    2: 0,  # Focal_Asymmetry           → Asymmetry_Distortion
+    3: 0,  # Global_Asymmetry          → Asymmetry_Distortion
+    4: 1,  # Mass                      → Mass
+    5: 2,  # Nipple_Retraction         → Skin_Other
+    6: 2,  # Skin_Retraction           → Skin_Other
+    7: 2,  # Skin_Thickening           → Skin_Other
+    8: 3,  # Suspicious_Calcification  → Suspicious_Calcification
+    9: 2,  # Suspicious_Lymph_Node     → Skin_Other
+}
+
+STAGE2_MERGED_NAMES: list[str] = [
+    "Asymmetry_Distortion",     # 0
+    "Mass",                     # 1
+    "Skin_Other",               # 2
+    "Suspicious_Calcification", # 3
+]

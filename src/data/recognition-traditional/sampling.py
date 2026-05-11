@@ -46,6 +46,7 @@ from config import (
     PATCH_SIZE,
     RANDOM_SEED,
     SEGMENTED_ROOT,
+    STAGE2_MERGE_MAP,
 )
 
 
@@ -163,17 +164,17 @@ def _load_image(patient_id: str, image_id: str) -> np.ndarray | None:
 
 
 def _stage2_label(row: pd.Series) -> int:
-    """Return the Stage-2 class index for a disease row.
+    """Return the merged Stage-2 class index for a disease row.
 
-    If multiple finding columns are set, the first match in FINDING_COLS
-    order is used as the primary label.  Returns -1 for 'No Finding'.
+    Returns the STAGE2_MERGE_MAP value for the first active FINDING_COLS
+    entry, or -1 for 'No Finding'.
     """
     if row.get(COL_NO_FINDING, 1) == 1:
         return -1
     for i, col in enumerate(FINDING_COLS):
         if row.get(col, 0) == 1:
-            return i
-    return -1  # no known finding column active (treat as unknown)
+            return STAGE2_MERGE_MAP.get(i, -1)
+    return -1  # no known finding column active
 
 
 def build_dataset(split: str = "training") -> tuple[list[np.ndarray], list[dict[str, Any]]]:

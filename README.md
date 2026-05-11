@@ -26,7 +26,8 @@ MammoPearl-Training/
 │   └── data/
 │       ├── pre-process/    # 数据预处理
 │       ├── segment/        # 图像分隔
-│       └── bounding-box/   # 标注框预测模型的训练
+│       ├── bounding-box/   # 深度学习路线 - 病灶框检测
+│       └── recognition-traditional/  # 传统 ML 路线 - 病灶分类
 │
 ├── tools/                  # 工具文件
 ├── models/                 # 训练产出的模型
@@ -47,6 +48,8 @@ bash ./build_dataset.sh
 详见：[docs/train-process.md](./docs/train-process.md)。
 
 ## 系统架构
+
+### 深度学习路线
 
 本项目采用两阶段级联架构：
 
@@ -80,3 +83,31 @@ bash ./build_dataset.sh
 ```
 
 **设计逻辑**：Stage 1 只负责"是否有可疑区域"及"在哪里"，Stage 2 利用这些位置信息进行更精确的患病判断。
+
+### 传统 ML 路线
+
+独立于深度学习路线，采用 **两阶段级联** 策略完成病灶分类。
+
+```
+预处理图像
+    │
+    ▼
+滑窗采样（patch 切块）+ 手工特征提取
+    • 统计特征：灰度均值 / 标准差 / 偏度 / 峰度 / 熵
+    • 纹理特征：GLCM 对比度 / 相关性 / 能量 / 同质性
+    • 频域特征：Gabor 滤波器组响应
+    • 梯度特征：Sobel / Laplacian 能量
+    │
+    ▼
+[Stage-1] SVM 二分类（正常 vs 病灶候选）
+    • Pipeline: StandardScaler → PCA(80) → SVC
+    • 高召回率优先（阈值 0.700），Recall ≈ 0.984
+    │
+    └── 正样本候选
+              │
+              ▼
+        [Stage-2] XGBoost 4 类病灶分类
+            • 类别：Asymmetry_Distortion / Mass /
+                    Skin_Other / Suspicious_Calcification
+            • Macro F1 ≈ 0.565
+```

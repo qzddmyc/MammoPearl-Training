@@ -23,6 +23,7 @@ from config import (
     MODEL_DIR,
     RANDOM_SEED,
     STAGE2_MODEL,
+    STAGE2_MERGED_NAMES,
 )
 
 _STAGE2_MODEL_PATH = MODEL_DIR / "stage2_model.pkl"
@@ -43,12 +44,15 @@ def _build_xgb(n_classes: int):
     return XGBClassifier(
         objective="multi:softmax",
         num_class=n_classes,
-        n_estimators=400,
-        max_depth=6,
-        learning_rate=0.05,
+        n_estimators=600,
+        max_depth=8,
+        learning_rate=0.03,
         subsample=0.8,
-        colsample_bytree=0.8,
-        use_label_encoder=False,
+        colsample_bytree=0.7,
+        min_child_weight=1,
+        gamma=0.1,
+        reg_alpha=0.1,
+        reg_lambda=1.0,
         eval_metric="mlogloss",
         random_state=RANDOM_SEED,
         n_jobs=-1,
@@ -111,7 +115,7 @@ def train_stage2(
     le = LabelEncoder()
     y_enc = le.fit_transform(y)
     n_classes = len(le.classes_)
-    print(f"[stage2] Number of classes: {n_classes}  ({[FINDING_COLS[c] for c in le.classes_]})")
+    print(f"[stage2] Number of classes: {n_classes}  ({[STAGE2_MERGED_NAMES[c] for c in le.classes_]})")
 
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
