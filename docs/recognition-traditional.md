@@ -46,7 +46,7 @@ Stage-1 宁可多报也不漏报（高 recall）；Stage-2 在 Stage-1 的阳性
 | 项目 | 内容 |
 |------|------|
 | 数据来源 | `data/raw/vindr_detection_folds.csv`（约 20,486 行） |
-| 图像路径 | `data/processed/images_png/<patient_id>/<image_id>.png` |
+| 图像路径 | `data/processed/images_png/<patient_id>/<image_id>` |
 | 训练 / 测试 | 患者级别划分，零重叠：16,000 张训练，4,000 张测试 |
 | 病变类别 | 10 种（见下方） |
 
