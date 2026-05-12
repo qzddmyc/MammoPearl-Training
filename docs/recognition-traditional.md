@@ -18,9 +18,6 @@
 原始影像
   │
   ▼
-[Step 0] 分割乳腺区域（可选，生成掩码，当前未接入采样流程）
-  │
-  ▼
 [Step 1] 采样：把图像切成一个个 128×128 的小块
   ├─ 正样本：从标注的病灶框中心裁剪
   └─ 难负样本：从同一张图的最致密腺体区域裁剪
@@ -37,6 +34,8 @@
   └─▶ [Stage-2] 多分类：是哪种病变？- XGBoost，目标高准确率
 ```
 
+> **[Step 0 - 可选]** 使用 `--generate-mask` 可在采样前生成乳腺区域掩码，但当前采样逻辑尚未读取掩码，不影响上述流程。详见：十、注意事项第 2 条。
+
 Stage-1 宁可多报也不漏报（高 recall）；Stage-2 在 Stage-1 的阳性结果中进一步区分病变类型。
 
 ---
@@ -47,7 +46,7 @@ Stage-1 宁可多报也不漏报（高 recall）；Stage-2 在 Stage-1 的阳性
 |------|------|
 | 数据来源 | `data/raw/vindr_detection_folds.csv`（约 20,486 行） |
 | 图像路径 | `data/processed/images_png/<patient_id>/<image_id>` |
-| 训练 / 测试 | 患者级别划分，零重叠：16,000 张训练，4,000 张测试 |
+| 训练 / 测试 | 患者级别划分，零重叠：16,391 张训练，4,095 张测试 |
 | 病变类别 | 10 种（见下方） |
 
 **10 种原始病变类型**：
@@ -67,9 +66,11 @@ Stage-1 宁可多报也不漏报（高 recall）；Stage-2 在 Stage-1 的阳性
 
 ---
 
-## 三、提取的"特征"是什么
+## 三、手工特征提取
 
-这里的"特征"是指：用数字来描述一块 128×128 图像区域长什么样。我们从多个角度来刻画每个图像块：
+传统机器学习模型无法直接处理原始像素，需要先将图像转换为一组数值向量，再交给分类器学习。这些数值向量就是"特征"：每一维对应图像的某种可量化属性（如纹理粗糙程度、边缘强度、频率分布等）。
+
+特征提取的质量直接决定模型的上限：如果特征无法区分不同病变的视觉差异，再强的分类器也无济于事。本系统从纹理、频率、统计等多个角度提取共 **113 维基础特征**（供 Stage-1 使用）和额外 **6 维扩展特征**（供 Stage-2 使用）。
 
 ### 3.1 基础特征（113 维，用于 Stage-1）
 
@@ -148,7 +149,7 @@ SVM 的核心思想是找一个"最宽的分界线"把两类样本分开。用 R
 | 合并后的类 | 包含的原始类别 | 合并依据 |
 |-----------|-------------|---------|
 | Asymmetry_Distortion | Architectural_Distortion, Asymmetry, Focal_Asymmetry, Global_Asymmetry | 都表现为局部或整体的密度/结构不对称，patch 纹理相近 |
-| Mass | Mass | 样本量最多（~232），独立保留 |
+| Mass | Mass | 训练集样本量最多（989 条），独立保留 |
 | Skin_Other | Nipple_Retraction, Skin_Retraction, Skin_Thickening, Suspicious_Lymph_Node | 均出现在图像边缘区域，视觉特征相近 |
 | Suspicious_Calcification | Suspicious_Calcification | 视觉特征独特（微小高亮点），独立保留 |
 
@@ -184,7 +185,7 @@ XGBoost 是梯度提升树的高效实现：先训一棵决策树，再训一棵
 
 ### 评估方式说明
 
-下面的数字**不是**滑窗推理的评估结果，而是一种"标准化的 patch 级评估"。具体流程如下：
+下面的数字**不是**滑窗推理的评估结果，而是一种"标准化的 patch 级评估"。这里的 **patch** 是指从原始乳腺图像中裁剪出的固定尺寸（128×128 像素）小图块，是模型的基本处理单元。具体评估流程如下：
 
 1. **测试集构建**：和训练集完全一样：对每个已知的病灶标注框，从框的中心裁剪出 128×128 的图像块作为正样本；同时从正常图像上随机裁剪负样本。最终测试集共 **12,447 个 patch**（其中 447 个病变阳性，12,000 个正常）。
 2. **模型推理**：把每个测试 patch 直接送给模型分类，统计 precision/recall/F1。
@@ -236,7 +237,7 @@ Asymmetry_Distortion 类的 F1 长期停留在 0.33，根本原因：
 
 1. **类内差异大**：这一类合并了结构扭曲、整体不对称、局灶不对称等 4 种外观差异显著的病变，128×128 的 patch 纹理特征难以统一表达
 2. **手工特征的天花板**：GLCM/LBP/Wavelet 等统计特征擅长描述局部纹理，但"不对称性"需要全乳图像级别的感受野才能感知，patch 级别的特征无法捕捉
-3. **样本量不足**：4 种亚型合并后仍只有 ~413 个训练样本
+3. **样本量不足**：4 种亚型合并后仍只有 406 个训练样本（Architectural_Distortion 95 + Asymmetry 77 + Focal_Asymmetry 216 + Global_Asymmetry 20）
 
 如需突破此瓶颈，需引入深度学习（CNN 在全乳图像上直接提取特征）。
 
@@ -325,10 +326,14 @@ python src/data/recognition-traditional/run_pipeline.py --generate-mask
 
 ## 十、注意事项
 
-1. **特征缓存**：基础特征（Stage-1 用）在首次提取后保存为 `.npy`；修改了 `STAGE2_MERGE_MAP` 后需手动删除缓存（`output/features/` 下的 `.npy` 文件），否则标签不会更新。
+1. **运行产出与缓存管理**：
+
+   - **特征缓存**：首次运行 `build_features()` 时，提取完成的基础特征矩阵会保存到 `output/features/` 下的三个 `.npy` 文件（`train_features.npy`、`train_labels.npy`、`train_stage2_labels.npy` 及对应的 `test_*` 文件）。后续再次运行会直接加载缓存，跳过耗时的采样和特征提取步骤。
+   - **模型文件**：训练完成后，Stage-1 模型（`pipeline + threshold`）保存至 `output/models/`，Stage-2 模型（`xgb model + scaler + label encoder`）同样保存至此目录，供后续 `--eval-only` 和 `--infer` 加载。
+   - **评估报告**：每次评估后在 `output/reports/` 下生成文本报告（`.txt`）和混淆矩阵图（`.png`）。
+
+   **何时需要手动删除缓存**：修改了 `STAGE2_MERGE_MAP`（类别合并方案）后，标签文件（`train_stage2_labels.npy` / `test_stage2_labels.npy`）不会自动更新，需手动删除 `output/features/` 下所有 `.npy` 文件，再重新运行以重建缓存。特征矩阵本身（`*_features.npy`）不受类别合并影响，可以保留，但为简单起见删除全部再重建最为稳妥。
 
 2. **掩码生成（当前未接入采样）**：默认不生成掩码；如需生成请加 `--generate-mask`，但掩码当前未被采样逻辑实际使用：`build_dataset()` 的难负样本挖掘用积分图法在全图采样，不依赖掩码文件。如需改进，需在 `build_dataset()` 里加入掩码读取和边界过滤的逻辑。
 
-3. **外部依赖**：整个传统 ML 模块自包含，唯一例外是掩码生成步骤依赖 `src/data/segment/segment.py`，需单独安装其依赖环境（仅使用 `--generate-mask` 时才需要）。
-
-4. **image_id 含后缀**：CSV 中 `image_id` 字段已包含 `.png`，路径拼接时不需要再额外加后缀。
+3. **掩码生成的外部依赖**：掩码生成步骤依赖 `src/data/segment/segment.py`（整个传统 ML 模块的唯一外部依赖），需单独安装其依赖环境；其余模块均自包含，仅使用 `--generate-mask` 时才需要此依赖。

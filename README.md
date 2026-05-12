@@ -92,7 +92,9 @@ bash ./build_dataset.sh
 预处理图像
     │
     ▼
-滑窗采样（patch 切块）+ 手工特征提取
+patch 采样 + 手工特征提取
+    • 正样本：从标注框中心裁剪 128×128 patch
+    • 负样本：积分图法在最致密腺体区域挖掘难负样本
     • 统计特征：灰度均值 / 标准差 / 偏度 / 峰度 / 熵
     • 纹理特征：GLCM 对比度 / 相关性 / 能量 / 同质性
     • 频域特征：Gabor 滤波器组响应
@@ -109,5 +111,5 @@ bash ./build_dataset.sh
         [Stage-2] XGBoost 4 类病灶分类
             • 类别：Asymmetry_Distortion / Mass /
                     Skin_Other / Suspicious_Calcification
-            • Macro F1 ≈ 0.565
+            • Accuracy ≈ 0.652
 ```
