@@ -334,6 +334,8 @@ python src/data/recognition-traditional/run_pipeline.py --generate-mask
 
    **何时需要手动删除缓存**：修改了 `STAGE2_MERGE_MAP`（类别合并方案）后，标签文件（`train_stage2_labels.npy` / `test_stage2_labels.npy`）不会自动更新，需手动删除 `output/features/` 下所有 `.npy` 文件，再重新运行以重建缓存。特征矩阵本身（`*_features.npy`）不受类别合并影响，可以保留，但为简单起见删除全部再重建最为稳妥。
 
-2. **掩码生成（当前未接入采样）**：默认不生成掩码；如需生成请加 `--generate-mask`，但掩码当前未被采样逻辑实际使用：`build_dataset()` 的难负样本挖掘用积分图法在全图采样，不依赖掩码文件。如需改进，需在 `build_dataset()` 里加入掩码读取和边界过滤的逻辑。
+2. **Stage-2 评估的局限性**：文档中 Stage-2 的指标（Accuracy / Macro F1 等）是在 `Stage-1 预测为阳性 AND 真实也是阳性` 的样本上计算的，即仅评估"两阶段均正确识别的正样本"。**Stage-1 的假阳性**（真实为负、但被 Stage-1 误判为阳性的 patch）在真实推理时同样会被送入 Stage-2，由 Stage-2 强行归入某个病变类别，但这部分错误完全不体现在当前评估指标中。因此，Stage-2 的实际线上表现会比评估数字更差。
+
+3. **掩码生成（当前未接入采样）**：默认不生成掩码；如需生成请加 `--generate-mask`，但掩码当前未被采样逻辑实际使用：`build_dataset()` 的难负样本挖掘用积分图法在全图采样，不依赖掩码文件。如需改进，需在 `build_dataset()` 里加入掩码读取和边界过滤的逻辑。
 
 3. **掩码生成的外部依赖**：掩码生成步骤依赖 `src/data/segment/segment.py`（整个传统 ML 模块的唯一外部依赖），需单独安装其依赖环境；其余模块均自包含，仅使用 `--generate-mask` 时才需要此依赖。
