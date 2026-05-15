@@ -413,17 +413,36 @@ def train(
     y: np.ndarray,
     pca_n: int,
     recall_target: float,
+    use_gpu: bool = False,
 ) -> tuple[Pipeline, float]:
-    print(f"\nTraining SVM  (samples={len(y):,}, pos={int(y.sum()):,}, pca={pca_n}) …")
+    # ---- Conditionally use cuML for GPU acceleration ----
+    _use_cuml = False
+    if use_gpu:
+        try:
+            from cuml.svm import SVC as _SVC                    # type: ignore[import]
+            from cuml.decomposition import PCA as _PCA          # type: ignore[import]
+            from cuml.preprocessing import StandardScaler as _SS  # type: ignore[import]
+            _use_cuml = True
+        except ImportError:
+            print("  [warn] cuML not found — falling back to scikit-learn (CPU)")
+    if not _use_cuml:
+        _SVC = SVC
+        _PCA = PCA
+        _SS  = StandardScaler
+
+    mode   = "GPU/cuML" if _use_cuml else "CPU"
+    n_jobs = 1 if _use_cuml else -1   # GPU is internally parallel; avoid multi-process
+
+    print(f"\nTraining SVM [{mode}]  (samples={len(y):,}, pos={int(y.sum()):,}, pca={pca_n}) …")
     nan_count = int(np.isnan(X).sum())
     if nan_count:
         print(f"  [warn] {nan_count} NaN values in feature matrix — will be imputed to 0")
     pipe = Pipeline([
         ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-        ("scaler",  StandardScaler()),
-        ("pca",     PCA(n_components=pca_n, random_state=RANDOM_SEED)),
-        ("svm",     SVC(kernel="rbf", probability=True,
-                        class_weight="balanced", random_state=RANDOM_SEED)),
+        ("scaler",  _SS()),
+        ("pca",     _PCA(n_components=pca_n, random_state=RANDOM_SEED)),
+        ("svm",     _SVC(kernel="rbf", probability=True,
+                         class_weight="balanced", random_state=RANDOM_SEED)),
     ])
     param_grid = {
         "svm__C":     [0.1, 1.0, 10.0],
@@ -432,7 +451,7 @@ def train(
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
     n_fits = 5 * len(param_grid["svm__C"]) * len(param_grid["svm__gamma"])
     grid = GridSearchCV(pipe, param_grid, cv=cv, scoring="recall",
-                        n_jobs=-1, verbose=0, refit=True)
+                        n_jobs=n_jobs, verbose=0, refit=True)
     with _tqdm_joblib(tqdm(total=n_fits, desc="GridSearchCV", unit="fit")):
         grid.fit(X, y)
     best = grid.best_estimator_
@@ -490,6 +509,9 @@ def parse_args() -> argparse.Namespace:
                    help="Feature cache directory (default: <output-dir>/cache)")
     p.add_argument("--no-cache",   action="store_true",
                    help="Recompute features even if a cache exists")
+    p.add_argument("--gpu",        action="store_true",
+                   help="Use cuML GPU-accelerated SVC/PCA/StandardScaler "
+                        "(requires RAPIDS cuML; falls back to CPU if unavailable)")
     return p.parse_args()
 
 
@@ -544,7 +566,8 @@ def main() -> None:
                   f"pos={n_pos:,}  neg={n_neg:,}  total={len(y):,}")
 
     pipeline, threshold = train(X, y, pca_n=args.pca_n,
-                                 recall_target=args.recall_target)
+                                 recall_target=args.recall_target,
+                                 use_gpu=args.gpu)
 
     # Persist
     with open(out_dir / "svm_pipeline.pkl", "wb") as f:
