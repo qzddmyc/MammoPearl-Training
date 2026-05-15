@@ -11,8 +11,13 @@
 
 *.pth
 *.pt
+*.pkl
+*.npy
 *.bak
 *.zip
+
+/models/bbox_trad/*.json
+/models/bbox_trad_test/*.json
 
 /src/data/recognition-traditional/output/features/*
 !/src/data/recognition-traditional/output/features/.gitkeep
