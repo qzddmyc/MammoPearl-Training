@@ -1,19 +1,21 @@
 r"""
-方向 E：U-Net 全图分割检测（使用 segmentation_models_pytorch）
+方向 F：U-Net Patch 训练检测（使用 segmentation_models_pytorch）
 
 安装依赖（在服务器上运行一次即可）：
     pip install segmentation-models-pytorch
 
 运行命令（Git Bash）：
 
-python src/data/bounding-box/bbox-train-E.py \
+python src/data/bounding-box/bbox-train-F.py \
     --epochs 50 \
-    --batch-size 4 \
+    --batch-size 16 \
     --lr 1e-4 \
     --encoder-lr-multiplier 0.1 \
     --input-h 1024 \
     --input-w 512 \
-    --clf-pos-weight 50.0 \
+    --patch-mode \
+    --patch-size 256 \
+    --clf-pos-weight 5.0 \
     --tversky-alpha 0.3 \
     --tversky-beta 0.7 \
     --val-heatmap-threshold 0.5 \
@@ -23,54 +25,31 @@ python src/data/bounding-box/bbox-train-E.py \
     --medical-backbone-path models/raw/ResNet50.pt \
     --hide-progress-bar
 
-与方向 D 的核心差异：
-  - 方向 D：patch 分类器（256×256），缺乏全局上下文，F1 天花板 ≈ 0.47
-  - 方向 E：U-Net 全图分割（1024×512），模型可见整张乳腺图，能区分
-            全局腺体分布与局部病灶，突破 patch 分类器的系统性误差
+与方向 E 的核心差异：
+  - 方向 E：全图训练（1024×512），正样本像素占比约 0.2%，pos_weight=50 仍无法
+            抵抗背景梯度主导（背景:病灶梯度 ≈ 10:1），训练中期出现保守性坍缩
+            （TP/FP 同步收缩，几乎不预测任何病灶），前 4 epoch 往往是全程最佳。
+  - 方向 F：Patch 训练 + 全图推理。训练时以 GT bbox 为中心裁取 patch_size×patch_size
+            patch，正负样本各 50%（负样本来自无病灶图像的随机裁剪），正样本像素比
+            提升至 5–20%，梯度不平衡比从 ~10:1 降至 ~2:1，保守性坍缩的梯度根因被
+            消除。验证和推理仍使用全图（U-Net 全卷积，支持任意尺寸输入）。
 
-GT 生成：将 xyxy bbox 转为硬掩码（框内像素=1.0，框外=0.0），缩放到
-1024×512 坐标系后写入，用 BCEWithLogitsLoss + Tversky loss 联合监督。
+GT 生成：将 xyxy bbox 转为硬掩码（框内像素=1.0，框外=0.0），在 patch 坐标系中
+生成，用 BCEWithLogitsLoss + Tversky loss 联合监督。
 
-后处理复用方向 D 管线：sigmoid → 阈值 → 膨胀 → 连通域 → 外接矩形 → IoU 匹配 GT。
+后处理复用方向 E 管线：sigmoid → 阈值 → 膨胀 → 连通域 → 外接矩形 → IoU 匹配 GT。
 
 ─────────────────────────────────────────────────────────────────────────────
 改版历史
 ─────────────────────────────────────────────────────────────────────────────
 
-rec_45（原版）
-  GT：高斯 blob 热图（σ = box_min_side / 6）
-  损失：BCE(pos_weight=5) + Dice，各 50%
-  优化：AdamW(lr=1e-4，全参数统一 lr)
-  结果：epoch 3 最佳 F1=0.4623，之后持续崩溃（epoch 10 F1=0.2039）
-  原因：pos_weight=5 与像素不平衡（阳性≈0.24%）严重失配，
-        模型预测全零最小化 loss，导致 recall 归零
-
-rec_45_upd_1
-  GT：硬 bbox 掩码（框内=1.0），替换高斯 blob
-  损失：BCE(pos_weight=50) + Dice，各 50%
-  优化：AdamW(lr=1e-4，全参数统一 lr)（仍未修复）
-  结果：epoch 2 最佳 F1=0.4851，之后持续崩溃（epoch 11 F1=0.1293）
-  根因：编码器（RadImageNet 预训练）与解码器（随机初始化）使用同一 lr=1e-4；
-        解码器需要高 lr 从零学习，但编码器在高 lr 下前 4–8 epoch 内预训练特征
-        被梯度覆写（catastrophic forgetting），loss 持续下降但验证 F1 崩溃
-
-rec_45_upd_2
-  新增：--encoder-lr-multiplier（默认 0.1）：编码器 lr = 1e-5，解码器 lr = 1e-4
-  新增：--freeze-encoder-epochs 5：前 5 epoch 冻结编码器，epoch 6 自动解冻
-  结果：epoch 4 最佳 F1=0.4292，之后持续崩溃（epoch 11 F1=0.2424）
-  好消息：差异化 lr 有效保护了编码器——loss 全程维持在 0.75–0.82（upd_1 已跌至 0.27），
-          编码器预训练特征未被覆写
-  坏消息：冻结适得其反：解码器在固定特征上学到的权重，解冻时被扰动后未能恢复；
-          保守性坍缩仍然存在——Dice loss 对 FP/FN 对称惩罚，模型学到"少预测"能
-          同时降低 BCE 和 Dice，导致 Recall 持续下滑，Precision 反而上升
-
-rec_45_upd_3（当前版本）
-  变更：将 Dice loss 替换为 Tversky loss（α=0.3, β=0.7），FN 权重 > FP 权重，
-        直接惩罚漏检，阻止保守性坍缩，同时保持对 FP 的适度约束
-  变更：--freeze-encoder-epochs 默认改为 0（不冻结），差异化 lr 单独保护编码器即可；
-        参数保留以便手动指定
-  新增：--tversky-alpha（默认 0.3）/ --tversky-beta（默认 0.7）可调参数
-  预期：Recall 不再因 loss 自我奖励保守策略而持续下滑，F1 曲线能在 epoch 10+ 维持或继续改善
+rec_46（初版）
+  基础：方向 E 的 rec_45_upd_3 代码（Tversky loss、差异化 lr、无冻结）
+  核心改动：Patch 训练（--patch-mode），替换全图训练 DataLoader
+  正样本 patch：以 GT bbox 为中心裁取，随机 jitter，resize 到 patch_size×patch_size
+  负样本 patch：从纯阴性图像随机裁取，每 epoch 重采样以与正样本数量匹配
+  pos_weight：50 → 5（patch 内正样本比提升，超大权重反而冗余）
+  预期：保守性坍缩根因消除，Recall 能持续改善直至真正收敛
 """
 
 from __future__ import annotations
@@ -120,7 +99,7 @@ except Exception:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Utilities (adapted from bbox-train-D.py)
+# Utilities
 # ─────────────────────────────────────────────────────────────────────────────
 
 def set_seed(seed: int) -> None:
@@ -311,13 +290,7 @@ def make_bbox_heatmap(
     w: int,
     boxes: np.ndarray,   # (N, 4) xyxy in (h, w) coordinate system
 ) -> np.ndarray:
-    """Generate a binary GT heatmap by filling each GT bbox with 1.
-
-    Replaces the previous Gaussian blob approach.  Hard binary mask gives
-    clear gradient signal and avoids the near-zero values at blob edges that
-    caused the model to converge to all-zero predictions under severe
-    pixel-level class imbalance (~1:420).
-    """
+    """Generate a binary GT heatmap by filling each GT bbox with 1."""
     heatmap = np.zeros((h, w), dtype=np.float32)
     if boxes.size == 0:
         return heatmap
@@ -333,11 +306,11 @@ def make_bbox_heatmap(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Dataset
+# Dataset — full-image (used for validation)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SegDataset(Dataset):
-    """Full-image segmentation dataset.
+    """Full-image segmentation dataset.  Used for validation only in patch mode.
 
     Each item is (image_tensor [3, H, W], heatmap_tensor [1, H, W]).
     Image is resized to (input_h, input_w).  GT boxes are scaled accordingly,
@@ -374,7 +347,6 @@ class SegDataset(Dataset):
         try:
             img = normalize_image(read_image_unicode(sample.image_path))
         except FileNotFoundError:
-            # Return zeros on missing file — will produce zero loss contribution
             img_t = torch.zeros(3, self.input_h, self.input_w, dtype=torch.float32)
             hm_t = torch.zeros(1, self.input_h, self.input_w, dtype=torch.float32)
             return img_t, hm_t
@@ -382,7 +354,6 @@ class SegDataset(Dataset):
         orig_h, orig_w = img.shape[:2]
         boxes = sample.boxes.copy()
 
-        # Filter invalid boxes
         if boxes.size > 0:
             boxes[:, 0] = np.clip(boxes[:, 0], 0, orig_w - 1)
             boxes[:, 2] = np.clip(boxes[:, 2], 0, orig_w - 1)
@@ -391,10 +362,8 @@ class SegDataset(Dataset):
             keep = (boxes[:, 2] > boxes[:, 0] + 1) & (boxes[:, 3] > boxes[:, 1] + 1)
             boxes = boxes[keep]
 
-        # Resize image to (input_h, input_w)
         img_resized = cv2.resize(img, (self.input_w, self.input_h), interpolation=cv2.INTER_LINEAR)
 
-        # Scale boxes to resized coordinate system
         scale_x = self.input_w / max(orig_w, 1)
         scale_y = self.input_h / max(orig_h, 1)
         scaled_boxes = boxes.copy()
@@ -404,9 +373,7 @@ class SegDataset(Dataset):
             scaled_boxes[:, 1] *= scale_y
             scaled_boxes[:, 3] *= scale_y
 
-        # Augmentation
         if self.augment:
-            # Horizontal flip
             if self.rng.random() < self.aug_hflip_prob:
                 img_resized = img_resized[:, ::-1, :].copy()
                 if scaled_boxes.size > 0:
@@ -414,17 +381,204 @@ class SegDataset(Dataset):
                     old_x2 = scaled_boxes[:, 2].copy()
                     scaled_boxes[:, 0] = self.input_w - old_x2
                     scaled_boxes[:, 2] = self.input_w - old_x1
-            # Brightness jitter
             if self.aug_brightness_delta > 0:
                 delta = (self.rng.random() * 2 - 1) * self.aug_brightness_delta * 255
                 img_resized = np.clip(img_resized.astype(np.float32) + delta, 0, 255).astype(np.uint8)
 
-        # Build GT heatmap (hard binary bbox mask)
         heatmap = make_bbox_heatmap(self.input_h, self.input_w, scaled_boxes)
 
         img_t = image_to_tensor(img_resized)
         hm_t = torch.from_numpy(heatmap).unsqueeze(0)  # (1, H, W)
         return img_t, hm_t
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dataset — patch-based (used for training in patch mode)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PatchDataset(Dataset):
+    """Patch-based segmentation dataset for balanced positive/negative training.
+
+    Builds a balanced list of items each epoch:
+      - Positive patches: one crop per GT bounding box, centered on the box
+        with optional random jitter, ensuring the bbox is contained in the crop.
+      - Negative patches: random crops from pure-negative training images
+        (no GT lesions), resampled each epoch to match the positive count.
+
+    Crops are taken from the full input_h×input_w resized image.  The GT mask
+    is computed for the full resized image, then cropped to the same region.
+    Both crop and mask are resized to patch_size×patch_size before returning.
+
+    Validation still uses SegDataset (full-image inference) — unchanged.
+    """
+
+    def __init__(
+        self,
+        samples: List[Sample],
+        indices: List[int],
+        input_h: int,
+        input_w: int,
+        patch_size: int = 256,
+        margin_factor: float = 2.5,
+        neg_patch_ratio: float = 1.0,
+        augment: bool = False,
+        aug_hflip_prob: float = 0.5,
+        aug_brightness_delta: float = 0.2,
+        seed: int = 42,
+        epoch: int = 0,
+    ) -> None:
+        self.samples = samples
+        self.input_h = input_h
+        self.input_w = input_w
+        self.patch_size = patch_size
+        self.margin_factor = margin_factor
+        self.augment = augment
+        self.aug_hflip_prob = aug_hflip_prob
+        self.aug_brightness_delta = aug_brightness_delta
+        self.rng = random.Random(seed + epoch * 7919)
+
+        # Build positive items: one entry per GT bbox
+        positive_items: List[Tuple[int, int]] = []  # (sample_idx, box_idx)
+        neg_source_indices: List[int] = []
+        for idx in indices:
+            s = samples[idx]
+            if s.boxes.shape[0] > 0:
+                for bi in range(s.boxes.shape[0]):
+                    positive_items.append((idx, bi))
+            else:
+                neg_source_indices.append(idx)
+
+        n_pos = len(positive_items)
+        n_neg = max(1, int(n_pos * neg_patch_ratio))
+
+        # Fallback: if no pure-negative images exist, sample from all indices
+        if not neg_source_indices:
+            neg_source_indices = list(indices)
+
+        # Resample negative sources each epoch for diversity
+        rng_init = random.Random(seed + epoch * 1013)
+        sampled_neg = rng_init.choices(neg_source_indices, k=n_neg)
+
+        # Build flat item list and shuffle
+        self.items: List[Tuple[str, int, int]] = []
+        for si, bi in positive_items:
+            self.items.append(("pos", si, bi))
+        for si in sampled_neg:
+            self.items.append(("neg", si, -1))
+        rng_init.shuffle(self.items)
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        item_type, sample_idx, box_idx = self.items[idx]
+        sample = self.samples[sample_idx]
+
+        # Load full image
+        try:
+            img = normalize_image(read_image_unicode(sample.image_path))
+        except FileNotFoundError:
+            blank = torch.zeros(3, self.patch_size, self.patch_size, dtype=torch.float32)
+            return blank, torch.zeros(1, self.patch_size, self.patch_size, dtype=torch.float32)
+
+        orig_h, orig_w = img.shape[:2]
+
+        # Resize to model input size
+        img_resized = cv2.resize(img, (self.input_w, self.input_h), interpolation=cv2.INTER_LINEAR)
+
+        # Scale box coordinates to input_h×input_w space
+        scale_x = self.input_w / max(orig_w, 1)
+        scale_y = self.input_h / max(orig_h, 1)
+        boxes = sample.boxes.copy()
+        if boxes.size > 0:
+            boxes[:, 0] = np.clip(boxes[:, 0] * scale_x, 0, self.input_w - 1)
+            boxes[:, 2] = np.clip(boxes[:, 2] * scale_x, 0, self.input_w - 1)
+            boxes[:, 1] = np.clip(boxes[:, 1] * scale_y, 0, self.input_h - 1)
+            boxes[:, 3] = np.clip(boxes[:, 3] * scale_y, 0, self.input_h - 1)
+            keep = (boxes[:, 2] > boxes[:, 0] + 1) & (boxes[:, 3] > boxes[:, 1] + 1)
+            boxes = boxes[keep]
+
+        # Determine crop region
+        if item_type == "pos":
+            if boxes.shape[0] == 0:
+                # Fallback to negative crop if all boxes were filtered out
+                cx1, cy1, cx2, cy2 = self._get_negative_crop()
+            else:
+                safe_idx = box_idx % boxes.shape[0]
+                cx1, cy1, cx2, cy2 = self._get_positive_crop(boxes[safe_idx])
+        else:
+            cx1, cy1, cx2, cy2 = self._get_negative_crop()
+
+        # Build GT mask for full image then crop
+        heatmap = make_bbox_heatmap(self.input_h, self.input_w, boxes)
+        img_patch = img_resized[cy1:cy2, cx1:cx2].copy()
+        hm_patch = heatmap[cy1:cy2, cx1:cx2].copy()
+
+        # Resize to patch_size × patch_size
+        img_patch = cv2.resize(img_patch, (self.patch_size, self.patch_size), interpolation=cv2.INTER_LINEAR)
+        hm_patch = cv2.resize(hm_patch, (self.patch_size, self.patch_size), interpolation=cv2.INTER_NEAREST)
+
+        # Augmentation
+        if self.augment:
+            if self.rng.random() < self.aug_hflip_prob:
+                img_patch = img_patch[:, ::-1, :].copy()
+                hm_patch = hm_patch[:, ::-1].copy()
+            if self.aug_brightness_delta > 0:
+                delta = (self.rng.random() * 2 - 1) * self.aug_brightness_delta * 255
+                img_patch = np.clip(img_patch.astype(np.float32) + delta, 0, 255).astype(np.uint8)
+
+        img_t = image_to_tensor(img_patch)
+        hm_t = torch.from_numpy(hm_patch).unsqueeze(0)  # (1, H, W)
+        return img_t, hm_t
+
+    def _get_positive_crop(self, box: np.ndarray) -> Tuple[int, int, int, int]:
+        """Return crop region (rx1, ry1, rx2, ry2) centered on the GT box
+        with random jitter, ensuring the bbox is contained in the crop."""
+        x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+        bw, bh = x2 - x1, y2 - y1
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+
+        # Crop side: large enough to contain bbox with margin, at least patch_size
+        crop_side = max(self.patch_size, int(max(bw, bh) * self.margin_factor))
+        crop_side = min(crop_side, min(self.input_h, self.input_w))
+
+        # Random jitter: shift center by up to 50% of available slack on each axis
+        half = crop_side / 2.0
+        slack_x = max(0.0, half - bw / 2.0)
+        slack_y = max(0.0, half - bh / 2.0)
+        cx += (self.rng.random() * 2 - 1) * slack_x * 0.5
+        cy += (self.rng.random() * 2 - 1) * slack_y * 0.5
+
+        # Compute initial crop bounds
+        rx1 = int(cx - half)
+        ry1 = int(cy - half)
+        rx2 = rx1 + crop_side
+        ry2 = ry1 + crop_side
+
+        # Shift to stay within image bounds
+        if rx1 < 0:
+            rx2 -= rx1
+            rx1 = 0
+        if ry1 < 0:
+            ry2 -= ry1
+            ry1 = 0
+        if rx2 > self.input_w:
+            rx1 -= rx2 - self.input_w
+            rx2 = self.input_w
+        if ry2 > self.input_h:
+            ry1 -= ry2 - self.input_h
+            ry2 = self.input_h
+        rx1, ry1 = max(0, rx1), max(0, ry1)
+        return rx1, ry1, rx2, ry2
+
+    def _get_negative_crop(self) -> Tuple[int, int, int, int]:
+        """Return a random crop region for a negative patch."""
+        max_x = max(0, self.input_w - self.patch_size)
+        max_y = max(0, self.input_h - self.patch_size)
+        rx1 = self.rng.randint(0, max_x) if max_x > 0 else 0
+        ry1 = self.rng.randint(0, max_y) if max_y > 0 else 0
+        return rx1, ry1, rx1 + self.patch_size, ry1 + self.patch_size
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -437,7 +591,7 @@ def build_unet(
     """Build a U-Net with ResNet50 encoder.
 
     Requires segmentation_models_pytorch.  The RadImageNet ResNet50 weights
-    are loaded into the encoder using the same key-mapping logic as D.
+    are loaded into the encoder using the same key-mapping logic as E.
     conv1 is adapted for grayscale-as-3channel input (channel-averaged weights).
     """
     if smp is None:
@@ -719,17 +873,20 @@ def save_checkpoint(save_path: Path, model: torch.nn.Module, meta: Dict[str, Any
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a U-Net full-image segmentation model for VinDr lesion detection (Direction E).")
+    parser = argparse.ArgumentParser(description="Train a U-Net patch-based segmentation model for VinDr lesion detection (Direction F).")
     parser.add_argument("--csv-path", type=Path, default=None)
     parser.add_argument("--images-root", type=Path, default=None)
     parser.add_argument("--save-path", type=Path, default=None)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--input-h", type=int, default=1024, help="Resize height for model input")
     parser.add_argument("--input-w", type=int, default=512, help="Resize width for model input")
-    parser.add_argument("--clf-pos-weight", type=float, default=50.0, help="BCE pos_weight for foreground pixels (pixel-level imbalance ~1:420, so much higher than patch-level)")
-    parser.add_argument("--bce-alpha", type=float, default=0.5, help="Weight of BCE in combined loss (1-alpha for Dice)")
+    parser.add_argument("--clf-pos-weight", type=float, default=50.0,
+                        help="BCE pos_weight for foreground pixels. In patch mode, positive pixel "
+                             "ratio is much higher (~5-20%%), so a value of 5.0 is recommended "
+                             "instead of the full-image default of 50.0.")
+    parser.add_argument("--bce-alpha", type=float, default=0.5, help="Weight of BCE in combined loss (1-alpha for Tversky)")
     parser.add_argument("--val-heatmap-threshold", type=float, default=0.5)
     parser.add_argument("--val-heatmap-dilation", type=int, default=30)
     parser.add_argument("--val-iou-threshold", type=float, default=0.1)
@@ -737,7 +894,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-delta", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--val-batch-size", type=int, default=1, help="Batch size for validation inference (usually 1 due to variable original sizes)")
+    parser.add_argument("--val-batch-size", type=int, default=1)
     parser.add_argument("--accumulation-steps", type=int, default=1)
     parser.add_argument("--augment", action="store_true")
     parser.add_argument("--aug-hflip-prob", type=float, default=0.5)
@@ -748,12 +905,25 @@ def parse_args() -> argparse.Namespace:
                              "Prevents catastrophic forgetting of pretrained features.")
     parser.add_argument("--freeze-encoder-epochs", type=int, default=0,
                         help="Number of epochs to keep encoder frozen (requires_grad=False). "
-                             "After this, encoder is unfrozen with encoder_lr = lr * encoder_lr_multiplier. "
                              "Default 0 = no freeze (differential LR handles encoder protection).")
     parser.add_argument("--tversky-alpha", type=float, default=0.3,
                         help="FP weight in Tversky loss. Lower value = less FP penalty.")
     parser.add_argument("--tversky-beta", type=float, default=0.7,
                         help="FN weight in Tversky loss. Higher value = more FN penalty = higher recall.")
+    # Patch training
+    parser.add_argument("--patch-mode", action="store_true",
+                        help="Enable patch-based training DataLoader (PatchDataset). Each epoch builds "
+                             "a balanced list of positive patches (centered on GT bboxes) and negative "
+                             "patches (random crops from negative images). Validation uses full-image "
+                             "inference unchanged. Recommended to fix pixel-level class imbalance.")
+    parser.add_argument("--patch-size", type=int, default=256,
+                        help="Side length of square training patches (pixels, in input_h×input_w space).")
+    parser.add_argument("--patch-margin-factor", type=float, default=2.5,
+                        help="When bbox is larger than patch_size: "
+                             "crop_side = max(patch_size, max(bbox_w, bbox_h) × margin_factor).")
+    parser.add_argument("--neg-patch-ratio", type=float, default=1.0,
+                        help="Negative-to-positive patch count ratio per epoch. "
+                             "1.0 = equal counts (recommended).")
     parser.add_argument("--hide-progress-bar", action="store_true")
     return parser.parse_args()
 
@@ -770,14 +940,12 @@ def main() -> None:
 
     csv_path = args.csv_path or repo_root / "data" / "raw" / "vindr_detection_folds.csv"
     images_root = args.images_root or repo_root / "data" / "processed" / "images_png"
-    save_path = args.save_path or repo_root / "models" / "bbox_resnet50.E.pth"
+    save_path = args.save_path or repo_root / "models" / "bbox_resnet50.F.pth"
 
     print(f"CSV: {csv_path}")
     print(f"Images root: {images_root}")
     print(f"Save path: {save_path}")
 
-    # Load all samples (single CSV — direction E doesn't separate by split column for split;
-    # uses the same "training" split as D for consistency).
     all_samples = load_samples(csv_path, images_root, split_name="training")
     print(f"Total samples: {len(all_samples)}")
 
@@ -794,7 +962,13 @@ def main() -> None:
     print(f"Input size: {args.input_h}×{args.input_w}")
     encoder_lr = float(args.lr) * float(args.encoder_lr_multiplier)
     decoder_lr = float(args.lr)
-    print(f"Batch size: {args.batch_size} | Decoder LR: {decoder_lr} | Encoder LR: {encoder_lr} (frozen for first {args.freeze_encoder_epochs} epochs) | Epochs: {args.epochs} | Patience: {args.patience}")
+    print(f"Batch size: {args.batch_size} | Decoder LR: {decoder_lr} | Encoder LR: {encoder_lr} "
+          f"(frozen for first {args.freeze_encoder_epochs} epochs) | Epochs: {args.epochs} | Patience: {args.patience}")
+    if args.patch_mode:
+        print(f"Patch mode: ON | Patch size: {args.patch_size}×{args.patch_size} | "
+              f"Margin factor: {args.patch_margin_factor} | Neg:Pos ratio: {args.neg_patch_ratio}")
+    else:
+        print("Patch mode: OFF (full-image training)")
 
     model = build_unet(
         medical_backbone_path=str(args.medical_backbone_path) if args.medical_backbone_path else None,
@@ -814,9 +988,6 @@ def main() -> None:
         optimizer, T_max=int(args.epochs), eta_min=float(args.lr) * 0.01
     )
 
-    # Freeze encoder for initial epochs to protect pretrained features.
-    # During frozen epochs, encoder.requires_grad=False so no gradients flow through
-    # and encoder optimizer state stays clean. Unfreezes at epoch freeze_encoder_epochs.
     if int(args.freeze_encoder_epochs) > 0:
         model.encoder.requires_grad_(False)
         print(f"[Freeze] Encoder frozen for first {args.freeze_encoder_epochs} epoch(s).")
@@ -826,7 +997,6 @@ def main() -> None:
     best_epoch = 0
     no_improve = 0
 
-    # Exit hook for clean logging
     _exit_state = {"reported": False}
 
     def _on_exit(reason: Optional[str] = None) -> None:
@@ -854,22 +1024,38 @@ def main() -> None:
         print(f"Epoch {epoch + 1} / {args.epochs}")
         print(f"{'-' * 72}")
 
-        # Unfreeze encoder after freeze_encoder_epochs epochs
         if epoch == int(args.freeze_encoder_epochs) and int(args.freeze_encoder_epochs) > 0:
             model.encoder.requires_grad_(True)
             print(f"[Unfreeze] Encoder unfrozen at epoch {epoch + 1} with lr={encoder_lr:.2e}")
 
-        train_dataset = SegDataset(
-            samples=all_samples,
-            indices=train_idx,
-            input_h=int(args.input_h),
-            input_w=int(args.input_w),
-            augment=bool(args.augment),
-            aug_hflip_prob=float(args.aug_hflip_prob),
-            aug_brightness_delta=float(args.aug_brightness_delta),
-            seed=int(args.seed),
-            epoch=epoch,
-        )
+        if bool(args.patch_mode):
+            train_dataset = PatchDataset(
+                samples=all_samples,
+                indices=train_idx,
+                input_h=int(args.input_h),
+                input_w=int(args.input_w),
+                patch_size=int(args.patch_size),
+                margin_factor=float(args.patch_margin_factor),
+                neg_patch_ratio=float(args.neg_patch_ratio),
+                augment=bool(args.augment),
+                aug_hflip_prob=float(args.aug_hflip_prob),
+                aug_brightness_delta=float(args.aug_brightness_delta),
+                seed=int(args.seed),
+                epoch=epoch,
+            )
+        else:
+            train_dataset = SegDataset(
+                samples=all_samples,
+                indices=train_idx,
+                input_h=int(args.input_h),
+                input_w=int(args.input_w),
+                augment=bool(args.augment),
+                aug_hflip_prob=float(args.aug_hflip_prob),
+                aug_brightness_delta=float(args.aug_brightness_delta),
+                seed=int(args.seed),
+                epoch=epoch,
+            )
+
         train_loader = DataLoader(
             train_dataset,
             batch_size=int(args.batch_size),
