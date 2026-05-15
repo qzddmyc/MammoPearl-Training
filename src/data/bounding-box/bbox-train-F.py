@@ -23,7 +23,8 @@ python src/data/bounding-box/bbox-train-F.py \
     --val-iou-threshold 0.1 \
     --patience 20 \
     --neg-hard-ratio 0.5 \
-    --monitor-metric recall \
+    --monitor-metric fbeta2 \
+    --neg-hard-ratio 0.8 \
     --medical-backbone-path models/raw/ResNet50.pt \
     --hide-progress-bar
 
@@ -66,9 +67,19 @@ rec_46_upd_1（负样本改造 + Recall 监控）
               crop 与所有 GT box 的交叠（交叉面积/GT 面积）< 0.3，最多尝试 15 次，
               失败则直接使用（保守 fallback）。这样模型能学到"乳腺实质 ≠ 病灶"，
               降低全图推理时的假激活。
-  核心改动 2：新增 --monitor-metric（f1 / recall），--neg-hard-ratio（default 0.5）。
-              recall 模式监控多阈值最大 Recall；f1 保持原有行为（向后兼容）。
+  核心改动 2：新增 --monitor-metric（f1 / recall / fbeta2），--neg-hard-ratio（default 0.5）。
+              recall 模式固定阈值 0.5 的 Recall；fbeta2 模式监控多阈值最大 F2 分数
+              （β=2，Recall 权重是 Precision 的 4 倍，兼顾 FP 惩罚）；f1 保持原有行为。
   预期：FP 降低，@0.5 或 @0.7 阈值的 F1 提升；Recall 曲线更稳定。
+
+rec_46_upd_2（hard neg 比例提升 + Fbeta2 监控）
+  基础：rec_46_upd_1 代码
+  核心改动 1：修复 best_recall 计算——从跨阈值 argmax 改为固定 thresh=0.5 的 Recall，
+              避免 checkpoint 退化为低阈值高 FP 版本。
+  核心改动 2：新增 --monitor-metric fbeta2；F2 = 5*P*R/(4P+R)，β=2 使 Recall 权重
+              是 Precision 的 4 倍，argmax 跨阈值安全（低 Precision 自然压制低阈值）。
+  核心改动 3：--neg-hard-ratio 建议提升到 0.8，给模型更多正样本图的非病灶区域负样本。
+  预期：checkpoint 选择更合理；FP 进一步下降而 Recall 维持高位。
 """
 
 from __future__ import annotations
@@ -905,8 +916,24 @@ def validate(
 
     best_f1_thresh = max(f1_per_thresh, key=lambda t: f1_per_thresh[t])
     best_f1 = f1_per_thresh[best_f1_thresh]
-    best_recall_thresh = max(recall_per_thresh, key=lambda t: recall_per_thresh[t])
+    # Fix: use fixed thresh=0.5 instead of argmax across all thresholds.
+    # Argmax always picks the lowest threshold (higher recall but unusable FP),
+    # causing checkpoints to degrade toward low-confidence, high-FP predictions.
+    best_recall_thresh: float = 0.5
     best_recall = recall_per_thresh[best_recall_thresh]
+    # Fbeta2 (beta=2): weights recall 4x over precision; argmax is safe here
+    # because low precision (from high FP at low thresholds) naturally penalises F2.
+    fbeta2_per_thresh: Dict[float, float] = {}
+    for thresh in multi_thresholds:
+        tp = multi_stats[thresh]["tp"]
+        fp = multi_stats[thresh]["fp"]
+        fn = multi_stats[thresh]["fn"]
+        prec = tp / max(tp + fp, 1)
+        rec = tp / max(tp + fn, 1)
+        fbeta2 = (1 + 4) * prec * rec / max(4 * prec + rec, 1e-9)
+        fbeta2_per_thresh[thresh] = fbeta2
+    best_fbeta2_thresh = max(fbeta2_per_thresh, key=lambda t: fbeta2_per_thresh[t])
+    best_fbeta2 = fbeta2_per_thresh[best_fbeta2_thresh]
 
     parts = []
     for thresh in multi_thresholds:
@@ -920,7 +947,8 @@ def validate(
     print(f"  [Val] GT_boxes={total_gt_boxes} | {' | '.join(parts)}")
     print(
         f"  [BestF1] F1={best_f1:.4f} @ thresh={best_f1_thresh} | "
-        f"[BestRecall] Recall={best_recall:.4f} @ thresh={best_recall_thresh}"
+        f"[BestRecall] Recall={best_recall:.4f} @ thresh={best_recall_thresh} | "
+        f"[BestFbeta2] F2={best_fbeta2:.4f} @ thresh={best_fbeta2_thresh}"
     )
 
     result: Dict[str, float] = {
@@ -928,6 +956,8 @@ def validate(
         "best_f1_thresh": float(best_f1_thresh),
         "best_recall": float(best_recall),
         "best_recall_thresh": float(best_recall_thresh),
+        "best_fbeta2": float(best_fbeta2),
+        "best_fbeta2_thresh": float(best_fbeta2_thresh),
         "val_gt_boxes": float(total_gt_boxes),
     }
     for thresh in multi_thresholds:
@@ -1012,11 +1042,12 @@ def parse_args() -> argparse.Namespace:
                              "0.5 = half hard (default, rec_46_upd_1); "
                              "1.0 = all hard negatives.")
     parser.add_argument("--monitor-metric", type=str, default="f1",
-                        choices=["f1", "recall"],
+                        choices=["f1", "recall", "fbeta2"],
                         help="Metric to monitor for checkpoint saving and early stopping. "
                              "'f1' = best-threshold F1 (default, rec_46 behavior); "
-                             "'recall' = max Recall across all thresholds. "
-                             "For screening tasks, 'recall' is recommended.")
+                             "'recall' = Recall at fixed thresh=0.5; "
+                             "'fbeta2' = F2 score (beta=2, Recall 4x Precision weight), "
+                             "argmax over thresholds -- recommended for screening.")
     parser.add_argument("--hide-progress-bar", action="store_true")
     return parser.parse_args()
 
@@ -1195,6 +1226,9 @@ def main() -> None:
         if monitor_metric_name == "recall":
             cur_monitor = float(val_metrics.get("best_recall", 0.0))
             monitor_thresh = float(val_metrics.get("best_recall_thresh", 0.5))
+        elif monitor_metric_name == "fbeta2":
+            cur_monitor = float(val_metrics.get("best_fbeta2", 0.0))
+            monitor_thresh = float(val_metrics.get("best_fbeta2_thresh", 0.5))
         else:
             cur_monitor = float(val_metrics.get("best_thresh_f1", 0.0))
             monitor_thresh = float(val_metrics.get("best_f1_thresh", 0.5))
