@@ -10,6 +10,8 @@ python src/data/bounding-box/bbox-train-E.py \
     --epochs 50 \
     --batch-size 4 \
     --lr 1e-4 \
+    --encoder-lr-multiplier 0.1 \
+    --freeze-encoder-epochs 5 \
     --input-h 1024 \
     --input-w 512 \
     --clf-pos-weight 50.0 \
@@ -25,10 +27,38 @@ python src/data/bounding-box/bbox-train-E.py \
   - 方向 E：U-Net 全图分割（1024×512），模型可见整张乳腺图，能区分
             全局腺体分布与局部病灶，突破 patch 分类器的系统性误差
 
-GT 生成：将 xyxy bbox 转为像素级高斯 blob 热图（σ = 框尺寸 / 6），
-缩放到 1024×512 坐标系后写入，用 BCEWithLogitsLoss + Dice loss 联合监督。
+GT 生成：将 xyxy bbox 转为硬掩码（框内像素=1.0，框外=0.0），缩放到
+1024×512 坐标系后写入，用 BCEWithLogitsLoss + Dice loss 联合监督。
 
 后处理复用方向 D 管线：sigmoid → 阈值 → 膨胀 → 连通域 → 外接矩形 → IoU 匹配 GT。
+
+─────────────────────────────────────────────────────────────────────────────
+改版历史
+─────────────────────────────────────────────────────────────────────────────
+
+rec_45（原版）
+  GT：高斯 blob 热图（σ = box_min_side / 6）
+  损失：BCE(pos_weight=5) + Dice，各 50%
+  优化：AdamW(lr=1e-4，全参数统一 lr)
+  结果：epoch 3 最佳 F1=0.4623，之后持续崩溃（epoch 10 F1=0.2039）
+  原因：pos_weight=5 与像素不平衡（阳性≈0.24%）严重失配，
+        模型预测全零最小化 loss，导致 recall 归零
+
+rec_45_upd_1
+  GT：硬 bbox 掩码（框内=1.0），替换高斯 blob
+  损失：BCE(pos_weight=50) + Dice，各 50%
+  优化：AdamW(lr=1e-4，全参数统一 lr)（仍未修复）
+  结果：epoch 2 最佳 F1=0.4851，之后持续崩溃（epoch 11 F1=0.1293）
+  根因：编码器（RadImageNet 预训练）与解码器（随机初始化）使用同一 lr=1e-4；
+        解码器需要高 lr 从零学习，但编码器在高 lr 下前 4–8 epoch 内预训练特征
+        被梯度覆写（catastrophic forgetting），loss 持续下降但验证 F1 崩溃
+
+rec_45_upd_2
+  新增：--encoder-lr-multiplier（默认 0.1）：编码器 lr = 1e-5，解码器 lr = 1e-4
+  新增：--freeze-encoder-epochs（默认 5）：前 5 epoch 冻结编码器（requires_grad=False），
+        解码器先在稳定预训练特征基础上学习；epoch 6 自动解冻编码器，以 1e-5 细调
+  删除：无效参数 --sigma-ratio（高斯 GT 已废弃）
+  预期：F1 不再在 epoch 2–3 触顶后单调衰退，能持续改善至 epoch 10–20 以上
 """
 
 from __future__ import annotations
@@ -677,8 +707,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aug-hflip-prob", type=float, default=0.5)
     parser.add_argument("--aug-brightness-delta", type=float, default=0.2)
     parser.add_argument("--medical-backbone-path", type=Path, default=None)
+    parser.add_argument("--encoder-lr-multiplier", type=float, default=0.1,
+                        help="LR multiplier for pretrained encoder. Decoder uses full --lr. "
+                             "Prevents catastrophic forgetting of pretrained features.")
+    parser.add_argument("--freeze-encoder-epochs", type=int, default=5,
+                        help="Number of epochs to keep encoder frozen (requires_grad=False). "
+                             "After this, encoder is unfrozen with encoder_lr = lr * encoder_lr_multiplier.")
     parser.add_argument("--hide-progress-bar", action="store_true")
-    parser.add_argument("--sigma-ratio", type=float, default=6.0, help="Gaussian blob σ = min(box_w, box_h) / sigma_ratio")
     return parser.parse_args()
 
 
@@ -716,17 +751,34 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     print(f"Input size: {args.input_h}×{args.input_w}")
-    print(f"Batch size: {args.batch_size} | LR: {args.lr} | Epochs: {args.epochs} | Patience: {args.patience}")
+    encoder_lr = float(args.lr) * float(args.encoder_lr_multiplier)
+    decoder_lr = float(args.lr)
+    print(f"Batch size: {args.batch_size} | Decoder LR: {decoder_lr} | Encoder LR: {encoder_lr} (frozen for first {args.freeze_encoder_epochs} epochs) | Epochs: {args.epochs} | Patience: {args.patience}")
 
     model = build_unet(
         medical_backbone_path=str(args.medical_backbone_path) if args.medical_backbone_path else None,
     )
     model.to(device)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=1e-4)
+    encoder_params = list(model.encoder.parameters())
+    encoder_param_ids = {id(p) for p in encoder_params}
+    other_params = [p for p in model.parameters() if id(p) not in encoder_param_ids]
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": encoder_params, "lr": encoder_lr},
+            {"params": other_params, "lr": decoder_lr},
+        ],
+        weight_decay=1e-4,
+    )
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=int(args.epochs), eta_min=float(args.lr) * 0.01
     )
+
+    # Freeze encoder for initial epochs to protect pretrained features.
+    # During frozen epochs, encoder.requires_grad=False so no gradients flow through
+    # and encoder optimizer state stays clean. Unfreezes at epoch freeze_encoder_epochs.
+    if int(args.freeze_encoder_epochs) > 0:
+        model.encoder.requires_grad_(False)
+        print(f"[Freeze] Encoder frozen for first {args.freeze_encoder_epochs} epoch(s).")
 
     history: List[Dict[str, float]] = []
     best_metric = 0.0
@@ -760,6 +812,11 @@ def main() -> None:
         print(f"\n{'-' * 72}")
         print(f"Epoch {epoch + 1} / {args.epochs}")
         print(f"{'-' * 72}")
+
+        # Unfreeze encoder after freeze_encoder_epochs epochs
+        if epoch == int(args.freeze_encoder_epochs) and int(args.freeze_encoder_epochs) > 0:
+            model.encoder.requires_grad_(True)
+            print(f"[Unfreeze] Encoder unfrozen at epoch {epoch + 1} with lr={encoder_lr:.2e}")
 
         train_dataset = SegDataset(
             samples=all_samples,
@@ -825,7 +882,7 @@ def main() -> None:
             f"Epoch {epoch + 1}/{args.epochs} | loss={avg_loss:.4f} | "
             f"BestThreshF1={monitor_metric:.4f} @ thresh={best_thresh} "
             f"(TP={best_tp} FP={best_fp} FN={best_fn} Recall={best_recall:.3f} Prec={best_prec:.3f}) | "
-            f"lr={lr_scheduler.get_last_lr()[0]:.6f}"
+            f"lr={lr_scheduler.get_last_lr()[-1]:.6f}"
         )
 
         improved = monitor_metric > best_metric + float(args.min_delta)
