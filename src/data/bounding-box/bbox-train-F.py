@@ -19,9 +19,11 @@ python src/data/bounding-box/bbox-train-F.py \
     --tversky-alpha 0.3 \
     --tversky-beta 0.7 \
     --val-heatmap-threshold 0.5 \
-    --val-heatmap-dilation 30 \
+    --val-heatmap-dilation 15 \
     --val-iou-threshold 0.1 \
     --patience 20 \
+    --neg-hard-ratio 0.5 \
+    --monitor-metric recall \
     --medical-backbone-path models/raw/ResNet50.pt \
     --hide-progress-bar
 
@@ -49,7 +51,24 @@ rec_46（初版）
   正样本 patch：以 GT bbox 为中心裁取，随机 jitter，resize 到 patch_size×patch_size
   负样本 patch：从纯阴性图像随机裁取，每 epoch 重采样以与正样本数量匹配
   pos_weight：50 → 5（patch 内正样本比提升，超大权重反而冗余）
-  预期：保守性坍缩根因消除，Recall 能持续改善直至真正收敛
+  结果：保守性坍缩根因消除（全程 TP≈140-185），但 FP 极高（@0.9 约 400-900），
+        模型在全图推理时对正常乳腺实质产生大量假激活，最优 F1 0.3308（epoch 8）。
+        最优阈值始终为 0.9，说明低置信度预测弥散于全图。
+  问题诊断：负样本仅来自纯阴性图像，模型未学会在有病灶图像的非病灶区域保持低输出；
+            训练（256²）→推理（1024×512）域差异：全图背景面积约 8× patch，模型从未
+            见过，对乳腺实质产生过度激活。
+  监控指标：F1（事后分析更适合用 Recall，因框级 IoU 制约了平凡解）。
+
+rec_46_upd_1（负样本改造 + Recall 监控）
+  基础：rec_46 代码
+  核心改动 1：PatchDataset 负样本改造——50% 来自纯阴性图像（easy neg），
+              50% 来自正样本图像的非 bbox 区域（hard neg）。Hard neg 要求裁取的
+              crop 与所有 GT box 的交叠（交叉面积/GT 面积）< 0.3，最多尝试 15 次，
+              失败则直接使用（保守 fallback）。这样模型能学到"乳腺实质 ≠ 病灶"，
+              降低全图推理时的假激活。
+  核心改动 2：新增 --monitor-metric（f1 / recall），--neg-hard-ratio（default 0.5）。
+              recall 模式监控多阈值最大 Recall；f1 保持原有行为（向后兼容）。
+  预期：FP 降低，@0.5 或 @0.7 阈值的 F1 提升；Recall 曲线更稳定。
 """
 
 from __future__ import annotations
@@ -402,8 +421,13 @@ class PatchDataset(Dataset):
     Builds a balanced list of items each epoch:
       - Positive patches: one crop per GT bounding box, centered on the box
         with optional random jitter, ensuring the bbox is contained in the crop.
-      - Negative patches: random crops from pure-negative training images
+      - Easy negative patches: random crops from pure-negative training images
         (no GT lesions), resampled each epoch to match the positive count.
+      - Hard negative patches: random crops from positive-sample images that do
+        NOT significantly overlap any GT bbox (intersection/GT_area < 0.3).
+        Fraction controlled by neg_hard_ratio (default 0.5).
+        Teaches the model to suppress activations on normal breast tissue
+        near (but not on) lesions, reducing FP in full-image inference.
 
     Crops are taken from the full input_h×input_w resized image.  The GT mask
     is computed for the full resized image, then cropped to the same region.
@@ -421,6 +445,7 @@ class PatchDataset(Dataset):
         patch_size: int = 256,
         margin_factor: float = 2.5,
         neg_patch_ratio: float = 1.0,
+        neg_hard_ratio: float = 0.5,
         augment: bool = False,
         aug_hflip_prob: float = 0.5,
         aug_brightness_delta: float = 0.2,
@@ -439,32 +464,42 @@ class PatchDataset(Dataset):
 
         # Build positive items: one entry per GT bbox
         positive_items: List[Tuple[int, int]] = []  # (sample_idx, box_idx)
-        neg_source_indices: List[int] = []
+        easy_neg_indices: List[int] = []   # pure-negative images
+        hard_neg_indices: List[int] = []   # positive images (hard neg crops)
         for idx in indices:
             s = samples[idx]
             if s.boxes.shape[0] > 0:
                 for bi in range(s.boxes.shape[0]):
                     positive_items.append((idx, bi))
+                hard_neg_indices.append(idx)
             else:
-                neg_source_indices.append(idx)
+                easy_neg_indices.append(idx)
 
         n_pos = len(positive_items)
         n_neg = max(1, int(n_pos * neg_patch_ratio))
+        n_hard = int(n_neg * max(0.0, min(1.0, neg_hard_ratio)))
+        n_easy = n_neg - n_hard
 
-        # Fallback: if no pure-negative images exist, sample from all indices
-        if not neg_source_indices:
-            neg_source_indices = list(indices)
+        # Fallback: if no pure-negative images exist, use all indices for easy neg
+        if not easy_neg_indices:
+            easy_neg_indices = list(indices)
+        # Fallback: if no positive images exist for hard neg, use easy neg pool
+        if not hard_neg_indices:
+            hard_neg_indices = easy_neg_indices
 
         # Resample negative sources each epoch for diversity
         rng_init = random.Random(seed + epoch * 1013)
-        sampled_neg = rng_init.choices(neg_source_indices, k=n_neg)
+        sampled_easy = rng_init.choices(easy_neg_indices, k=n_easy) if n_easy > 0 else []
+        sampled_hard = rng_init.choices(hard_neg_indices, k=n_hard) if n_hard > 0 else []
 
         # Build flat item list and shuffle
         self.items: List[Tuple[str, int, int]] = []
         for si, bi in positive_items:
             self.items.append(("pos", si, bi))
-        for si in sampled_neg:
-            self.items.append(("neg", si, -1))
+        for si in sampled_easy:
+            self.items.append(("neg_easy", si, -1))
+        for si in sampled_hard:
+            self.items.append(("neg_hard", si, -1))
         rng_init.shuffle(self.items)
 
     def __len__(self) -> int:
@@ -506,7 +541,9 @@ class PatchDataset(Dataset):
             else:
                 safe_idx = box_idx % boxes.shape[0]
                 cx1, cy1, cx2, cy2 = self._get_positive_crop(boxes[safe_idx])
-        else:
+        elif item_type == "neg_hard":
+            cx1, cy1, cx2, cy2 = self._get_hard_negative_crop(boxes)
+        else:  # neg_easy
             cx1, cy1, cx2, cy2 = self._get_negative_crop()
 
         # Build GT mask for full image then crop
@@ -579,6 +616,39 @@ class PatchDataset(Dataset):
         rx1 = self.rng.randint(0, max_x) if max_x > 0 else 0
         ry1 = self.rng.randint(0, max_y) if max_y > 0 else 0
         return rx1, ry1, rx1 + self.patch_size, ry1 + self.patch_size
+
+    def _crop_overlaps_gt(self, rx1: int, ry1: int, rx2: int, ry2: int, boxes: np.ndarray) -> bool:
+        """Return True if the crop significantly overlaps any GT box.
+
+        Criterion: intersection area / GT box area > 0.3 for any box.
+        A crop that contains >30% of a GT box is considered a positive region.
+        """
+        if boxes.shape[0] == 0:
+            return False
+        for box in boxes:
+            bx1, by1, bx2, by2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+            ix1 = max(rx1, bx1)
+            iy1 = max(ry1, by1)
+            ix2 = min(rx2, bx2)
+            iy2 = min(ry2, by2)
+            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+            gt_area = max(1.0, (bx2 - bx1) * (by2 - by1))
+            if inter / gt_area > 0.3:
+                return True
+        return False
+
+    def _get_hard_negative_crop(self, boxes: np.ndarray) -> Tuple[int, int, int, int]:
+        """Return a random crop region that does NOT significantly overlap GT boxes.
+
+        Used for hard negative patches from positive-sample images.  Tries up to
+        15 times to find a non-overlapping crop; falls back to the last attempt.
+        """
+        rx1 = ry1 = rx2 = ry2 = 0
+        for _ in range(15):
+            rx1, ry1, rx2, ry2 = self._get_negative_crop()
+            if not self._crop_overlaps_gt(rx1, ry1, rx2, ry2, boxes):
+                return rx1, ry1, rx2, ry2
+        return rx1, ry1, rx2, ry2  # fallback: return last attempt
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -820,8 +890,9 @@ def validate(
 
             total_gt_boxes += int(gt_boxes.shape[0]) if gt_boxes.size > 0 else 0
 
-    # Compute F1 per threshold and pick best
+    # Compute F1 and Recall per threshold
     f1_per_thresh: Dict[float, float] = {}
+    recall_per_thresh: Dict[float, float] = {}
     for thresh in multi_thresholds:
         tp = multi_stats[thresh]["tp"]
         fp = multi_stats[thresh]["fp"]
@@ -830,23 +901,33 @@ def validate(
         recall = tp / max(tp + fn, 1)
         f1 = 2 * precision * recall / max(precision + recall, 1e-9)
         f1_per_thresh[thresh] = f1
+        recall_per_thresh[thresh] = recall
 
-    best_thresh = max(f1_per_thresh, key=lambda t: f1_per_thresh[t])
-    best_f1 = f1_per_thresh[best_thresh]
+    best_f1_thresh = max(f1_per_thresh, key=lambda t: f1_per_thresh[t])
+    best_f1 = f1_per_thresh[best_f1_thresh]
+    best_recall_thresh = max(recall_per_thresh, key=lambda t: recall_per_thresh[t])
+    best_recall = recall_per_thresh[best_recall_thresh]
 
     parts = []
     for thresh in multi_thresholds:
         tp = multi_stats[thresh]["tp"]
         fp = multi_stats[thresh]["fp"]
         fn = multi_stats[thresh]["fn"]
-        recall_t = tp / max(tp + fn, 1)
-        parts.append(f"@{thresh}: TP={tp} FP={fp} FN={fn} Rec={recall_t:.3f} F1={f1_per_thresh[thresh]:.4f}")
+        parts.append(
+            f"@{thresh}: TP={tp} FP={fp} FN={fn} "
+            f"Rec={recall_per_thresh[thresh]:.3f} F1={f1_per_thresh[thresh]:.4f}"
+        )
     print(f"  [Val] GT_boxes={total_gt_boxes} | {' | '.join(parts)}")
-    print(f"  [BestThresh] F1={best_f1:.4f} @ thresh={best_thresh}")
+    print(
+        f"  [BestF1] F1={best_f1:.4f} @ thresh={best_f1_thresh} | "
+        f"[BestRecall] Recall={best_recall:.4f} @ thresh={best_recall_thresh}"
+    )
 
     result: Dict[str, float] = {
         "best_thresh_f1": float(best_f1),
-        "best_thresh": float(best_thresh),
+        "best_f1_thresh": float(best_f1_thresh),
+        "best_recall": float(best_recall),
+        "best_recall_thresh": float(best_recall_thresh),
         "val_gt_boxes": float(total_gt_boxes),
     }
     for thresh in multi_thresholds:
@@ -924,6 +1005,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neg-patch-ratio", type=float, default=1.0,
                         help="Negative-to-positive patch count ratio per epoch. "
                              "1.0 = equal counts (recommended).")
+    parser.add_argument("--neg-hard-ratio", type=float, default=0.5,
+                        help="Fraction of negative patches that are hard negatives (crops from "
+                             "positive-sample images that do NOT overlap GT bboxes). "
+                             "0.0 = all easy negatives (rec_46 behavior); "
+                             "0.5 = half hard (default, rec_46_upd_1); "
+                             "1.0 = all hard negatives.")
+    parser.add_argument("--monitor-metric", type=str, default="f1",
+                        choices=["f1", "recall"],
+                        help="Metric to monitor for checkpoint saving and early stopping. "
+                             "'f1' = best-threshold F1 (default, rec_46 behavior); "
+                             "'recall' = max Recall across all thresholds. "
+                             "For screening tasks, 'recall' is recommended.")
     parser.add_argument("--hide-progress-bar", action="store_true")
     return parser.parse_args()
 
@@ -966,9 +1059,11 @@ def main() -> None:
           f"(frozen for first {args.freeze_encoder_epochs} epochs) | Epochs: {args.epochs} | Patience: {args.patience}")
     if args.patch_mode:
         print(f"Patch mode: ON | Patch size: {args.patch_size}×{args.patch_size} | "
-              f"Margin factor: {args.patch_margin_factor} | Neg:Pos ratio: {args.neg_patch_ratio}")
+              f"Margin factor: {args.patch_margin_factor} | Neg:Pos ratio: {args.neg_patch_ratio} | "
+              f"Neg hard ratio: {args.neg_hard_ratio}")
     else:
         print("Patch mode: OFF (full-image training)")
+    print(f"Monitor metric: {args.monitor_metric}")
 
     model = build_unet(
         medical_backbone_path=str(args.medical_backbone_path) if args.medical_backbone_path else None,
@@ -997,6 +1092,7 @@ def main() -> None:
     best_epoch = 0
     no_improve = 0
 
+    monitor_metric_name = str(args.monitor_metric)
     _exit_state = {"reported": False}
 
     def _on_exit(reason: Optional[str] = None) -> None:
@@ -1005,7 +1101,7 @@ def main() -> None:
         _exit_state["reported"] = True
         end_time = time.time()
         print(f"\n[Exit] Reason: {reason or 'normal'}")
-        print(f"Best BestThreshF1={best_metric:.4f} at epoch {best_epoch}")
+        print(f"Best {monitor_metric_name}={best_metric:.4f} at epoch {best_epoch}")
 
     atexit.register(_on_exit, "atexit")
 
@@ -1037,6 +1133,7 @@ def main() -> None:
                 patch_size=int(args.patch_size),
                 margin_factor=float(args.patch_margin_factor),
                 neg_patch_ratio=float(args.neg_patch_ratio),
+                neg_hard_ratio=float(args.neg_hard_ratio),
                 augment=bool(args.augment),
                 aug_hflip_prob=float(args.aug_hflip_prob),
                 aug_brightness_delta=float(args.aug_brightness_delta),
@@ -1095,28 +1192,32 @@ def main() -> None:
             disable_tqdm=bool(args.hide_progress_bar),
         )
 
-        monitor_metric = float(val_metrics.get("best_thresh_f1", 0.0))
-        best_thresh = float(val_metrics.get("best_thresh", 0.5))
+        if monitor_metric_name == "recall":
+            cur_monitor = float(val_metrics.get("best_recall", 0.0))
+            monitor_thresh = float(val_metrics.get("best_recall_thresh", 0.5))
+        else:
+            cur_monitor = float(val_metrics.get("best_thresh_f1", 0.0))
+            monitor_thresh = float(val_metrics.get("best_f1_thresh", 0.5))
 
         row: Dict[str, float] = {"epoch": float(epoch + 1), "loss": float(avg_loss)}
         row.update(val_metrics)
         history.append(row)
 
-        best_tp = int(val_metrics.get(f"tp@{best_thresh}", 0))
-        best_fp = int(val_metrics.get(f"fp@{best_thresh}", 0))
-        best_fn = int(val_metrics.get(f"fn@{best_thresh}", 0))
-        best_recall = best_tp / max(best_tp + best_fn, 1)
-        best_prec = best_tp / max(best_tp + best_fp, 1)
+        report_tp = int(val_metrics.get(f"tp@{monitor_thresh}", 0))
+        report_fp = int(val_metrics.get(f"fp@{monitor_thresh}", 0))
+        report_fn = int(val_metrics.get(f"fn@{monitor_thresh}", 0))
+        report_recall = report_tp / max(report_tp + report_fn, 1)
+        report_prec = report_tp / max(report_tp + report_fp, 1)
         print(
             f"Epoch {epoch + 1}/{args.epochs} | loss={avg_loss:.4f} | "
-            f"BestThreshF1={monitor_metric:.4f} @ thresh={best_thresh} "
-            f"(TP={best_tp} FP={best_fp} FN={best_fn} Recall={best_recall:.3f} Prec={best_prec:.3f}) | "
+            f"{monitor_metric_name}={cur_monitor:.4f} @ thresh={monitor_thresh} "
+            f"(TP={report_tp} FP={report_fp} FN={report_fn} Recall={report_recall:.3f} Prec={report_prec:.3f}) | "
             f"lr={lr_scheduler.get_last_lr()[-1]:.6f}"
         )
 
-        improved = monitor_metric > best_metric + float(args.min_delta)
+        improved = cur_monitor > best_metric + float(args.min_delta)
         if improved:
-            best_metric = monitor_metric
+            best_metric = cur_monitor
             no_improve = 0
             best_epoch = epoch + 1
             save_checkpoint(
@@ -1124,20 +1225,20 @@ def main() -> None:
                 model=model,
                 meta={
                     "epoch": epoch + 1,
-                    "best_thresh_f1": monitor_metric,
-                    "best_thresh": best_thresh,
+                    monitor_metric_name: cur_monitor,
+                    "monitor_thresh": monitor_thresh,
                     "input_h": int(args.input_h),
                     "input_w": int(args.input_w),
                 },
             )
-            print(f"  [Checkpoint] Epoch {epoch + 1} | Saved (BestThreshF1={best_metric:.4f}) -> {save_path}")
+            print(f"  [Checkpoint] Epoch {epoch + 1} | Saved ({monitor_metric_name}={best_metric:.4f}) -> {save_path}")
         else:
             no_improve += 1
             if int(args.patience) > 0 and no_improve >= int(args.patience):
                 print(f"Early stopping triggered: no improvement for {no_improve} epochs.")
                 break
 
-    print(f"\nTraining complete. Best BestThreshF1={best_metric:.4f} at epoch {best_epoch}.")
+    print(f"\nTraining complete. Best {monitor_metric_name}={best_metric:.4f} at epoch {best_epoch}.")
     print(f"Checkpoint: {save_path}")
     _exit_state["reported"] = True
 
