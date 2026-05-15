@@ -79,6 +79,11 @@ rec_46_upd_2（hard neg 比例提升 + Fbeta2 监控）
   核心改动 2：新增 --monitor-metric fbeta2；F2 = 5*P*R/(4P+R)，β=2 使 Recall 权重
               是 Precision 的 4 倍，argmax 跨阈值安全（低 Precision 自然压制低阈值）。
   核心改动 3：--neg-hard-ratio 建议提升到 0.8，给模型更多正样本图的非病灶区域负样本。
+  核心改动 4（rec_46_upd_2 补丁）：新增 --min-detection-area（default 200 px²）传入
+              heatmap_to_boxes()，替换硬编码的 min_component_area=50。原始图像分辨率
+              912×1520，GT box 面积 1% 分位为 759 px²，50 px² ≈ 7×7 像素（噪声级别）
+              导致散点激活各自计为一个 FP 框。200 px² ≈ 14×14 像素 ≈ 2.3mm，可过滤
+              亚病灶噪声而不影响真实病灶检测。
   预期：checkpoint 选择更合理；FP 进一步下降而 Recall 维持高位。
 """
 
@@ -859,6 +864,7 @@ def validate(
     val_batch_size: int,
     iou_threshold: float,
     dilation_size: int,
+    min_component_area: int,
     epoch: int,
     epochs: int,
     disable_tqdm: bool = False,
@@ -893,7 +899,8 @@ def validate(
             pred_heatmap_orig = cv2.resize(pred_heatmap, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
 
             for thresh in multi_thresholds:
-                pred_boxes, _ = heatmap_to_boxes(pred_heatmap_orig, thresh, dilation_size)
+                pred_boxes, _ = heatmap_to_boxes(pred_heatmap_orig, thresh, dilation_size,
+                                                 min_component_area=min_component_area)
                 tp, fp, fn = compute_iou_matches(pred_boxes, gt_boxes, iou_threshold)
                 multi_stats[thresh]["tp"] += tp
                 multi_stats[thresh]["fp"] += fp
@@ -1001,6 +1008,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-heatmap-threshold", type=float, default=0.5)
     parser.add_argument("--val-heatmap-dilation", type=int, default=30)
     parser.add_argument("--val-iou-threshold", type=float, default=0.1)
+    parser.add_argument("--min-detection-area", type=int, default=200,
+                        help="Minimum connected-component area (pixels^2) to count as a detection. "
+                             "Filters sub-lesion noise activations. At 912x1520 original resolution, "
+                             "200 px^2 ≈ 14x14 pixels ≈ 2.3mm; 1%% GT box area = 759 px^2. "
+                             "Default 200 keeps all real lesions while removing noise.")
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--min-delta", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
@@ -1218,6 +1230,7 @@ def main() -> None:
             val_batch_size=int(args.val_batch_size),
             iou_threshold=float(args.val_iou_threshold),
             dilation_size=int(args.val_heatmap_dilation),
+            min_component_area=int(args.min_detection_area),
             epoch=epoch,
             epochs=int(args.epochs),
             disable_tqdm=bool(args.hide_progress_bar),
