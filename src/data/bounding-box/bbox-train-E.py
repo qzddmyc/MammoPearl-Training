@@ -11,10 +11,11 @@ python src/data/bounding-box/bbox-train-E.py \
     --batch-size 4 \
     --lr 1e-4 \
     --encoder-lr-multiplier 0.1 \
-    --freeze-encoder-epochs 5 \
     --input-h 1024 \
     --input-w 512 \
     --clf-pos-weight 50.0 \
+    --tversky-alpha 0.3 \
+    --tversky-beta 0.7 \
     --val-heatmap-threshold 0.5 \
     --val-heatmap-dilation 30 \
     --val-iou-threshold 0.1 \
@@ -28,7 +29,7 @@ python src/data/bounding-box/bbox-train-E.py \
             全局腺体分布与局部病灶，突破 patch 分类器的系统性误差
 
 GT 生成：将 xyxy bbox 转为硬掩码（框内像素=1.0，框外=0.0），缩放到
-1024×512 坐标系后写入，用 BCEWithLogitsLoss + Dice loss 联合监督。
+1024×512 坐标系后写入，用 BCEWithLogitsLoss + Tversky loss 联合监督。
 
 后处理复用方向 D 管线：sigmoid → 阈值 → 膨胀 → 连通域 → 外接矩形 → IoU 匹配 GT。
 
@@ -55,10 +56,21 @@ rec_45_upd_1
 
 rec_45_upd_2
   新增：--encoder-lr-multiplier（默认 0.1）：编码器 lr = 1e-5，解码器 lr = 1e-4
-  新增：--freeze-encoder-epochs（默认 5）：前 5 epoch 冻结编码器（requires_grad=False），
-        解码器先在稳定预训练特征基础上学习；epoch 6 自动解冻编码器，以 1e-5 细调
-  删除：无效参数 --sigma-ratio（高斯 GT 已废弃）
-  预期：F1 不再在 epoch 2–3 触顶后单调衰退，能持续改善至 epoch 10–20 以上
+  新增：--freeze-encoder-epochs 5：前 5 epoch 冻结编码器，epoch 6 自动解冻
+  结果：epoch 4 最佳 F1=0.4292，之后持续崩溃（epoch 11 F1=0.2424）
+  好消息：差异化 lr 有效保护了编码器——loss 全程维持在 0.75–0.82（upd_1 已跌至 0.27），
+          编码器预训练特征未被覆写
+  坏消息：冻结适得其反：解码器在固定特征上学到的权重，解冻时被扰动后未能恢复；
+          保守性坍缩仍然存在——Dice loss 对 FP/FN 对称惩罚，模型学到"少预测"能
+          同时降低 BCE 和 Dice，导致 Recall 持续下滑，Precision 反而上升
+
+rec_45_upd_3（当前版本）
+  变更：将 Dice loss 替换为 Tversky loss（α=0.3, β=0.7），FN 权重 > FP 权重，
+        直接惩罚漏检，阻止保守性坍缩，同时保持对 FP 的适度约束
+  变更：--freeze-encoder-epochs 默认改为 0（不冻结），差异化 lr 单独保护编码器即可；
+        参数保留以便手动指定
+  新增：--tversky-alpha（默认 0.3）/ --tversky-beta（默认 0.7）可调参数
+  预期：Recall 不再因 loss 自我奖励保守策略而持续下滑，F1 曲线能在 epoch 10+ 维持或继续改善
 """
 
 from __future__ import annotations
@@ -503,12 +515,25 @@ def build_unet(
 # Loss
 # ─────────────────────────────────────────────────────────────────────────────
 
-def dice_loss(pred_sigmoid: torch.Tensor, target: torch.Tensor, smooth: float = 1.0) -> torch.Tensor:
-    """Soft Dice loss. pred_sigmoid and target are in [0, 1], same shape."""
+def tversky_loss(
+    pred_sigmoid: torch.Tensor,
+    target: torch.Tensor,
+    alpha: float = 0.3,
+    beta: float = 0.7,
+    smooth: float = 1.0,
+) -> torch.Tensor:
+    """Tversky loss. alpha weights FP, beta weights FN.
+
+    With beta > alpha, FN is penalized more than FP, encouraging higher recall.
+    Setting alpha=beta=0.5 is equivalent to Dice loss.
+    """
     pred_flat = pred_sigmoid.reshape(-1)
     tgt_flat = target.reshape(-1)
-    intersection = (pred_flat * tgt_flat).sum()
-    return 1.0 - (2.0 * intersection + smooth) / (pred_flat.sum() + tgt_flat.sum() + smooth)
+    tp = (pred_flat * tgt_flat).sum()
+    fp = (pred_flat * (1.0 - tgt_flat)).sum()
+    fn = ((1.0 - pred_flat) * tgt_flat).sum()
+    tversky_index = (tp + smooth) / (tp + alpha * fp + beta * fn + smooth)
+    return 1.0 - tversky_index
 
 
 def combined_loss(
@@ -516,16 +541,19 @@ def combined_loss(
     target: torch.Tensor,
     pos_weight: float = 5.0,
     bce_alpha: float = 0.5,
+    tversky_alpha: float = 0.3,
+    tversky_beta: float = 0.7,
 ) -> torch.Tensor:
-    """BCE + Dice combined loss.
+    """BCE + Tversky combined loss.
 
-    bce_alpha: weight of BCE term (1 - bce_alpha applied to Dice).
+    bce_alpha: weight of BCE term (1 - bce_alpha applied to Tversky).
+    tversky_alpha / tversky_beta: FP / FN weights in Tversky loss.
     """
     pw = torch.tensor([pos_weight], device=logits.device, dtype=logits.dtype)
     bce = torch.nn.functional.binary_cross_entropy_with_logits(logits, target, pos_weight=pw)
     pred_sigmoid = torch.sigmoid(logits)
-    dice = dice_loss(pred_sigmoid, target)
-    return bce_alpha * bce + (1.0 - bce_alpha) * dice
+    tversky = tversky_loss(pred_sigmoid, target, alpha=tversky_alpha, beta=tversky_beta)
+    return bce_alpha * bce + (1.0 - bce_alpha) * tversky
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -542,6 +570,8 @@ def train_one_epoch(
     accumulation_steps: int,
     pos_weight: float = 5.0,
     bce_alpha: float = 0.5,
+    tversky_alpha: float = 0.3,
+    tversky_beta: float = 0.7,
     disable_tqdm: bool = False,
 ) -> float:
     model.train()
@@ -555,7 +585,13 @@ def train_one_epoch(
         heatmaps = heatmaps.to(device)
 
         logits = model(imgs)  # (B, 1, H, W)
-        loss = combined_loss(logits, heatmaps, pos_weight=pos_weight, bce_alpha=bce_alpha)
+        loss = combined_loss(
+            logits, heatmaps,
+            pos_weight=pos_weight,
+            bce_alpha=bce_alpha,
+            tversky_alpha=tversky_alpha,
+            tversky_beta=tversky_beta,
+        )
 
         if not torch.isfinite(loss):
             optimizer.zero_grad(set_to_none=True)
@@ -710,9 +746,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder-lr-multiplier", type=float, default=0.1,
                         help="LR multiplier for pretrained encoder. Decoder uses full --lr. "
                              "Prevents catastrophic forgetting of pretrained features.")
-    parser.add_argument("--freeze-encoder-epochs", type=int, default=5,
+    parser.add_argument("--freeze-encoder-epochs", type=int, default=0,
                         help="Number of epochs to keep encoder frozen (requires_grad=False). "
-                             "After this, encoder is unfrozen with encoder_lr = lr * encoder_lr_multiplier.")
+                             "After this, encoder is unfrozen with encoder_lr = lr * encoder_lr_multiplier. "
+                             "Default 0 = no freeze (differential LR handles encoder protection).")
+    parser.add_argument("--tversky-alpha", type=float, default=0.3,
+                        help="FP weight in Tversky loss. Lower value = less FP penalty.")
+    parser.add_argument("--tversky-beta", type=float, default=0.7,
+                        help="FN weight in Tversky loss. Higher value = more FN penalty = higher recall.")
     parser.add_argument("--hide-progress-bar", action="store_true")
     return parser.parse_args()
 
@@ -847,6 +888,8 @@ def main() -> None:
             accumulation_steps=int(args.accumulation_steps),
             pos_weight=float(args.clf_pos_weight),
             bce_alpha=float(args.bce_alpha),
+            tversky_alpha=float(args.tversky_alpha),
+            tversky_beta=float(args.tversky_beta),
             disable_tqdm=bool(args.hide_progress_bar),
         )
         lr_scheduler.step()
