@@ -12,7 +12,7 @@ python src/data/bounding-box/bbox-train-E.py \
     --lr 1e-4 \
     --input-h 1024 \
     --input-w 512 \
-    --clf-pos-weight 5.0 \
+    --clf-pos-weight 50.0 \
     --val-heatmap-threshold 0.5 \
     --val-heatmap-dilation 30 \
     --val-iou-threshold 0.1 \
@@ -264,34 +264,30 @@ def patient_level_split(
 # GT heatmap generation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_gaussian_heatmap(
+def make_bbox_heatmap(
     h: int,
     w: int,
     boxes: np.ndarray,   # (N, 4) xyxy in (h, w) coordinate system
-    sigma_ratio: float = 6.0,
 ) -> np.ndarray:
-    """Generate a soft GT heatmap with Gaussian blobs centred on each GT box.
+    """Generate a binary GT heatmap by filling each GT bbox with 1.
 
-    σ is computed as min(box_w, box_h) / sigma_ratio so larger boxes produce
-    wider blobs.  Values are clipped to [0, 1].
+    Replaces the previous Gaussian blob approach.  Hard binary mask gives
+    clear gradient signal and avoids the near-zero values at blob edges that
+    caused the model to converge to all-zero predictions under severe
+    pixel-level class imbalance (~1:420).
     """
     heatmap = np.zeros((h, w), dtype=np.float32)
     if boxes.size == 0:
         return heatmap
-
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-
     for box in boxes:
-        x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
-        if x2 <= x1 or y2 <= y1:
-            continue
-        cx = (x1 + x2) / 2.0
-        cy = (y1 + y2) / 2.0
-        sigma = max(min(x2 - x1, y2 - y1) / sigma_ratio, 1.0)
-        gauss = np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2.0 * sigma ** 2))
-        heatmap = np.maximum(heatmap, gauss)
-
-    return np.clip(heatmap, 0.0, 1.0)
+        x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(w, x2)
+        y2 = min(h, y2)
+        if x2 > x1 and y2 > y1:
+            heatmap[y1:y2, x1:x2] = 1.0
+    return heatmap
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -303,7 +299,7 @@ class SegDataset(Dataset):
 
     Each item is (image_tensor [3, H, W], heatmap_tensor [1, H, W]).
     Image is resized to (input_h, input_w).  GT boxes are scaled accordingly,
-    then converted to Gaussian blob heatmaps.
+    then converted to hard binary bbox masks (pixels inside any GT box = 1, else 0).
     """
 
     def __init__(
@@ -381,8 +377,8 @@ class SegDataset(Dataset):
                 delta = (self.rng.random() * 2 - 1) * self.aug_brightness_delta * 255
                 img_resized = np.clip(img_resized.astype(np.float32) + delta, 0, 255).astype(np.uint8)
 
-        # Build GT heatmap
-        heatmap = make_gaussian_heatmap(self.input_h, self.input_w, scaled_boxes)
+        # Build GT heatmap (hard binary bbox mask)
+        heatmap = make_bbox_heatmap(self.input_h, self.input_w, scaled_boxes)
 
         img_t = image_to_tensor(img_resized)
         hm_t = torch.from_numpy(heatmap).unsqueeze(0)  # (1, H, W)
@@ -666,7 +662,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--input-h", type=int, default=1024, help="Resize height for model input")
     parser.add_argument("--input-w", type=int, default=512, help="Resize width for model input")
-    parser.add_argument("--clf-pos-weight", type=float, default=5.0, help="BCE pos_weight for foreground pixels")
+    parser.add_argument("--clf-pos-weight", type=float, default=50.0, help="BCE pos_weight for foreground pixels (pixel-level imbalance ~1:420, so much higher than patch-level)")
     parser.add_argument("--bce-alpha", type=float, default=0.5, help="Weight of BCE in combined loss (1-alpha for Dice)")
     parser.add_argument("--val-heatmap-threshold", type=float, default=0.5)
     parser.add_argument("--val-heatmap-dilation", type=int, default=30)
