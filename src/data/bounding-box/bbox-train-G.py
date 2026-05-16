@@ -121,7 +121,7 @@ def load_samples(csv_path: Path, images_root: Path, split_name: str) -> List[Sam
         patient_id = str(row["patient_id"])
         image_id = str(row["image_id"])
         key = f"{patient_id}/{image_id}"
-        image_path = images_root / patient_id / f"{image_id}.png"
+        image_path = images_root / patient_id / image_id
         if key not in samples_dict:
             samples_dict[key] = Sample(
                 patient_id=patient_id,
