@@ -28,7 +28,7 @@ python src/data/bounding-box/bbox-train-G.py \
     --encoder-lr-multiplier 0.01 \
     --crop-expand 1.5 \
     --crop-size 224 \
-    --hard-neg-per-pos-image 3 \
+    --mine-hard-negs-per-image 5 \
     --easy-neg-ratio 0.5 \
     --stage1-threshold 0.3 \
     --val-heatmap-dilation 15 \
@@ -280,6 +280,62 @@ def box_iou(a: np.ndarray, b: np.ndarray) -> float:
     return inter / max(area_a + area_b - inter, 1e-6)
 
 
+# (image_path, box_xyxy, orig_h, orig_w)
+MiningItem = Tuple[Path, np.ndarray, int, int]
+
+
+def mine_stage1_fp_crops(
+    stage1_model: "nn.Module",
+    samples: List[Sample],
+    indices: List[int],
+    device: torch.device,
+    input_h: int,
+    input_w: int,
+    stage1_threshold: float,
+    dilation_size: int,
+    min_component_area: int,
+    nms_iou_thresh: float,
+    max_per_image: int,
+    disable_tqdm: bool,
+) -> List[MiningItem]:
+    """Run Stage 1 on training images and collect FP candidate crops.
+
+    For each image, extracts heatmap candidates and keeps those with
+    IoU < 0.1 with all GT boxes (i.e., genuine false positives of Stage 1).
+    These are used as hard negatives for Stage 2 training.
+    """
+    stage1_model.eval()
+    mined: List[MiningItem] = []
+    pbar = tqdm(indices, desc="Mining Stage1 FPs", leave=False, disable=disable_tqdm)
+    with torch.no_grad():
+        for idx in pbar:
+            s = samples[idx]
+            orig_img = normalize_image(read_image_unicode(s.image_path))
+            orig_h, orig_w = orig_img.shape[:2]
+            img_resized = cv2.resize(orig_img, (input_w, input_h), interpolation=cv2.INTER_LINEAR)
+            img_t = image_to_tensor(img_resized).unsqueeze(0).to(device)
+            logits = stage1_model(img_t)
+            heatmap = torch.sigmoid(logits)[0, 0].cpu().numpy()
+            heatmap_orig = cv2.resize(heatmap, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+            cand_boxes, cand_scores = heatmap_to_boxes(
+                heatmap_orig, stage1_threshold, dilation_size,
+                min_component_area=min_component_area, nms_iou_thresh=nms_iou_thresh,
+            )
+            if len(cand_boxes) == 0:
+                continue
+            gt_boxes = s.boxes
+            fp_boxes: List[Tuple[np.ndarray, float]] = []
+            for box, score in zip(cand_boxes, cand_scores):
+                is_fp = all(box_iou(box, gt) < 0.1 for gt in gt_boxes)
+                if is_fp:
+                    fp_boxes.append((box, float(score)))
+            # Sort by score descending, take top max_per_image
+            fp_boxes.sort(key=lambda x: x[1], reverse=True)
+            for box, _ in fp_boxes[:max_per_image]:
+                mined.append((s.image_path, box, orig_h, orig_w))
+    return mined
+
+
 def make_crop(
     img: np.ndarray,        # HWC uint8
     box: np.ndarray,        # [x1, y1, x2, y2] in img coords
@@ -321,8 +377,9 @@ class CropDataset(Dataset):
     """Binary crop classification dataset.
 
     Positive  : one crop per GT box in positive training images.
-    Hard neg  : hard_neg_per_pos_image random crops per positive image
-                that do NOT overlap any GT box (IoU < 0.1).
+    Hard neg  : if mined_hard_negs is given, use Stage 1 FP candidates;
+                otherwise, sample hard_neg_per_pos_image random crops per
+                positive image that do NOT overlap any GT box (IoU < 0.1).
     Easy neg  : random crops from purely negative images,
                 capped at n_hard_neg * easy_neg_ratio.
     """
@@ -337,6 +394,7 @@ class CropDataset(Dataset):
         easy_neg_ratio: float,
         augment: bool,
         seed: int = 42,
+        mined_hard_negs: Optional[List[MiningItem]] = None,
     ) -> None:
         self.crop_size = crop_size
         self.expand_factor = expand_factor
@@ -347,26 +405,38 @@ class CropDataset(Dataset):
         pos_indices = [i for i in indices if samples[i].boxes.shape[0] > 0]
         neg_indices = [i for i in indices if samples[i].boxes.shape[0] == 0]
 
-        n_hard_neg = 0
+        # ── Positive crops ──────────────────────────────────────────────────
         for idx in pos_indices:
             s = samples[idx]
             orig_h = int(s.orig_size[0]) if s.orig_size[0] > 0 else _VINDR_DEFAULT_H
             orig_w = int(s.orig_size[1]) if s.orig_size[1] > 0 else _VINDR_DEFAULT_W
-            # Positive crops
             for box in s.boxes:
                 self.items.append((s.image_path, box.copy(), 1, orig_h, orig_w))
-            # Hard negative crops
-            added, attempts = 0, 0
-            max_attempts = hard_neg_per_pos_image * 25
-            while added < hard_neg_per_pos_image and attempts < max_attempts:
-                attempts += 1
-                neg_box = self._sample_hard_neg(s.boxes, orig_h, orig_w)
-                if neg_box is not None:
-                    self.items.append((s.image_path, neg_box, 0, orig_h, orig_w))
-                    added += 1
-                    n_hard_neg += 1
 
-        # Easy negatives (capped)
+        # ── Hard negatives ──────────────────────────────────────────────────
+        n_hard_neg = 0
+        if mined_hard_negs is not None:
+            # Use Stage 1 FP candidates mined from training images
+            for path, box, h, w in mined_hard_negs:
+                self.items.append((path, box, 0, h, w))
+                n_hard_neg += 1
+        else:
+            # Fallback: random crops from positive images (not overlapping GT)
+            for idx in pos_indices:
+                s = samples[idx]
+                orig_h = int(s.orig_size[0]) if s.orig_size[0] > 0 else _VINDR_DEFAULT_H
+                orig_w = int(s.orig_size[1]) if s.orig_size[1] > 0 else _VINDR_DEFAULT_W
+                added, attempts = 0, 0
+                max_attempts = hard_neg_per_pos_image * 25
+                while added < hard_neg_per_pos_image and attempts < max_attempts:
+                    attempts += 1
+                    neg_box = self._sample_hard_neg(s.boxes, orig_h, orig_w)
+                    if neg_box is not None:
+                        self.items.append((s.image_path, neg_box, 0, orig_h, orig_w))
+                        added += 1
+                        n_hard_neg += 1
+
+        # ── Easy negatives (from pure negative images, capped) ──────────────
         max_easy = int(n_hard_neg * easy_neg_ratio)
         self._rng.shuffle(neg_indices)
         easy_added = 0
@@ -382,9 +452,10 @@ class CropDataset(Dataset):
 
         n_pos = sum(1 for it in self.items if it[2] == 1)
         n_neg = len(self.items) - n_pos
+        hard_src = "mined" if mined_hard_negs is not None else "random"
         print(
             f"  CropDataset: {len(self.items)} items | "
-            f"pos={n_pos} neg={n_neg} (hard_neg={n_hard_neg} easy_neg={easy_added})"
+            f"pos={n_pos} neg={n_neg} (hard_neg={n_hard_neg}[{hard_src}] easy_neg={easy_added})"
         )
 
     def _sample_hard_neg(
@@ -449,13 +520,19 @@ class Stage2Net(nn.Module):
         return self.head(features[-1])  # (B, 1)
 
 
-def build_stage2_net(stage1_model_path: Path, device: torch.device) -> Stage2Net:
-    """Load Stage 1 U-Net checkpoint, extract encoder, build Stage2Net."""
-    assert HAS_SMP, "segmentation_models_pytorch is required (pip install segmentation-models-pytorch)"
+def load_stage1_unet(stage1_model_path: Path, device: torch.device) -> "smp.Unet":
+    """Load full Stage 1 U-Net from checkpoint."""
+    assert HAS_SMP, "segmentation_models_pytorch is required"
     stage1 = smp.Unet(encoder_name="resnet50", in_channels=3, classes=1, activation=None)
     ckpt = torch.load(str(stage1_model_path), map_location="cpu")
     state_dict = ckpt.get("model_state_dict", ckpt)
     stage1.load_state_dict(state_dict)
+    return stage1.to(device)
+
+
+def build_stage2_net(stage1_model_path: Path, device: torch.device) -> Stage2Net:
+    """Load Stage 1 U-Net checkpoint, extract encoder, build Stage2Net."""
+    stage1 = load_stage1_unet(stage1_model_path, device)
     model = Stage2Net(encoder=stage1.encoder, encoder_out_channels=2048)
     return model.to(device)
 
@@ -673,7 +750,11 @@ def parse_args() -> argparse.Namespace:
                         help="Context expansion factor around each candidate box. "
                              "1.5 adds 25%% of box width/height as margin on each side.")
     parser.add_argument("--hard-neg-per-pos-image", type=int, default=3,
-                        help="Hard negative crops sampled per positive training image.")
+                        help="Hard negative crops sampled per positive training image "
+                             "(used only when --mine-hard-negs-per-image=0).")
+    parser.add_argument("--mine-hard-negs-per-image", type=int, default=5,
+                        help="Run Stage 1 on training images to mine FP candidates as hard negatives. "
+                             "Value = max FP crops per image. Set 0 to disable (use random crops instead).")
     parser.add_argument("--easy-neg-ratio", type=float, default=0.5,
                         help="Ratio of easy negatives (from pure negative images) to hard negatives.")
     parser.add_argument("--input-h", type=int, default=1024,
@@ -729,6 +810,31 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
+    # ── Load Stage 1 model (used for mining + later reused for Stage 2 encoder) ──
+    print(f"\nLoading Stage 1 U-Net from {stage1_path} ...")
+    stage1_unet = load_stage1_unet(stage1_path, device)
+
+    # ── Hard negative mining ──────────────────────────────────────────────────
+    train_mined_negs: Optional[List[MiningItem]] = None
+    mine_n = int(args.mine_hard_negs_per_image)
+    if mine_n > 0:
+        print(f"Mining Stage 1 FP candidates (max {mine_n}/image, {len(train_idx)} images)...")
+        train_mined_negs = mine_stage1_fp_crops(
+            stage1_model=stage1_unet,
+            samples=all_samples,
+            indices=train_idx,
+            device=device,
+            input_h=int(args.input_h),
+            input_w=int(args.input_w),
+            stage1_threshold=float(args.stage1_threshold),
+            dilation_size=int(args.val_heatmap_dilation),
+            min_component_area=int(args.min_detection_area),
+            nms_iou_thresh=float(args.box_nms_thresh),
+            max_per_image=mine_n,
+            disable_tqdm=bool(args.hide_progress_bar),
+        )
+        print(f"  Mined {len(train_mined_negs)} FP hard negatives from training set.")
+
     # Build datasets
     print("\nBuilding CropDataset (train)...")
     train_ds = CropDataset(
@@ -739,6 +845,7 @@ def main() -> None:
         easy_neg_ratio=float(args.easy_neg_ratio),
         augment=bool(args.augment),
         seed=int(args.seed),
+        mined_hard_negs=train_mined_negs,
     )
     print("Building CropDataset (val)...")
     val_ds = CropDataset(
@@ -749,6 +856,7 @@ def main() -> None:
         easy_neg_ratio=float(args.easy_neg_ratio),
         augment=False,
         seed=int(args.seed),
+        mined_hard_negs=None,   # val uses random hard negs (monitoring only)
     )
     train_loader = DataLoader(
         train_ds, batch_size=int(args.batch_size), shuffle=True,
@@ -759,9 +867,10 @@ def main() -> None:
         num_workers=int(args.num_workers), pin_memory=True,
     )
 
-    # Build Stage 2 model
-    print("\nLoading Stage 1 encoder for Stage 2...")
-    model = build_stage2_net(stage1_path, device)
+    # Build Stage 2 model (reuse already-loaded Stage 1 encoder)
+    print("\nBuilding Stage 2 model from Stage 1 encoder...")
+    model = Stage2Net(encoder=stage1_unet.encoder, encoder_out_channels=2048).to(device)
+    del stage1_unet  # decoder no longer needed; encoder is kept alive via model.encoder
 
     encoder_lr = float(args.lr) * float(args.encoder_lr_multiplier)
     head_lr = float(args.lr)
