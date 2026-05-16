@@ -22,9 +22,9 @@ python src/data/bounding-box/bbox-train-F.py \
     --val-heatmap-dilation 15 \
     --val-iou-threshold 0.1 \
     --patience 20 \
-    --neg-hard-ratio 0.5 \
-    --monitor-metric fbeta2 \
     --neg-hard-ratio 0.8 \
+    --min-detection-area 200 \
+    --monitor-metric fbeta2 \
     --medical-backbone-path models/raw/ResNet50.pt \
     --hide-progress-bar
 
