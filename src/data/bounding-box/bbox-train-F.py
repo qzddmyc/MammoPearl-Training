@@ -8,22 +8,23 @@ r"""
 
 python src/data/bounding-box/bbox-train-F.py \
     --epochs 50 \
-    --batch-size 16 \
+    --batch-size 10 \
     --lr 1e-4 \
     --encoder-lr-multiplier 0.1 \
     --input-h 1024 \
     --input-w 512 \
     --patch-mode \
-    --patch-size 256 \
+    --patch-size 384 \
     --clf-pos-weight 5.0 \
     --tversky-alpha 0.3 \
     --tversky-beta 0.7 \
     --val-heatmap-threshold 0.5 \
     --val-heatmap-dilation 15 \
     --val-iou-threshold 0.1 \
-    --patience 20 \
+    --patience 5 \
     --neg-hard-ratio 0.8 \
     --min-detection-area 200 \
+    --box-nms-thresh 0.3 \
     --monitor-metric fbeta2 \
     --medical-backbone-path models/raw/ResNet50.pt \
     --hide-progress-bar
@@ -85,6 +86,20 @@ rec_46_upd_2（hard neg 比例提升 + Fbeta2 监控）
               导致散点激活各自计为一个 FP 框。200 px² ≈ 14×14 像素 ≈ 2.3mm，可过滤
               亚病灶噪声而不影响真实病灶检测。
   预期：checkpoint 选择更合理；FP 进一步下降而 Recall 维持高位。
+
+rec_46_upd_3（NMS + 更大 patch size）
+  基础：rec_46_upd_2 代码
+  核心改动 1：新增 --box-nms-thresh（default 0.0 = 禁用）。在 heatmap_to_boxes() 连通
+              域提取后对所有候选框做贪心 IoU-based NMS，合并同一区域内的碎片化 FP
+              框，减少重复计数。推荐值 0.3。
+  核心改动 2：默认 patch-size 建议从 256 改为 384，增大训练时感受野，使模型能看到
+              激活区域的周边组织，从根源减少高置信 FP（病灶样实质误激活）。
+              batch-size 相应从 16 降至 10（384×384 约是 256×256 的 2.25×，RTX 4090
+              24GB 下 batch=10 安全；如出现 OOM 可降至 8）。
+  核心改动 3：patience 建议从 20 降至 5。rec_46_upd_2 实验表明 F2 在 epoch 4 达峰，
+              随后系统性退化（过拟合），patience=20 浪费计算且不能改善 checkpoint。
+  预期：NMS 直接降低碎片化 FP 计数；更大 patch 在 Stage 1 层面减少高置信 FP；
+        更短 patience 使训练在退化前及时停止。
 """
 
 from __future__ import annotations
@@ -182,11 +197,39 @@ def image_to_tensor(img: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 
 
+def _nms_boxes(boxes: np.ndarray, scores: np.ndarray, iou_thresh: float) -> List[int]:
+    """Greedy NMS. Returns indices of kept boxes (sorted by score descending)."""
+    if len(boxes) == 0:
+        return []
+    order = np.argsort(scores)[::-1]
+    keep: List[int] = []
+    while len(order) > 0:
+        idx = int(order[0])
+        keep.append(idx)
+        if len(order) == 1:
+            break
+        rest = order[1:]
+        bx = boxes[idx]
+        br = boxes[rest]
+        ix1 = np.maximum(bx[0], br[:, 0])
+        iy1 = np.maximum(bx[1], br[:, 1])
+        ix2 = np.minimum(bx[2], br[:, 2])
+        iy2 = np.minimum(bx[3], br[:, 3])
+        inter = np.maximum(0.0, ix2 - ix1) * np.maximum(0.0, iy2 - iy1)
+        area_bx = (bx[2] - bx[0]) * (bx[3] - bx[1])
+        area_br = (br[:, 2] - br[:, 0]) * (br[:, 3] - br[:, 1])
+        union = area_bx + area_br - inter
+        iou = inter / np.maximum(union, 1e-6)
+        order = rest[iou < iou_thresh]
+    return keep
+
+
 def heatmap_to_boxes(
     heatmap: np.ndarray,
     threshold: float,
     dilation_size: int = 30,
     min_component_area: int = 50,
+    nms_iou_thresh: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     if heatmap.size == 0 or float(heatmap.max()) < threshold:
         return np.zeros((0, 4), dtype=np.float32), np.zeros((0,), dtype=np.float32)
@@ -206,7 +249,13 @@ def heatmap_to_boxes(
         scores_list.append(float(heatmap[component_mask].max()))
     if not boxes_list:
         return np.zeros((0, 4), dtype=np.float32), np.zeros((0,), dtype=np.float32)
-    return np.array(boxes_list, dtype=np.float32), np.array(scores_list, dtype=np.float32)
+    boxes_arr = np.array(boxes_list, dtype=np.float32)
+    scores_arr = np.array(scores_list, dtype=np.float32)
+    if nms_iou_thresh > 0.0 and len(boxes_arr) > 1:
+        keep = _nms_boxes(boxes_arr, scores_arr, nms_iou_thresh)
+        boxes_arr = boxes_arr[keep]
+        scores_arr = scores_arr[keep]
+    return boxes_arr, scores_arr
 
 
 def compute_iou_matches(
@@ -865,6 +914,7 @@ def validate(
     iou_threshold: float,
     dilation_size: int,
     min_component_area: int,
+    nms_iou_thresh: float,
     epoch: int,
     epochs: int,
     disable_tqdm: bool = False,
@@ -900,7 +950,8 @@ def validate(
 
             for thresh in multi_thresholds:
                 pred_boxes, _ = heatmap_to_boxes(pred_heatmap_orig, thresh, dilation_size,
-                                                 min_component_area=min_component_area)
+                                                 min_component_area=min_component_area,
+                                                 nms_iou_thresh=nms_iou_thresh)
                 tp, fp, fn = compute_iou_matches(pred_boxes, gt_boxes, iou_threshold)
                 multi_stats[thresh]["tp"] += tp
                 multi_stats[thresh]["fp"] += fp
@@ -1060,6 +1111,11 @@ def parse_args() -> argparse.Namespace:
                              "'recall' = Recall at fixed thresh=0.5; "
                              "'fbeta2' = F2 score (beta=2, Recall 4x Precision weight), "
                              "argmax over thresholds -- recommended for screening.")
+    parser.add_argument("--box-nms-thresh", type=float, default=0.0,
+                        help="IoU threshold for greedy NMS applied to predicted boxes after "
+                             "connected-component extraction. 0.0 = disabled (default, preserves "
+                             "previous behaviour). Typical values: 0.3–0.5. Merges overlapping "
+                             "boxes from the same lesion region, reducing duplicate FP counts.")
     parser.add_argument("--hide-progress-bar", action="store_true")
     return parser.parse_args()
 
@@ -1231,6 +1287,7 @@ def main() -> None:
             iou_threshold=float(args.val_iou_threshold),
             dilation_size=int(args.val_heatmap_dilation),
             min_component_area=int(args.min_detection_area),
+            nms_iou_thresh=float(args.box_nms_thresh),
             epoch=epoch,
             epochs=int(args.epochs),
             disable_tqdm=bool(args.hide_progress_bar),
