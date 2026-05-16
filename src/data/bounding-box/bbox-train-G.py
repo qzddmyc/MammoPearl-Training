@@ -858,8 +858,25 @@ def main() -> None:
         seed=int(args.seed),
         mined_hard_negs=None,   # val uses random hard negs (monitoring only)
     )
+
+    # WeightedRandomSampler: force balanced batches (50% pos, 50% neg)
+    # regardless of dataset imbalance — eliminates the need to tune pos_weight
+    _n_pos = sum(1 for it in train_ds.items if it[2] == 1)
+    _n_neg = len(train_ds.items) - _n_pos
+    _sample_weights = [
+        1.0 / _n_pos if it[2] == 1 else 1.0 / _n_neg
+        for it in train_ds.items
+    ]
+    from torch.utils.data import WeightedRandomSampler
+    _sampler = WeightedRandomSampler(
+        weights=_sample_weights,
+        num_samples=len(train_ds),
+        replacement=True,
+    )
+    print(f"  Balanced sampler: n_pos={_n_pos} n_neg={_n_neg} → each batch ~50% pos/neg")
+
     train_loader = DataLoader(
-        train_ds, batch_size=int(args.batch_size), shuffle=True,
+        train_ds, batch_size=int(args.batch_size), sampler=_sampler,
         num_workers=int(args.num_workers), pin_memory=True,
     )
     val_loader = DataLoader(
