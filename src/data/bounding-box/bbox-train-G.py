@@ -1,14 +1,16 @@
 r"""
-方向 G — Stage 2：ROI 级别二分类器（rec_47）
+方向 G — Stage 2：ROI 级别二分类器（rec_47_upd_3）
 
 两阶段检测流程：
   Stage 1：U-Net（ResNet50 encoder，方向 F，已训练）生成 heatmap → NMS → 候选框
   Stage 2（本脚本）：对候选框 crop 进行二分类，过滤高置信度 FP
 
-训练策略：
-  正样本：训练集每个 GT box 区域（带 crop-expand 倍上下文填充，resize 到 crop-size×crop-size）
-  硬负样本：正样本图中随机裁取但不与任何 GT box 重叠（IoU < 0.1）的区域
+训练策略（rec_47_upd_3）：
+  正样本：Stage 1 推理后 IoU≥mine-tp-iou-thresh（默认 0.3）的 TP 候选框 crop
+          （与推理时正样本分布对齐；Stage 1 未检到的病灶 Stage 2 推理时也不会见到）
+  硬负样本：Stage 1 推理后 IoU<0.1 的 FP 候选框 crop（单次推理同时收集 TP/FP）
   易负样本：纯负样本图（无病灶）中随机裁取，数量 = hard_neg × easy-neg-ratio
+  WeightedRandomSampler：强制每 batch 50% 正样本 / 50% 负样本
 
 架构：
   编码器：Stage 1 U-Net 的 ResNet50 encoder（加载 Stage 1 checkpoint 权重）
@@ -29,6 +31,8 @@ python src/data/bounding-box/bbox-train-G.py \
     --crop-expand 1.5 \
     --crop-size 224 \
     --mine-hard-negs-per-image 5 \
+    --mine-tp-per-image 5 \
+    --mine-tp-iou-thresh 0.3 \
     --easy-neg-ratio 0.5 \
     --stage1-threshold 0.3 \
     --val-heatmap-dilation 15 \
@@ -284,7 +288,7 @@ def box_iou(a: np.ndarray, b: np.ndarray) -> float:
 MiningItem = Tuple[Path, np.ndarray, int, int]
 
 
-def mine_stage1_fp_crops(
+def mine_stage1_crops(
     stage1_model: "nn.Module",
     samples: List[Sample],
     indices: List[int],
@@ -295,18 +299,27 @@ def mine_stage1_fp_crops(
     dilation_size: int,
     min_component_area: int,
     nms_iou_thresh: float,
-    max_per_image: int,
-    disable_tqdm: bool,
-) -> List[MiningItem]:
-    """Run Stage 1 on training images and collect FP candidate crops.
+    max_tp_per_image: int,
+    max_fp_per_image: int,
+    tp_iou_thresh: float = 0.3,
+    fp_iou_thresh: float = 0.1,
+    disable_tqdm: bool = False,
+) -> Tuple[List[MiningItem], List[MiningItem]]:
+    """Run Stage 1 on training images; return (tp_crops, fp_crops) in one pass.
 
-    For each image, extracts heatmap candidates and keeps those with
-    IoU < 0.1 with all GT boxes (i.e., genuine false positives of Stage 1).
-    These are used as hard negatives for Stage 2 training.
+    For each Stage 1 candidate box:
+      - max IoU with any GT >= tp_iou_thresh  → TP crop (positive for Stage 2)
+      - max IoU with all GT  < fp_iou_thresh  → FP crop (hard negative for Stage 2)
+      - ambiguous range: skipped
+
+    Using Stage 1 TP crops (rather than raw GT boxes) as Stage 2 positives ensures
+    train/inference distribution alignment: Stage 2 sees the same type of crops
+    at train time as it will at inference.
     """
     stage1_model.eval()
-    mined: List[MiningItem] = []
-    pbar = tqdm(indices, desc="Mining Stage1 FPs", leave=False, disable=disable_tqdm)
+    tp_crops: List[MiningItem] = []
+    fp_crops: List[MiningItem] = []
+    pbar = tqdm(indices, desc="Mining Stage1 TPs/FPs", leave=False, disable=disable_tqdm)
     with torch.no_grad():
         for idx in pbar:
             s = samples[idx]
@@ -324,16 +337,22 @@ def mine_stage1_fp_crops(
             if len(cand_boxes) == 0:
                 continue
             gt_boxes = s.boxes
-            fp_boxes: List[Tuple[np.ndarray, float]] = []
+            tp_this: List[Tuple[np.ndarray, float]] = []
+            fp_this: List[Tuple[np.ndarray, float]] = []
             for box, score in zip(cand_boxes, cand_scores):
-                is_fp = all(box_iou(box, gt) < 0.1 for gt in gt_boxes)
-                if is_fp:
-                    fp_boxes.append((box, float(score)))
-            # Sort by score descending, take top max_per_image
-            fp_boxes.sort(key=lambda x: x[1], reverse=True)
-            for box, _ in fp_boxes[:max_per_image]:
-                mined.append((s.image_path, box, orig_h, orig_w))
-    return mined
+                max_iou = max((box_iou(box, gt) for gt in gt_boxes), default=0.0)
+                if max_iou >= tp_iou_thresh:
+                    tp_this.append((box, float(score)))
+                elif max_iou < fp_iou_thresh:
+                    fp_this.append((box, float(score)))
+                # else: ambiguous (0.1 <= IoU < 0.3), skip
+            tp_this.sort(key=lambda x: x[1], reverse=True)
+            fp_this.sort(key=lambda x: x[1], reverse=True)
+            for box, _ in tp_this[:max_tp_per_image]:
+                tp_crops.append((s.image_path, box, orig_h, orig_w))
+            for box, _ in fp_this[:max_fp_per_image]:
+                fp_crops.append((s.image_path, box, orig_h, orig_w))
+    return tp_crops, fp_crops
 
 
 def make_crop(
@@ -394,6 +413,7 @@ class CropDataset(Dataset):
         easy_neg_ratio: float,
         augment: bool,
         seed: int = 42,
+        mined_pos_crops: Optional[List[MiningItem]] = None,
         mined_hard_negs: Optional[List[MiningItem]] = None,
     ) -> None:
         self.crop_size = crop_size
@@ -406,12 +426,20 @@ class CropDataset(Dataset):
         neg_indices = [i for i in indices if samples[i].boxes.shape[0] == 0]
 
         # ── Positive crops ──────────────────────────────────────────────────
-        for idx in pos_indices:
-            s = samples[idx]
-            orig_h = int(s.orig_size[0]) if s.orig_size[0] > 0 else _VINDR_DEFAULT_H
-            orig_w = int(s.orig_size[1]) if s.orig_size[1] > 0 else _VINDR_DEFAULT_W
-            for box in s.boxes:
-                self.items.append((s.image_path, box.copy(), 1, orig_h, orig_w))
+        # If mined TP crops are provided, use them (Stage 1 TP candidate crops)
+        # so train/inference distributions align. Fall back to GT box crops otherwise.
+        pos_src = "mined_tp"
+        if mined_pos_crops is not None:
+            for path, box, h, w in mined_pos_crops:
+                self.items.append((path, box, 1, h, w))
+        else:
+            pos_src = "gt_box"
+            for idx in pos_indices:
+                s = samples[idx]
+                orig_h = int(s.orig_size[0]) if s.orig_size[0] > 0 else _VINDR_DEFAULT_H
+                orig_w = int(s.orig_size[1]) if s.orig_size[1] > 0 else _VINDR_DEFAULT_W
+                for box in s.boxes:
+                    self.items.append((s.image_path, box.copy(), 1, orig_h, orig_w))
 
         # ── Hard negatives ──────────────────────────────────────────────────
         n_hard_neg = 0
@@ -455,7 +483,7 @@ class CropDataset(Dataset):
         hard_src = "mined" if mined_hard_negs is not None else "random"
         print(
             f"  CropDataset: {len(self.items)} items | "
-            f"pos={n_pos} neg={n_neg} (hard_neg={n_hard_neg}[{hard_src}] easy_neg={easy_added})"
+            f"pos={n_pos}[{pos_src}] neg={n_neg} (hard_neg={n_hard_neg}[{hard_src}] easy_neg={easy_added})"
         )
 
     def _sample_hard_neg(
@@ -755,6 +783,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mine-hard-negs-per-image", type=int, default=5,
                         help="Run Stage 1 on training images to mine FP candidates as hard negatives. "
                              "Value = max FP crops per image. Set 0 to disable (use random crops instead).")
+    parser.add_argument("--mine-tp-per-image", type=int, default=5,
+                        help="Max Stage 1 TP candidate crops (IoU>=mine-tp-iou-thresh with GT) to collect "
+                             "per image as positive training samples. Set 0 to use raw GT box crops instead.")
+    parser.add_argument("--mine-tp-iou-thresh", type=float, default=0.3,
+                        help="Minimum IoU between a Stage 1 candidate and any GT box to count as TP. "
+                             "Lower values (e.g. 0.2) increase the number of mined positives; "
+                             "higher values (e.g. 0.4) require tighter overlap.")
     parser.add_argument("--easy-neg-ratio", type=float, default=0.5,
                         help="Ratio of easy negatives (from pure negative images) to hard negatives.")
     parser.add_argument("--input-h", type=int, default=1024,
@@ -814,12 +849,17 @@ def main() -> None:
     print(f"\nLoading Stage 1 U-Net from {stage1_path} ...")
     stage1_unet = load_stage1_unet(stage1_path, device)
 
-    # ── Hard negative mining ──────────────────────────────────────────────────
+    # ── Hard negative mining + TP (positive) mining ──────────────────────────
     train_mined_negs: Optional[List[MiningItem]] = None
-    mine_n = int(args.mine_hard_negs_per_image)
-    if mine_n > 0:
-        print(f"Mining Stage 1 FP candidates (max {mine_n}/image, {len(train_idx)} images)...")
-        train_mined_negs = mine_stage1_fp_crops(
+    train_mined_pos: Optional[List[MiningItem]] = None
+    mine_fp_n = int(args.mine_hard_negs_per_image)
+    mine_tp_n = int(args.mine_tp_per_image)
+    if mine_fp_n > 0 or mine_tp_n > 0:
+        print(
+            f"Mining Stage 1 candidates (max TP={mine_tp_n}/img, FP={mine_fp_n}/img, "
+            f"{len(train_idx)} images)..."
+        )
+        mined_tp, mined_fp = mine_stage1_crops(
             stage1_model=stage1_unet,
             samples=all_samples,
             indices=train_idx,
@@ -830,10 +870,17 @@ def main() -> None:
             dilation_size=int(args.val_heatmap_dilation),
             min_component_area=int(args.min_detection_area),
             nms_iou_thresh=float(args.box_nms_thresh),
-            max_per_image=mine_n,
+            max_tp_per_image=mine_tp_n,
+            max_fp_per_image=mine_fp_n,
+            tp_iou_thresh=float(args.mine_tp_iou_thresh),
             disable_tqdm=bool(args.hide_progress_bar),
         )
-        print(f"  Mined {len(train_mined_negs)} FP hard negatives from training set.")
+        if mine_fp_n > 0:
+            train_mined_negs = mined_fp
+            print(f"  Mined {len(train_mined_negs)} FP hard negatives from training set.")
+        if mine_tp_n > 0:
+            train_mined_pos = mined_tp
+            print(f"  Mined {len(train_mined_pos)} TP positive crops from training set.")
 
     # Build datasets
     print("\nBuilding CropDataset (train)...")
@@ -845,6 +892,7 @@ def main() -> None:
         easy_neg_ratio=float(args.easy_neg_ratio),
         augment=bool(args.augment),
         seed=int(args.seed),
+        mined_pos_crops=train_mined_pos,
         mined_hard_negs=train_mined_negs,
     )
     print("Building CropDataset (val)...")
@@ -856,6 +904,7 @@ def main() -> None:
         easy_neg_ratio=float(args.easy_neg_ratio),
         augment=False,
         seed=int(args.seed),
+        mined_pos_crops=None,   # val uses GT box crops (monitoring only)
         mined_hard_negs=None,   # val uses random hard negs (monitoring only)
     )
 
