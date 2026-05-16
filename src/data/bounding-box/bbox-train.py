@@ -438,12 +438,25 @@ Prompts for improvement:
 
 -----------
 46. 方向 F：U-Net Patch 训练检测（解决保守性坍缩根因）
-    【此文件未作修改，完整实现在分支文件 bbox-train-F.py 中】
+    【此文件未作修改，完整实现在分支文件 bbox-train-F.py 中（已删除，模型已保存）】
     根因分析：方向 E 中全图训练的像素正负比约 500:1，pos_weight=50 仍不足以抵抗
     背景梯度（背景:病灶梯度 ≈ 10:1），模型总能找到"少预测"捷径降低 loss，导致
     保守性坍缩。方向 F 改为 Patch 训练：以 GT bbox 为中心裁取 256×256 patch，
     正负各 50%，正样本像素比提升至 5–20%，梯度不平衡根因被消除。
     验证/推理仍用全图（U-Net 全卷积支持任意尺寸）。
+    最终结果（rec_46_upd_3）：F2@0.9=0.4652，FP@0.9=599。
+    已训练模型：models/bbox_resnet50.F.pth
+
+-----------
+47. 方向 G：两阶段检测 — Stage 2 ROI 分类器过滤 FP（rec_47）
+    【此文件未作修改，完整实现在分支文件 bbox-train-G.py 中】
+    根因分析：方向 F 在 256–384 感受野下无法利用全局上下文区分"病灶"与
+    "病灶样乳腺实质"，导致高置信度 FP 无法从 heatmap 层面消除。
+    方向 G 在 Stage 1（U-Net heatmap → NMS → 候选框）之后添加 Stage 2：
+    对每个候选框 crop（224×224，1.5 倍上下文填充）运行 ResNet50 二分类器，
+    过滤 Stage 2 打分低的 FP 候选，目标将 FP@0.9 从 ~600 降至 <200。
+    Stage 2 编码器复用 Stage 1（方向 F）的 ResNet50 权重（encoder-lr-multiplier=0.01）。
+    训练样本：GT box crop（正）+ 正样本图随机 crop（硬负）+ 负样本图随机 crop（易负）。
 
 """
 
