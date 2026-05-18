@@ -16,6 +16,7 @@ python src/data/bounding-box/bbox-train-H.py \
     --monitor-metric fbeta2 \
     --medical-backbone-path models/raw/ResNet50.pt \
     --save-path models/bbox_resnet50.H.pth \
+    --augment \
     --hide-progress-bar
 
 与方向 F（UNet）的核心差异：
@@ -359,7 +360,7 @@ class DetectionDataset(Dataset):
         if boxes.size > 0:
             target = {
                 "boxes": torch.from_numpy(boxes.astype(np.float32)),
-                "labels": torch.ones(boxes.shape[0], dtype=torch.int64),
+                "labels": torch.zeros(boxes.shape[0], dtype=torch.int64),  # class 0 = foreground (num_classes=1)
             }
         else:
             target = {
