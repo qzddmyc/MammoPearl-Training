@@ -438,7 +438,7 @@ Prompts for improvement:
 
 -----------
 46. 方向 F：U-Net Patch 训练检测（解决保守性坍缩根因）
-    【此文件未作修改，完整实现在分支文件 bbox-train-F.py 中】
+    【此文件未作修改，完整实现在分支文件 bbox-train-F.py 中】（已删除）
     根因分析：方向 E 中全图训练的像素正负比约 500:1，pos_weight=50 仍不足以抵抗
     背景梯度（背景:病灶梯度 ≈ 10:1），模型总能找到"少预测"捷径降低 loss，导致
     保守性坍缩。方向 F 改为 Patch 训练：以 GT bbox 为中心裁取 256×256 patch，
@@ -449,7 +449,7 @@ Prompts for improvement:
 
 -----------
 47. 方向 G：两阶段检测 — Stage 2 ROI 分类器过滤 FP（rec_47）
-    【此文件未作修改，完整实现在分支文件 bbox-train-G.py 中】
+    【此文件未作修改，完整实现在分支文件 bbox-train-G.py 中】（已删除）
     根因分析：方向 F 在 256–384 感受野下无法利用全局上下文区分"病灶"与
     "病灶样乳腺实质"，导致高置信度 FP 无法从 heatmap 层面消除。
     方向 G 在 Stage 1（U-Net heatmap → NMS → 候选框）之后添加 Stage 2：
@@ -457,6 +457,29 @@ Prompts for improvement:
     过滤 Stage 2 打分低的 FP 候选，目标将 FP@0.9 从 ~600 降至 <200。
     Stage 2 编码器复用 Stage 1（方向 F）的 ResNet50 权重（encoder-lr-multiplier=0.01）。
     训练样本：GT box crop（正）+ 正样本图随机 crop（硬负）+ 负样本图随机 crop（易负）。
+    根本瓶颈（进一步追因）：
+    - Stage 1 F 在 score_thresh=0.5 时 FP=1068，recall≈71%，约 17% GT 框热图无响应。
+    - 降低 stage1_threshold=0.2（upd_5）：候选暴增至 5396，Stage 2 F2 从 0.376 降至 0.289。
+    - 热图后处理管线（连通域→NMS）是 FP 的主要来源，无法从 Stage 2 端彻底消除。
+    - F+G 两阶段误差累积：Stage 2 精度上限被 Stage 1 recall 锁死。
+
+-----------
+48. 方向 H：RetinaNet 全图直接检测（替代 F+G 两阶段流水线，rec_48）
+    【此文件未作修改，完整实现在分支文件 bbox-train-H.py 中】
+    切换动机：
+    - F+G 根本缺陷是热图后处理管线（连通域→NMS）产生大量 FP，且 Stage 1 召回率天花板约 83%。
+    - H 直接用 RetinaNet + ResNet50-FPN 全图回归 box，消除热图后处理 FP 来源。
+    - Focal Loss 内置极端不平衡处理（γ=2.0，α=0.25），无需手动调 pos_weight/Tversky。
+    - FPN P3–P7 五层特征图同时覆盖 32–512px 尺度，直接输出 (box, score)。
+    关键实现：
+    - 输入尺寸：1024×512；设 min_size=512, max_size=1024 后 torchvision 内部不再 resize。
+    - anchor sizes=(32,64,128,256,512)，aspect_ratios=(0.5,1.0,2.0)×5，3 anchors/cell。
+    - RadImageNet ResNet50 权重加载（同 F 脚本 key 映射）；conv1 权重通道均值适配。
+    - 正样本图像过采样（pos_oversample_factor=4.0）补偿 7% 正样本比例。
+    - 差异 LR：backbone.body（encoder_lr=lr×encoder_lr_multiplier）vs FPN+head（full lr）。
+    - val 多阈值报告（score@0.1–0.9）输出 TP/FP/FN/Recall/F1/F2。
+    - patient_level_split 使用 sorted() 确保确定性（与 G 一致）。
+    目标：超越 F+G 最佳 F2=0.4652，争取 F2 > 0.50。
 
 """
 
