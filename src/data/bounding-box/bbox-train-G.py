@@ -159,7 +159,7 @@ def load_samples(csv_path: Path, images_root: Path, split_name: str) -> List[Sam
 def patient_level_split(
     samples: List[Sample], val_ratio: float = 0.15, seed: int = 42
 ) -> Tuple[List[int], List[int]]:
-    patient_ids = list({s.patient_id for s in samples})
+    patient_ids = sorted({s.patient_id for s in samples})  # sorted → deterministic order
     rng = random.Random(seed)
     rng.shuffle(patient_ids)
     n_val = max(1, int(len(patient_ids) * val_ratio))
