@@ -13,7 +13,7 @@ python src/data/bounding-box/bbox-train-H.py \
     --input-h 1024 \
     --input-w 512 \
     --patience 10 \
-    --monitor-metric fbeta2 \
+    --monitor-metric fbeta2_ref \
     --medical-backbone-path models/raw/ResNet50.pt \
     --save-path models/bbox_resnet50.H.pth \
     --augment \
@@ -37,6 +37,17 @@ python src/data/bounding-box/bbox-train-H.py \
 rec_48（初版）
   - RetinaNet + ResNet50-FPN，全图 1024×512 直接检测
   - anchor sizes=(32,64,128,256,512)，aspect_ratios=(0.5,1.0,2.0)
+
+upd_1（rec_48 修复与日志改进）
+  [fix] labels=torch.zeros（前景类索引 0）替换 torch.ones
+        → 修复 num_classes=1 时 CUDA index-out-of-bounds 崩溃
+  [fix] resnet_fpn_backbone(backbone_name=...) 改为关键字参数
+        → 消除 torchvision ≥0.13 的 DeprecationWarning
+  [fix] 验证日志 [BestRecall] 标签改为 Recall@0.3 (ref)
+        → 原标签误导性（实为固定阈值参考值，并非最大 recall）
+  [new] 新增 --monitor-metric fbeta2_ref 选项
+        → 使用固定 score=0.3 处的 F2 作为 checkpoint/early-stop 标准
+        → 比 fbeta2（best across all thresh，始终落在 score=0.1）噪声更低
 """
 
 from __future__ import annotations
@@ -421,7 +432,7 @@ def build_retinanet(
     # Build ResNet50-FPN backbone
     try:
         backbone = resnet_fpn_backbone(
-            "resnet50",
+            backbone_name="resnet50",
             weights=_IMAGENET_WEIGHTS,
             trainable_layers=trainable_backbone_layers,
         )
@@ -429,7 +440,7 @@ def build_retinanet(
     except TypeError:
         # Older torchvision API
         backbone = resnet_fpn_backbone(  # type: ignore[call-arg]
-            "resnet50",
+            backbone_name="resnet50",
             pretrained=True,
             trainable_layers=trainable_backbone_layers,
         )
@@ -653,7 +664,7 @@ def validate(
     print(f"  [Val] GT_boxes={total_gt_boxes} | {' | '.join(parts)}")
     print(
         f"  [BestF1] F1={best_f1:.4f} @ score={best_f1_thresh} | "
-        f"[BestRecall] Recall={best_recall:.4f} @ score={best_recall_thresh} | "
+        f"Recall@{best_recall_thresh}={best_recall:.4f} (ref) | "
         f"[BestFbeta2] F2={best_fbeta2:.4f} @ score={best_fbeta2_thresh} | "
         f"F2@{ref_fbeta2_thresh}={ref_fbeta2:.4f} (ref)"
     )
@@ -738,8 +749,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score-thresh", type=float, default=0.05,
                         help="Minimum score threshold for reported detections. Default 0.05.")
     parser.add_argument("--monitor-metric", type=str, default="fbeta2",
-                        choices=["f1", "recall", "fbeta2"],
-                        help="Metric to monitor for checkpoint saving and early stopping.")
+                        choices=["f1", "recall", "fbeta2", "fbeta2_ref"],
+                        help="Metric to monitor for checkpoint saving and early stopping. "
+                             "fbeta2_ref uses F2 at the fixed reference threshold (0.3), "
+                             "which is more stable than fbeta2 (best across all thresholds).")
     parser.add_argument("--hide-progress-bar", action="store_true")
     return parser.parse_args()
 
@@ -922,6 +935,9 @@ def main() -> None:
         elif monitor_metric_name == "fbeta2":
             cur_monitor = float(val_metrics.get("best_fbeta2", 0.0))
             monitor_thresh = float(val_metrics.get("best_fbeta2_thresh", 0.3))
+        elif monitor_metric_name == "fbeta2_ref":
+            cur_monitor = float(val_metrics.get("ref_fbeta2", 0.0))
+            monitor_thresh = float(val_metrics.get("ref_fbeta2_thresh", 0.3))
         else:
             cur_monitor = float(val_metrics.get("best_f1", 0.0))
             monitor_thresh = float(val_metrics.get("best_f1_thresh", 0.3))
