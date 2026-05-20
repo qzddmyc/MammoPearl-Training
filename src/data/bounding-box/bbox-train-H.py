@@ -17,6 +17,8 @@ python src/data/bounding-box/bbox-train-H.py \
     --medical-backbone-path models/raw/ResNet50.pt \
     --save-path models/bbox_resnet50.H.pth \
     --augment \
+    --aug-contrast-range 0.8 1.2 \
+    --aug-scale-min 0.85 \
     --hide-progress-bar
 
 与方向 F（UNet）的核心差异：
@@ -48,6 +50,22 @@ upd_1（rec_48 修复与日志改进）
   [new] 新增 --monitor-metric fbeta2_ref 选项
         → 使用固定 score=0.3 处的 F2 作为 checkpoint/early-stop 标准
         → 比 fbeta2（best across all thresh，始终落在 score=0.1）噪声更低
+
+upd_2（rec_48_upd_2 数据增强与宽高比修复）
+  根因分析（rec_48_upd_1 F2@0.3 在 epoch 11 封顶于 0.2176 的原因）：
+    1. 宽高比扭曲：原图 1520×912（AR=1.667）直接 resize 到 1024×512（AR=2.0），
+       水平/垂直缩放比不等（0.561 vs 0.674），导致圆形病灶被拉伸 20%，
+       模型学到扭曲特征，验证泛化能力受限。历史实验（rec_34–47）均未遇此问题，
+       因旧框架用 torchvision 内部等比 resize。本次属新发现盲点。
+    2. 数据增强过弱：仅水平翻转 + 亮度抖动，无对比度/缩放多样性，
+       过拟合在 epoch 12 后显现（训练 loss 持续下降，验证 F2 不升）。
+  [fix] AR-preserving pad：读图后先将 H 方向 pad 到 W×target_AR（加黑边），
+        再等比 resize 到 1024×512 → 修复 20% AR 扭曲，作用于训练和验证。
+        (VinDr-Mammo 固定 1520×912 → pad H to 1824 → resize 1024×512)
+  [new] --aug-contrast-range MIN MAX：对比度抖动（乘性偏移，以图像均值为轴），
+        默认 1.0 1.0（禁用，向后兼容）。rec_48_upd_2 推荐 0.8 1.2。
+  [new] --aug-scale-min S：随机 zoom-out 增强（等比缩小至 S–1.0 倍后居中 pad），
+        默认 1.0（禁用，向后兼容）。rec_48_upd_2 推荐 0.85。
 """
 
 from __future__ import annotations
@@ -299,6 +317,9 @@ class DetectionDataset(Dataset):
         augment: bool = False,
         aug_hflip_prob: float = 0.5,
         aug_brightness_delta: float = 0.2,
+        aug_contrast_min: float = 1.0,
+        aug_contrast_max: float = 1.0,
+        aug_scale_min: float = 1.0,
         seed: int = 42,
     ) -> None:
         self.samples = samples
@@ -308,6 +329,9 @@ class DetectionDataset(Dataset):
         self.augment = augment
         self.aug_hflip_prob = aug_hflip_prob
         self.aug_brightness_delta = aug_brightness_delta
+        self.aug_contrast_min = aug_contrast_min
+        self.aug_contrast_max = aug_contrast_max
+        self.aug_scale_min = aug_scale_min
         self.rng = random.Random(seed)
 
     def __len__(self) -> int:
@@ -338,6 +362,29 @@ class DetectionDataset(Dataset):
             keep = (boxes[:, 2] > boxes[:, 0] + 1) & (boxes[:, 3] > boxes[:, 1] + 1)
             boxes = boxes[keep]
 
+        # AR-preserving pad: make H/W match target AR before resize to eliminate distortion.
+        # VinDr-Mammo images are 1520×912 (AR=1.667); target 1024×512 (AR=2.0) → pad H.
+        target_ar = self.input_h / max(self.input_w, 1)
+        actual_ar = orig_h / max(orig_w, 1)
+        if actual_ar < target_ar - 1e-6:  # image too wide → pad height
+            padded_h = int(round(orig_w * target_ar))
+            pad_top = (padded_h - orig_h) // 2
+            pad_bottom = padded_h - orig_h - pad_top
+            img = np.pad(img, ((pad_top, pad_bottom), (0, 0), (0, 0)), constant_values=0)
+            if boxes.size > 0:
+                boxes[:, 1] += pad_top
+                boxes[:, 3] += pad_top
+            orig_h = padded_h
+        elif actual_ar > target_ar + 1e-6:  # image too tall → pad width
+            padded_w = int(round(orig_h / target_ar))
+            pad_left = (padded_w - orig_w) // 2
+            pad_right = padded_w - orig_w - pad_left
+            img = np.pad(img, ((0, 0), (pad_left, pad_right), (0, 0)), constant_values=0)
+            if boxes.size > 0:
+                boxes[:, 0] += pad_left
+                boxes[:, 2] += pad_left
+            orig_w = padded_w
+
         # Resize image
         img_resized = cv2.resize(img, (self.input_w, self.input_h), interpolation=cv2.INTER_LINEAR)
 
@@ -365,6 +412,30 @@ class DetectionDataset(Dataset):
             if self.aug_brightness_delta > 0:
                 delta = (self.rng.random() * 2 - 1) * self.aug_brightness_delta * 255
                 img_resized = np.clip(img_resized.astype(np.float32) + delta, 0, 255).astype(np.uint8)
+            if self.aug_contrast_max > self.aug_contrast_min + 1e-6:
+                factor = self.aug_contrast_min + self.rng.random() * (self.aug_contrast_max - self.aug_contrast_min)
+                mean_val = float(img_resized.mean())
+                img_resized = np.clip(
+                    mean_val + (img_resized.astype(np.float32) - mean_val) * factor, 0, 255
+                ).astype(np.uint8)
+            if self.aug_scale_min < 1.0 - 1e-6:
+                scale = self.aug_scale_min + self.rng.random() * (1.0 - self.aug_scale_min)
+                if scale < 1.0 - 1e-6:
+                    scaled_h = max(int(self.input_h * scale), 1)
+                    scaled_w = max(int(self.input_w * scale), 1)
+                    img_small = cv2.resize(img_resized, (scaled_w, scaled_h), interpolation=cv2.INTER_LINEAR)
+                    pad_top_zo = (self.input_h - scaled_h) // 2
+                    pad_left_zo = (self.input_w - scaled_w) // 2
+                    img_zoomed = np.zeros_like(img_resized)
+                    img_zoomed[pad_top_zo:pad_top_zo + scaled_h, pad_left_zo:pad_left_zo + scaled_w] = img_small
+                    img_resized = img_zoomed
+                    if boxes.size > 0:
+                        boxes[:, 0] = boxes[:, 0] * scale + pad_left_zo
+                        boxes[:, 2] = boxes[:, 2] * scale + pad_left_zo
+                        boxes[:, 1] = boxes[:, 1] * scale + pad_top_zo
+                        boxes[:, 3] = boxes[:, 3] * scale + pad_top_zo
+                        keep = (boxes[:, 2] > boxes[:, 0] + 1) & (boxes[:, 3] > boxes[:, 1] + 1)
+                        boxes = boxes[keep]
 
         img_t = image_to_tensor(img_resized)  # [3, H, W] float32 in [0, 1]
 
@@ -594,6 +665,28 @@ def validate(
             orig_h, orig_w = img.shape[:2]
             gt_boxes = sample.boxes.astype(np.float32).copy()
 
+            # AR-preserving pad (must match training preprocessing)
+            target_ar = input_h / max(input_w, 1)
+            actual_ar = orig_h / max(orig_w, 1)
+            if actual_ar < target_ar - 1e-6:  # pad height
+                padded_h = int(round(orig_w * target_ar))
+                pad_top = (padded_h - orig_h) // 2
+                pad_bottom = padded_h - orig_h - pad_top
+                img = np.pad(img, ((pad_top, pad_bottom), (0, 0), (0, 0)), constant_values=0)
+                if gt_boxes.size > 0:
+                    gt_boxes[:, 1] += pad_top
+                    gt_boxes[:, 3] += pad_top
+                orig_h = padded_h
+            elif actual_ar > target_ar + 1e-6:  # pad width
+                padded_w = int(round(orig_h / target_ar))
+                pad_left = (padded_w - orig_w) // 2
+                pad_right = padded_w - orig_w - pad_left
+                img = np.pad(img, ((0, 0), (pad_left, pad_right), (0, 0)), constant_values=0)
+                if gt_boxes.size > 0:
+                    gt_boxes[:, 0] += pad_left
+                    gt_boxes[:, 2] += pad_left
+                orig_w = padded_w
+
             # Scale GT boxes to input_h×input_w coordinate space
             scale_x = input_w / max(orig_w, 1)
             scale_y = input_h / max(orig_h, 1)
@@ -734,6 +827,13 @@ def parse_args() -> argparse.Namespace:
                         help="Enable training augmentation (hflip, brightness jitter).")
     parser.add_argument("--aug-hflip-prob", type=float, default=0.5)
     parser.add_argument("--aug-brightness-delta", type=float, default=0.2)
+    parser.add_argument("--aug-contrast-range", type=float, nargs=2, default=[1.0, 1.0],
+                        metavar=("MIN", "MAX"),
+                        help="Contrast jitter range (multiplicative factor around image mean). "
+                             "1.0 1.0 = disabled (default). Recommended: 0.8 1.2.")
+    parser.add_argument("--aug-scale-min", type=float, default=1.0,
+                        help="Minimum zoom-out scale for random scale augmentation. "
+                             "1.0 = disabled (default). Recommended: 0.85.")
     parser.add_argument("--medical-backbone-path", type=Path, default=None,
                         help="Path to RadImageNet ResNet50 checkpoint (.pt). "
                              "If None, uses ImageNet weights only.")
@@ -848,6 +948,9 @@ def main() -> None:
         augment=bool(args.augment),
         aug_hflip_prob=float(args.aug_hflip_prob),
         aug_brightness_delta=float(args.aug_brightness_delta),
+        aug_contrast_min=float(args.aug_contrast_range[0]),
+        aug_contrast_max=float(args.aug_contrast_range[1]),
+        aug_scale_min=float(args.aug_scale_min),
         seed=int(args.seed),
     )
 
