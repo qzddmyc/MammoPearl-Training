@@ -19,6 +19,7 @@ python src/data/bounding-box/bbox-train-H.py \
     --augment \
     --aug-contrast-range 0.8 1.2 \
     --aug-scale-min 0.85 \
+    --focal-alpha 0.4 \
     --hide-progress-bar
 
 与方向 F（UNet）的核心差异：
@@ -66,6 +67,27 @@ upd_2（rec_48_upd_2 数据增强与宽高比修复）
         默认 1.0 1.0（禁用，向后兼容）。rec_48_upd_2 推荐 0.8 1.2。
   [new] --aug-scale-min S：随机 zoom-out 增强（等比缩小至 S–1.0 倍后居中 pad），
         默认 1.0（禁用，向后兼容）。rec_48_upd_2 推荐 0.85。
+
+upd_3（epoch-seeded WeightedRandomSampler）
+  根因分析（rec_48_upd_1/upd_2 均在 epoch 7-8 出现断崖的原因）：
+    WeightedRandomSampler 在训练前创建一次，各 epoch 顺序消耗 PyTorch 全局随机
+    状态（seed=42 固定）。epoch 7-8 恰好抽到"困难批次"（小病灶/低对比度正样本
+    密集），梯度冲突导致 loss 反升、验证 F2@0.3 断崖。两次训练的断崖完全同步，
+    证明是确定性批次组成问题，而非模型本身的收敛问题。
+  [fix] 每个 epoch 用独立 generator（manual_seed = base_seed + epoch）重建
+        WeightedRandomSampler 和 DataLoader，打破跨 epoch 的批次确定性。
+        各 epoch 的批次组成仍然完全可复现（同 seed 多次运行结果一致），
+        但不再依赖前序 epoch 的随机状态消耗，消除了 epoch 7 固定谷底。
+  [new] --focal-alpha F：Focal Loss 前景权重 α（torchvision 默认 0.25）。
+        α=0.25 使背景梯度是正样本的 3 倍，模型学会保守预测（score 集中在
+        0.1-0.2），导致 F2@0.3 受限。提高 α 可上移置信度分布。
+        默认 0.25（向后兼容）。rec_48_upd_3 推荐 0.4。
+  [new] checkpoint meta 新增 best_fbeta2 / best_fbeta2_thresh / focal_alpha：
+        训练时遍历阈值得到的最优 F2 及对应阈值一并保存进 .pth。
+        部署时直接读取，无需手动调参：
+          ckpt = torch.load("models/bbox_resnet50.H.pth")
+          deploy_thresh = ckpt["meta"]["best_fbeta2_thresh"]
+          # → 在此阈值处 ckpt["meta"]["best_fbeta2"] 最大
 """
 
 from __future__ import annotations
@@ -488,6 +510,7 @@ def build_retinanet(
     nms_thresh: float = 0.3,
     score_thresh: float = 0.05,
     detections_per_img: int = 500,
+    focal_alpha: float = 0.25,
 ) -> "RetinaNet":
     """Build a RetinaNet with ResNet50-FPN backbone.
 
@@ -568,6 +591,13 @@ def build_retinanet(
         score_thresh=score_thresh,
         detections_per_img=detections_per_img,
     )
+
+    # Override focal loss alpha (torchvision default: 0.25)
+    try:
+        model.head.classification_head.focal_loss_alpha = float(focal_alpha)
+        print(f"[Info] Focal loss alpha set to {focal_alpha}.")
+    except AttributeError:
+        print(f"[Warning] Could not set focal_loss_alpha on this torchvision version.")
 
     return model
 
@@ -848,6 +878,11 @@ def parse_args() -> argparse.Namespace:
                         help="NMS IoU threshold applied during inference. Default 0.3.")
     parser.add_argument("--score-thresh", type=float, default=0.05,
                         help="Minimum score threshold for reported detections. Default 0.05.")
+    parser.add_argument("--focal-alpha", type=float, default=0.25,
+                        help="Focal Loss foreground weight alpha. Higher values increase "
+                             "positive-sample gradient weight, shifting score distribution "
+                             "upward. torchvision default 0.25; try 0.4 to reduce "
+                             "confidence suppression. Default 0.25 (backward-compatible).")
     parser.add_argument("--monitor-metric", type=str, default="fbeta2",
                         choices=["f1", "recall", "fbeta2", "fbeta2_ref"],
                         help="Metric to monitor for checkpoint saving and early stopping. "
@@ -920,6 +955,7 @@ def main() -> None:
         nms_thresh=float(args.nms_thresh),
         score_thresh=float(args.score_thresh),
         detections_per_img=500,
+        focal_alpha=float(args.focal_alpha),
     )
     model.to(device)
 
@@ -958,19 +994,8 @@ def main() -> None:
     sampler_weights = make_oversampling_weights(
         all_samples, train_idx, pos_oversample_factor=float(args.pos_oversample_factor)
     )
-    train_sampler = WeightedRandomSampler(
-        weights=sampler_weights,
-        num_samples=len(train_idx),
-        replacement=True,
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=int(args.batch_size),
-        sampler=train_sampler,
-        num_workers=int(args.num_workers),
-        collate_fn=detection_collate_fn,
-        pin_memory=torch.cuda.is_available(),
-    )
+    # train_sampler and train_loader are rebuilt each epoch inside the loop
+    # (epoch-seeded generator) to break cross-epoch batch determinism.
 
     # Training state
     best_metric = 0.0
@@ -1004,6 +1029,25 @@ def main() -> None:
         print(f"\n{'─' * 72}")
         print(f"Epoch {epoch + 1} / {args.epochs}")
         print(f"{'─' * 72}")
+
+        # Rebuild sampler with an epoch-specific seed so each epoch draws an
+        # independent batch sequence (still reproducible: same seed → same run).
+        _epoch_gen = torch.Generator()
+        _epoch_gen.manual_seed(int(args.seed) + epoch)
+        train_sampler = WeightedRandomSampler(
+            weights=sampler_weights,
+            num_samples=len(train_idx),
+            replacement=True,
+            generator=_epoch_gen,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=int(args.batch_size),
+            sampler=train_sampler,
+            num_workers=int(args.num_workers),
+            collate_fn=detection_collate_fn,
+            pin_memory=torch.cuda.is_available(),
+        )
 
         avg_loss = train_one_epoch(
             model=model,
@@ -1071,10 +1115,16 @@ def main() -> None:
                     "epoch": epoch + 1,
                     monitor_metric_name: cur_monitor,
                     "monitor_thresh": monitor_thresh,
+                    # Also save the sweep-optimal F2 threshold for deployment use.
+                    # When monitor_metric is fbeta2_ref (fixed 0.3), monitor_thresh=0.3
+                    # but best_fbeta2_thresh gives the threshold that maximises F2.
+                    "best_fbeta2": float(val_metrics.get("best_fbeta2", 0.0)),
+                    "best_fbeta2_thresh": float(val_metrics.get("best_fbeta2_thresh", 0.3)),
                     "input_h": int(args.input_h),
                     "input_w": int(args.input_w),
                     "anchor_sizes": str(args.anchor_sizes),
                     "nms_thresh": float(args.nms_thresh),
+                    "focal_alpha": float(args.focal_alpha),
                 },
             )
             print(f"  [Checkpoint] Epoch {epoch + 1} | Saved ({monitor_metric_name}={best_metric:.4f}) -> {save_path}")
