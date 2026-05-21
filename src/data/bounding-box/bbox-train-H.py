@@ -20,7 +20,8 @@ python src/data/bounding-box/bbox-train-H.py \
     --aug-contrast-range 0.8 1.2 \
     --aug-scale-min 0.85 \
     --focal-alpha 0.25 \
-    --lesion-types Mass \
+    --min-box-side 24.0 \
+    --max-box-ar 3.0 \
     --hide-progress-bar
 
 与方向 F（UNet）的核心差异：
@@ -105,6 +106,23 @@ upd_4（纯 Mass 检测 baseline）
   [revert] focal_alpha 从 0.4 退回 0.25：upd_3 的 α=0.4 使 Recall@0.1
         从 0.502 降至 0.404（-20%），虽然 TP@0.7 提升，但 upd_4 目标是
         建立 Mass 检测的 recall 上限，优先覆盖率。upd_4 推荐 α=0.25。
+
+upd_5（按几何可检测性过滤 GT box，全类型训练）
+  根因分析（upd_4 对比）：
+    upd_4 仅训练 Mass，F2@0.3 从 0.2164 提升至 0.3005（+39%），
+    Recall@0.1 从 40.4% 提升至 54.0%（per-box）。
+    证明其他类型（尤其是 Suspicious_Calcification 的高 AR / 小尺寸子集）
+    向训练注入了噪声信号。但剔除全部非 Mass 类型牺牲了临床覆盖面。
+    upd_5 改为按"几何可检测性"精确过滤：保留所有类型中 anchor 实际能
+    覆盖的 GT box，丢弃 anchor 物理上无法匹配的 box。
+  [new] --min-box-side S：在 resized 图像空间（如 1024×512）中，最短边
+        < S px 的 box 被丢弃。anchor 最小尺寸 = 32px，低于此的 box IoU=0，
+        对训练无正向贡献，只增加 FN 计数。推荐 24.0（3/4 最小 anchor）。
+  [new] --max-box-ar R：长宽比（max/min）> R 的 box 被丢弃。anchor 覆盖
+        AR 0.5–2.0，AR>2.5 时最优 anchor fg_iou < 0.5，训练中标记为
+        ignored（既不贡献正样本 loss 也不贡献负样本 loss）。推荐 3.0。
+  [note] upd_5 不使用 --lesion-types，全类型训练，仅靠几何过滤精确控制
+        噪声信号。预期 val GT boxes ≈ 240-250（vs 267 全量，150 Mass-only）。
 """
 
 from __future__ import annotations
@@ -287,6 +305,9 @@ def load_samples(
     images_root: Path,
     split_name: str,
     lesion_types: Optional[List[str]] = None,
+    min_box_side: float = 0.0,
+    max_box_ar: float = float("inf"),
+    input_w: int = 512,
 ) -> List[Sample]:
     df = pd.read_csv(csv_path, low_memory=False)
     df = df[df["split"].astype(str).str.lower() == split_name.lower()].copy()
@@ -312,6 +333,22 @@ def load_samples(
             invalid = int(np.sum((boxes[:, 2] <= boxes[:, 0]) | (boxes[:, 3] <= boxes[:, 1])))
             if invalid > 0:
                 print(f"[Warning] Found {invalid} invalid boxes in {image_path}")
+
+        # Detectability filter (in resized-image-space coordinates)
+        if boxes.size > 0 and (min_box_side > 0.0 or max_box_ar < float("inf")):
+            orig_w_val = float(first["width"]) if pd.notna(first["width"]) else float(input_w)
+            scale = float(input_w) / max(orig_w_val, 1.0)
+            bw = (boxes[:, 2] - boxes[:, 0]) * scale
+            bh = (boxes[:, 3] - boxes[:, 1]) * scale
+            min_sides = np.minimum(bw, bh)
+            ars = np.maximum(bw, bh) / np.maximum(min_sides, 1e-3)
+            keep = np.ones(len(boxes), dtype=bool)
+            if min_box_side > 0.0:
+                keep &= (min_sides >= min_box_side)
+            if max_box_ar < float("inf"):
+                keep &= (ars <= max_box_ar)
+            boxes = boxes[keep]
+
         orig_h = float(first["height"]) if pd.notna(first["height"]) else 0.0
         orig_w = float(first["width"]) if pd.notna(first["width"]) else 0.0
 
@@ -917,6 +954,16 @@ def parse_args() -> argparse.Namespace:
                              "(e.g. 'Mass' or 'Mass,Focal_Asymmetry'). Images whose boxes are "
                              "all filtered out become negative samples. Default: None (use all "
                              "annotated boxes, backward compatible).")
+    parser.add_argument("--min-box-side", type=float, default=0.0,
+                        help="Minimum box shortest side in resized-image space (pixels). "
+                             "Boxes below this are dropped as GT (no anchor can match them). "
+                             "0 = no filter (default). Recommended for VinDr 1024\u00d7512: 24.0 "
+                             "(removes boxes smaller than 3/4 of the minimum 32px anchor).")
+    parser.add_argument("--max-box-ar", type=float, default=float("inf"),
+                        help="Maximum box aspect ratio (max_side / min_side) to keep as positive "
+                             "GT. Boxes with AR > this have fg_iou < 0.5 with all anchors and "
+                             "produce no useful training signal. inf = no filter (default). "
+                             "Recommended: 3.0 (anchors cover AR 0.5-2.0; 3.0 adds 50%% margin).")
     return parser.parse_args()
 
 
@@ -940,10 +987,15 @@ def main() -> None:
 
     all_samples = load_samples(csv_path, images_root, split_name="training",
                                lesion_types=[t.strip() for t in args.lesion_types.split(",")]
-                               if args.lesion_types else None)
+                               if args.lesion_types else None,
+                               min_box_side=float(args.min_box_side),
+                               max_box_ar=float(args.max_box_ar),
+                               input_w=int(args.input_w))
     print(f"Total samples: {len(all_samples)}")
     if args.lesion_types:
         print(f"Lesion type filter: {args.lesion_types}")
+    if float(args.min_box_side) > 0.0 or float(args.max_box_ar) < float("inf"):
+        print(f"Box detectability filter: min_side≥{args.min_box_side:.1f}px, max_AR≤{args.max_box_ar:.1f}")
 
     train_idx, val_idx = patient_level_split(all_samples, val_ratio=0.15, seed=int(args.seed))
     val_pos_idx = [i for i in val_idx if all_samples[i].boxes.shape[0] > 0]
