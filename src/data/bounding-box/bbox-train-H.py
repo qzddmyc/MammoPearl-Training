@@ -19,7 +19,8 @@ python src/data/bounding-box/bbox-train-H.py \
     --augment \
     --aug-contrast-range 0.8 1.2 \
     --aug-scale-min 0.85 \
-    --focal-alpha 0.4 \
+    --focal-alpha 0.25 \
+    --lesion-types Mass \
     --hide-progress-bar
 
 与方向 F（UNet）的核心差异：
@@ -88,6 +89,22 @@ upd_3（epoch-seeded WeightedRandomSampler）
           ckpt = torch.load("models/bbox_resnet50.H.pth")
           deploy_thresh = ckpt["meta"]["best_fbeta2_thresh"]
           # → 在此阈值处 ckpt["meta"]["best_fbeta2"] 最大
+
+upd_4（纯 Mass 检测 baseline）
+  根因分析（rec_48_upd_3 Recall@0.1=0.404 封顶的原因）：
+    验证集 267 GT boxes 中，仅 Mass（56.6%）具备清晰可检测的视觉特征。
+    其余类型存在结构性漏检问题：
+      · Suspicious_Calcification（20.2%）：约 30% AR>2，anchor fg_iou<0.5 被
+        标为 ignored；约 20% size<32px 完全超出 anchor 覆盖；其余训练信号不稳定。
+      · Asymmetry / Architectural_Distortion（12.8%）：需双侧对比才能识别，
+        单视图特征图无法与背景区分，即使 anchor 覆盖也无学习信号。
+    理论上限 Recall@0.1 ≈ 55-65%（非 100%），当前 40.4% 已逼近该上限。
+  [new] --lesion-types TYPES：逗号分隔的病灶类型名称，只将指定类型的 box 作为
+        正样本 GT，其余 box 被忽略（图像若所有 box 均被过滤则视为负样本）。
+        默认 None（使用全部 box，向后兼容）。upd_4 推荐 Mass。
+  [revert] focal_alpha 从 0.4 退回 0.25：upd_3 的 α=0.4 使 Recall@0.1
+        从 0.502 降至 0.404（-20%），虽然 TP@0.7 提升，但 upd_4 目标是
+        建立 Mass 检测的 recall 上限，优先覆盖率。upd_4 推荐 α=0.25。
 """
 
 from __future__ import annotations
@@ -269,6 +286,7 @@ def load_samples(
     csv_path: Path,
     images_root: Path,
     split_name: str,
+    lesion_types: Optional[List[str]] = None,
 ) -> List[Sample]:
     df = pd.read_csv(csv_path, low_memory=False)
     df = df[df["split"].astype(str).str.lower() == split_name.lower()].copy()
@@ -279,6 +297,12 @@ def load_samples(
     for (patient_id, _series_id, image_id), group in df.groupby(
         ["patient_id", "series_id", "image_id"], sort=True
     ):
+        if lesion_types:
+            type_mask = pd.Series(False, index=group.index)
+            for lt in lesion_types:
+                if lt in group.columns:
+                    type_mask = type_mask | (group[lt] == 1)
+            group = group[type_mask]
         valid = group[["xmin", "ymin", "xmax", "ymax"]].dropna()
         boxes: np.ndarray = valid.to_numpy(dtype=np.float32) if not valid.empty else np.zeros((0, 4), dtype=np.float32)
         image_path = images_root / str(patient_id) / f"{image_id}"
@@ -889,6 +913,11 @@ def parse_args() -> argparse.Namespace:
                              "fbeta2_ref uses F2 at the fixed reference threshold (0.3), "
                              "which is more stable than fbeta2 (best across all thresholds).")
     parser.add_argument("--hide-progress-bar", action="store_true")
+    parser.add_argument("--lesion-types", type=str, default=None,
+                        help="Comma-separated lesion type names to keep as positive GT boxes "
+                             "(e.g. 'Mass' or 'Mass,Focal_Asymmetry'). Images whose boxes are "
+                             "all filtered out become negative samples. Default: None (use all "
+                             "annotated boxes, backward compatible).")
     return parser.parse_args()
 
 
@@ -910,8 +939,12 @@ def main() -> None:
     print(f"Images root: {images_root}")
     print(f"Save path: {save_path}")
 
-    all_samples = load_samples(csv_path, images_root, split_name="training")
+    all_samples = load_samples(csv_path, images_root, split_name="training",
+                               lesion_types=[t.strip() for t in args.lesion_types.split(",")]
+                               if args.lesion_types else None)
     print(f"Total samples: {len(all_samples)}")
+    if args.lesion_types:
+        print(f"Lesion type filter: {args.lesion_types}")
 
     train_idx, val_idx = patient_level_split(all_samples, val_ratio=0.15, seed=int(args.seed))
     val_pos_idx = [i for i in val_idx if all_samples[i].boxes.shape[0] > 0]
