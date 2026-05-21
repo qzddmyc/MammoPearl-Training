@@ -297,6 +297,7 @@ def load_samples(
     for (patient_id, _series_id, image_id), group in df.groupby(
         ["patient_id", "series_id", "image_id"], sort=True
     ):
+        first = group.iloc[0]  # read orig_h/w before filtering
         if lesion_types:
             type_mask = pd.Series(False, index=group.index)
             for lt in lesion_types:
@@ -311,8 +312,6 @@ def load_samples(
             invalid = int(np.sum((boxes[:, 2] <= boxes[:, 0]) | (boxes[:, 3] <= boxes[:, 1])))
             if invalid > 0:
                 print(f"[Warning] Found {invalid} invalid boxes in {image_path}")
-
-        first = group.iloc[0]
         orig_h = float(first["height"]) if pd.notna(first["height"]) else 0.0
         orig_w = float(first["width"]) if pd.notna(first["width"]) else 0.0
 
