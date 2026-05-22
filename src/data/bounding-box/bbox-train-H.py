@@ -22,6 +22,7 @@ python src/data/bounding-box/bbox-train-H.py \
     --focal-alpha 0.25 \
     --min-box-side 24.0 \
     --max-box-ar 3.0 \
+    --cliff-patience-ratio 0.6 \
     --hide-progress-bar
 
 与方向 F（UNet）的核心差异：
@@ -123,6 +124,21 @@ upd_5（按几何可检测性过滤 GT box，全类型训练）
         ignored（既不贡献正样本 loss 也不贡献负样本 loss）。推荐 3.0。
   [note] upd_5 不使用 --lesion-types，全类型训练，仅靠几何过滤精确控制
         噪声信号。预期 val GT boxes ≈ 240-250（vs 267 全量，150 Mass-only）。
+
+upd_6（断崖感知 patience，解决 upd_5 提前停止问题）
+  根因分析（upd_5 训练观察）：
+    训练过程中 F2@0.3 呈现 ~5 epoch 周期振荡，峰值在 ep4/ep9/ep17。
+    WeightedRandomSampler 每 epoch 重置采样种子，某些 epoch 开始时
+    集中采样困难批次，导致 Focal Loss 梯度峰值 → 当 epoch 指标骤降。
+    这些"断崖 epoch"连续触发 patience 计数，在 best ep9 之后 9 个 epoch
+    内（ep10–ep18）没能突破，patience=10 在 ep19 触发早停，错过了
+    ep22–23 潜在峰值（下一个周期峰）。
+  [new] --cliff-patience-ratio R：若当前 epoch 的监控指标 < best×R，
+        判定为"断崖 epoch"，不增加 patience 计数器。R=0 禁用（默认）。
+        推荐 0.6：从实验数据可见，真正断崖的 metric 为 best 的 34–53%，
+        普通徘徊在 60–96%，R=0.6 可以准确分离两类。
+  [note] 断崖 epoch 的模型权重仍正常更新（不回滚），依赖下一个 epoch
+        的采样顺序自然恢复。仅 patience 计数被跳过，不影响优化本身。
 """
 
 from __future__ import annotations
@@ -909,6 +925,13 @@ def parse_args() -> argparse.Namespace:
                         help="IoU threshold for matching predicted boxes to GT during validation.")
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--min-delta", type=float, default=1e-4)
+    parser.add_argument("--cliff-patience-ratio", type=float, default=0.0,
+                        help="Cliff-aware patience: if the monitored metric for an epoch falls "
+                             "below (best × cliff_patience_ratio), classify that epoch as a "
+                             "'cliff' and do NOT increment the patience counter. "
+                             "0 = disabled (default). Recommended: 0.6 — isolates genuine "
+                             "cliff drops (< 60%% of best) from normal plateau oscillation, "
+                             "preventing premature early-stopping due to sampler-induced spikes.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--accumulation-steps", type=int, default=1,
@@ -1188,6 +1211,12 @@ def main() -> None:
         )
 
         improved = cur_monitor > best_metric + float(args.min_delta)
+        cliff_ratio = float(args.cliff_patience_ratio)
+        is_cliff = (
+            cliff_ratio > 0.0
+            and best_metric > 0.0
+            and cur_monitor < best_metric * cliff_ratio
+        )
         if improved:
             best_metric = cur_monitor
             no_improve = 0
@@ -1211,12 +1240,24 @@ def main() -> None:
                     "focal_alpha": float(args.focal_alpha),
                 },
             )
-            print(f"  [Checkpoint] Epoch {epoch + 1} | Saved ({monitor_metric_name}={best_metric:.4f}) -> {save_path}")
+            print(f"  [Checkpoint] Epoch {epoch + 1} | Saved ({monitor_metric_name}={best_metric:.4f}, patience reset) -> {save_path}")
+        elif is_cliff:
+            print(
+                f"  [Cliff] Epoch {epoch + 1}: metric={cur_monitor:.4f} is "
+                f"{cur_monitor / best_metric * 100:.0f}% of best={best_metric:.4f} "
+                f"(< {cliff_ratio:.0%} threshold) — patience not incremented "
+                f"(no_improve={no_improve}/{args.patience})"
+            )
         else:
             no_improve += 1
-            if int(args.patience) > 0 and no_improve >= int(args.patience):
-                print(f"Early stopping triggered: no improvement for {no_improve} epochs.")
+            _pat = int(args.patience)
+            if _pat > 0 and no_improve >= _pat:
+                print(f"  [EarlyStop] no_improve={no_improve}/{_pat} — early stopping triggered.")
                 break
+            elif _pat > 0:
+                _remaining = _pat - no_improve
+                _warn = "  !!!  close to stopping" if _remaining <= 3 else ""
+                print(f"  [Patience] no_improve={no_improve}/{_pat} (remaining={_remaining}){_warn}")
 
     print(f"\nTraining complete. Best {monitor_metric_name}={best_metric:.4f} at epoch {best_epoch}.")
     print(f"Checkpoint: {save_path}")
