@@ -1,23 +1,9 @@
 r"""
-方向 I：双侧对比检测（Bilateral Multi-View Fusion）
-
-核心思想：对每张乳腺图（primary），将其对侧同视角图（contralateral, same view）
-作为参照，将三通道 [primary, contra, |primary-contra|] 拼合后送入 RetinaNet。
-病变侧的解剖差异在差分通道中被放大，为模型提供"哪一侧不对称"的明确语义线索。
-
-标准坐标系（Canonical Left-Facing Space）：
-  - 左侧 (L) 图像：不翻转，乳头朝右，胸壁在左侧
-  - 右侧 (R) 图像：水平翻转，使乳头朝右 → 与左侧坐标一致
-  - 因此 |primary-contra| 在解剖上对齐，差异真正反映不对称性
-  - 训练时不使用水平翻转增强（会破坏双侧语义）
-
-conv1 初始化策略：
-  - primary / contra 通道：继承 RadImageNet 均值权重（与 H 一致）
-  - diff 通道：0.1× 初始权重（较小，让模型缓慢学习如何利用差分信号）
+方向 J：Global-Local 双分支检测（Global Context Fusion + ROI Refinement）
 
 运行命令（Git Bash）：
 
-python src/data/bounding-box/bbox-train-I.py \
+python src/data/bounding-box/bbox-train-J.py \
     --epochs 50 \
     --batch-size 4 \
     --lr 1e-4 \
@@ -27,7 +13,7 @@ python src/data/bounding-box/bbox-train-I.py \
     --patience 10 \
     --monitor-metric fbeta2_ref \
     --medical-backbone-path models/raw/ResNet50.pt \
-    --save-path models/bbox_resnet50.I.pth \
+    --save-path models/bbox_resnet50.J.pth \
     --augment \
     --aug-contrast-range 0.8 1.2 \
     --aug-scale-min 0.85 \
@@ -35,22 +21,46 @@ python src/data/bounding-box/bbox-train-I.py \
     --min-box-side 24.0 \
     --max-box-ar 3.0 \
     --cliff-patience-ratio 0.6 \
+    --roi-lambda 0.5 \
     --hide-progress-bar
+
+核心思想（相比方向 H 的改进）：
+  方向 H 的主要缺陷：模型能找到病灶（F2@0.1 ≈ 0.40），但置信度打分偏低
+  （F2@0.3 仅 0.28），说明模型缺乏"这个局部区域在全乳中是否可疑"的上下文判断。
+
+  方向 J 引入两个机制解决此问题：
+
+  1. Global Context Fusion（全局上下文注入）：
+     - 将 1024×512 图像降采样到 256×128
+     - 经过 GlobalContextEncoder（3 层 stride-2 CNN）得到 128 通道全局特征图
+     - 全局特征图在 5 个 FPN 层（P3-P7）分别上采样/下采样后与局部特征 concat
+     - 1×1 conv 融合，通道数保持 256（identity 初始化，全局分量初始权重接近零）
+     这给检测头提供了"整体乳腺的密度分布/形态轮廓"上下文，
+     使模型能区分"正常腺体"与"异常结构"。
+
+  2. ROI Refinement Head（兴趣区域置信度校正）：
+     - 训练时：从 GT box（正例）和背景随机 crop（负例）构造 ROI 样本
+       ROI Align from P3（stride=8，局部分辨率最高）→ 7×7×256 → FC(256) → 1
+       BCE loss：与检测损失联合反向传播
+     - 推理时：对 stage-1 检测分数 > 0.05 的候选框，经 ROI head 重打分
+       最终分数 = √(detection_score × roi_score)（几何均值融合）
+     - 无需两阶段训练：ROI head 与检测头同步端到端训练
 
 ─────────────────────────────────────────────────────────────────────────────
 改版历史
 ─────────────────────────────────────────────────────────────────────────────
 
-rec_49（初版）
-  - 基于方向 H（bbox-train-H.py upd_6）重构
+rec_50（初版，基于 H upd_6 改造）
   - 核心改动：
-    · BilateralSample 替换 Sample：新增 contra_path / laterality / view 字段
-    · load_bilateral_samples() 负责构建每张图的对侧路径映射
-    · BilateralDetectionDataset：加载双图 → 标准化坐标系 → 3 通道拼合
-    · build_retinanet_bilateral()：conv1 改为 3 通道，diff 通道权重 0.1×
-    · validate_bilateral()：推理时同样构造双侧 3 通道输入
-    · 删除 --aug-hflip-prob 和 --aug-brightness-delta（不适用双侧对比场景）
-  - 训练样本数：≈16000（每张原始图作为一次 primary，与 H 相同量级）
+    · GlobalContextEncoder：3 层 stride-2 BN-ReLU conv，256×128 → 32×16 @ 128ch
+    · GlobalAwareBackbone：包装 ResNet50-FPN，按层注入全局上下文，缓存 P3~P7
+    · RoiRefinementHead：ROI Align(P3, 7×7) + 2-layer FC → 置信度校正
+    · build_global_local_retinanet()：组装以上组件
+    · 训练时 ROI 损失：GT box（+20% jitter）为正例，背景随机 crop 为负例（3:1 比）
+    · 推理时几何均值合并 stage-1 与 ROI 分数
+  - 数据加载：与 H 完全相同（单图，无双侧配对需求）
+  - 增强：保留 hflip（单图架构，不破坏双侧语义）
+  - 目标：突破 H 的 F2@0.3=0.2788
 """
 
 from __future__ import annotations
@@ -63,10 +73,12 @@ if not _omp or not _omp.isdigit() or int(_omp) < 1:
 import argparse
 import atexit
 import datetime
+import math
 import random
 import re
 import signal
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -75,6 +87,8 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 try:
@@ -84,6 +98,12 @@ try:
     _TORCHVISION_DET_OK = True
 except ImportError:
     _TORCHVISION_DET_OK = False
+
+try:
+    from torchvision.ops import roi_align as _torchvision_roi_align
+    _ROI_ALIGN_OK = True
+except ImportError:
+    _ROI_ALIGN_OK = False
 
 try:
     from torchvision.models import resnet50 as _resnet50
@@ -124,6 +144,29 @@ def read_image_unicode(path: Path) -> np.ndarray:
     if img is None:
         raise FileNotFoundError(f"Unable to read image: {path}")
     return img
+
+
+def normalize_image(img: np.ndarray) -> np.ndarray:
+    """Convert image to RGB uint8 with CLAHE for grayscale."""
+    if img.ndim == 2:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        img = clahe.apply(img)
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    elif img.ndim == 3:
+        if img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+        elif img.shape[2] == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        else:
+            img = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2RGB)
+    else:
+        raise ValueError(f"Unsupported image shape: {img.shape}")
+    return img
+
+
+def image_to_tensor(img: np.ndarray) -> torch.Tensor:
+    arr = img.astype(np.float32) / 255.0
+    return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 
 
 def _nms_boxes(boxes: np.ndarray, scores: np.ndarray, iou_thresh: float) -> List[int]:
@@ -192,102 +235,20 @@ def compute_iou_matches(
     return int(tp), int(fp), int(fn)
 
 
-def load_gray_clahe(path: Path) -> Optional[np.ndarray]:
-    """Load an image, convert to grayscale, apply CLAHE. Returns [H, W] uint8 or None if failed."""
-    try:
-        raw = np.fromfile(str(path), dtype=np.uint8)
-        img = cv2.imdecode(raw, cv2.IMREAD_UNCHANGED)
-        if img is None:
-            return None
-    except Exception:
-        return None
-
-    if img.ndim == 2:
-        gray = img
-    elif img.ndim == 3:
-        if img.shape[2] == 4:
-            gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
-        else:
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    else:
-        return None
-
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray = clahe.apply(gray)
-    return gray
-
-
-def _flip_boxes_h(boxes: np.ndarray, width: int) -> np.ndarray:
-    """Flip boxes horizontally. boxes: (N, 4) xyxy."""
-    flipped = boxes.copy()
-    flipped[:, 0] = width - boxes[:, 2]
-    flipped[:, 2] = width - boxes[:, 0]
-    return flipped
-
-
-def _pad_gray_to_target_ar(
-    gray: np.ndarray,
-    boxes: Optional[np.ndarray],
-    target_ar: float,
-) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    """AR-preserving pad for a single-channel (H, W) grayscale image.
-
-    Pads with zeros so that H/W == target_ar, matching the AR-pad logic in H.
-    Returns (padded_gray, padded_boxes).
-    """
-    orig_h, orig_w = gray.shape[:2]
-    actual_ar = orig_h / max(orig_w, 1)
-    if actual_ar < target_ar - 1e-6:  # too wide → pad height
-        padded_h = int(round(orig_w * target_ar))
-        pad_top = (padded_h - orig_h) // 2
-        pad_bottom = padded_h - orig_h - pad_top
-        gray = np.pad(gray, ((pad_top, pad_bottom), (0, 0)), constant_values=0)
-        if boxes is not None and boxes.size > 0:
-            boxes = boxes.copy()
-            boxes[:, 1] += pad_top
-            boxes[:, 3] += pad_top
-    elif actual_ar > target_ar + 1e-6:  # too tall → pad width
-        padded_w = int(round(orig_h / target_ar))
-        pad_left = (padded_w - orig_w) // 2
-        pad_right = padded_w - orig_w - pad_left
-        gray = np.pad(gray, ((0, 0), (pad_left, pad_right)), constant_values=0)
-        if boxes is not None and boxes.size > 0:
-            boxes = boxes.copy()
-            boxes[:, 0] += pad_left
-            boxes[:, 2] += pad_left
-    return gray, boxes
-
-
-def compose_bilateral_tensor(p_gray: np.ndarray, c_gray: np.ndarray) -> torch.Tensor:
-    """Compose 3-channel bilateral tensor [primary, contra, |diff|].
-
-    Both inputs must be [H, W] uint8 grayscale already resized to the same shape.
-    Returns [3, H, W] float32 in [0, 1].
-    """
-    p = p_gray.astype(np.float32) / 255.0
-    c = c_gray.astype(np.float32) / 255.0
-    d = np.abs(p - c)
-    arr = np.stack([p, c, d], axis=0)  # [3, H, W]
-    return torch.from_numpy(arr).contiguous()
-
-
 # =============================================================================
 # Data structures
 # =============================================================================
 
 @dataclass
-class BilateralSample:
+class Sample:
     patient_id: str
-    image_id: str           # primary image ID
-    laterality: str         # 'L' or 'R' (primary side)
-    view: str               # 'CC' or 'MLO'
-    image_path: Path        # primary image path
-    contra_path: Path       # contralateral same-view image path
-    boxes: np.ndarray       # GT boxes in primary's ORIGINAL (pre-flip) coords, (N, 4) xyxy
-    orig_size: Tuple[float, float]  # (H, W) of primary
+    image_id: str
+    image_path: Path
+    boxes: np.ndarray          # (N, 4) xyxy in original image coords
+    orig_size: Tuple[float, float]  # (H, W)
 
 
-def load_bilateral_samples(
+def load_samples(
     csv_path: Path,
     images_root: Path,
     split_name: str,
@@ -295,81 +256,34 @@ def load_bilateral_samples(
     min_box_side: float = 0.0,
     max_box_ar: float = float("inf"),
     input_w: int = 512,
-) -> List[BilateralSample]:
-    """Load samples with contralateral image paths for bilateral comparison.
-
-    For each image in the given split, finds its contralateral same-view image
-    within the same patient. Images without a valid contralateral are skipped
-    with a warning.
-
-    Returns one BilateralSample per primary image (~16000 for training split).
-    """
+) -> List[Sample]:
     df = pd.read_csv(csv_path, low_memory=False)
     df = df[df["split"].astype(str).str.lower() == split_name.lower()].copy()
     if df.empty:
         raise ValueError(f"No rows found for split={split_name!r} in {csv_path}")
 
-    # Build contra lookup: patient_id → {(laterality, view): image_id}
-    # Use first row per (patient_id, series_id, image_id) group for metadata.
-    image_meta: Dict[str, Dict[Tuple[str, str], str]] = {}  # pid → {(lat, view): iid}
+    samples: List[Sample] = []
     for (patient_id, _series_id, image_id), group in df.groupby(
         ["patient_id", "series_id", "image_id"], sort=True
     ):
         first = group.iloc[0]
-        lat = str(first.get("laterality", "")).strip().upper()
-        view_raw = str(first.get("view", "")).strip().upper()
-        if lat not in ("L", "R") or view_raw not in ("CC", "MLO"):
-            continue
-        pid = str(patient_id)
-        if pid not in image_meta:
-            image_meta[pid] = {}
-        key = (lat, view_raw)
-        if key not in image_meta[pid]:
-            image_meta[pid][key] = str(image_id)
-
-    samples: List[BilateralSample] = []
-    skipped_no_contra = 0
-
-    for (patient_id, _series_id, image_id), group in df.groupby(
-        ["patient_id", "series_id", "image_id"], sort=True
-    ):
-        pid = str(patient_id)
-        iid = str(image_id)
-        first = group.iloc[0]
-
-        lat = str(first.get("laterality", "")).strip().upper()
-        view_raw = str(first.get("view", "")).strip().upper()
-        if lat not in ("L", "R") or view_raw not in ("CC", "MLO"):
-            continue
-
-        contra_lat = "R" if lat == "L" else "L"
-        contra_key = (contra_lat, view_raw)
-        pid_meta = image_meta.get(pid, {})
-        if contra_key not in pid_meta:
-            skipped_no_contra += 1
-            continue
-        contra_iid = pid_meta[contra_key]
-
-        # Filter GT boxes by lesion type
-        grp = group.copy()
         if lesion_types:
-            type_mask = pd.Series(False, index=grp.index)
+            type_mask = pd.Series(False, index=group.index)
             for lt in lesion_types:
-                if lt in grp.columns:
-                    type_mask = type_mask | (grp[lt] == 1)
-            grp = grp[type_mask]
-
-        valid = grp[["xmin", "ymin", "xmax", "ymax"]].dropna()
+                if lt in group.columns:
+                    type_mask = type_mask | (group[lt] == 1)
+            group = group[type_mask]
+        valid = group[["xmin", "ymin", "xmax", "ymax"]].dropna()
         boxes: np.ndarray = valid.to_numpy(dtype=np.float32) if not valid.empty else np.zeros((0, 4), dtype=np.float32)
+        image_path = images_root / str(patient_id) / f"{image_id}"
 
         if boxes.size > 0:
             invalid = int(np.sum((boxes[:, 2] <= boxes[:, 0]) | (boxes[:, 3] <= boxes[:, 1])))
             if invalid > 0:
-                print(f"[Warning] {invalid} invalid box(es) in {pid}/{iid}")
+                print(f"[Warning] Found {invalid} invalid boxes in {image_path}")
 
-        # Detectability filter (in resized-image-space coordinates)
         if boxes.size > 0 and (min_box_side > 0.0 or max_box_ar < float("inf")):
-            orig_w_val = float(first["width"]) if pd.notna(first.get("width")) else float(input_w)
+            orig_w_val = float(first["width"]) if pd.notna(first["width"]) else float(input_w)
             scale = float(input_w) / max(orig_w_val, 1.0)
             bw = (boxes[:, 2] - boxes[:, 0]) * scale
             bh = (boxes[:, 3] - boxes[:, 1]) * scale
@@ -382,35 +296,26 @@ def load_bilateral_samples(
                 keep &= (ars <= max_box_ar)
             boxes = boxes[keep]
 
-        orig_h = float(first["height"]) if pd.notna(first.get("height")) else 0.0
-        orig_w = float(first["width"]) if pd.notna(first.get("width")) else 0.0
+        orig_h = float(first["height"]) if pd.notna(first["height"]) else 0.0
+        orig_w = float(first["width"]) if pd.notna(first["width"]) else 0.0
 
-        image_path = images_root / pid / iid
-        contra_path = images_root / pid / contra_iid
-
-        samples.append(BilateralSample(
-            patient_id=pid,
-            image_id=iid,
-            laterality=lat,
-            view=view_raw,
+        samples.append(Sample(
+            patient_id=str(patient_id),
+            image_id=str(image_id),
             image_path=image_path,
-            contra_path=contra_path,
             boxes=boxes,
             orig_size=(orig_h, orig_w),
         ))
-
-    if skipped_no_contra > 0:
-        print(f"[Warning] Skipped {skipped_no_contra} images with no contralateral same-view image.")
 
     return samples
 
 
 def patient_level_split(
-    samples: List[BilateralSample],
+    samples: List[Sample],
     val_ratio: float = 0.15,
     seed: int = 42,
 ) -> Tuple[List[int], List[int]]:
-    patients = sorted({s.patient_id for s in samples})  # sorted → deterministic order
+    patients = sorted({s.patient_id for s in samples})
     rng = random.Random(seed)
     rng.shuffle(patients)
     n_val = max(1, int(len(patients) * val_ratio))
@@ -424,28 +329,18 @@ def patient_level_split(
 # Dataset
 # =============================================================================
 
-class BilateralDetectionDataset(Dataset):
-    """Bilateral full-image detection dataset for torchvision RetinaNet.
-
-    Each item is a 3-channel tensor [primary_canonical, contra_canonical, |diff|]
-    in the canonical left-facing coordinate system:
-      - L primary: no horizontal flip
-      - R primary: flip horizontally (and flip boxes accordingly)
-
-    The contralateral image is loaded, AR-padded, resized, and flipped to the
-    same canonical orientation before computing the difference channel.
-
-    Returns (img_tensor [3, H, W], target_dict) where target_dict contains
-    'boxes' [N, 4] (xyxy in canonical coords) and 'labels' [N].
-    """
+class DetectionDataset(Dataset):
+    """Full-image detection dataset for torchvision RetinaNet (same as H)."""
 
     def __init__(
         self,
-        samples: List[BilateralSample],
+        samples: List[Sample],
         indices: List[int],
         input_h: int,
         input_w: int,
         augment: bool = False,
+        aug_hflip_prob: float = 0.5,
+        aug_brightness_delta: float = 0.2,
         aug_contrast_min: float = 1.0,
         aug_contrast_max: float = 1.0,
         aug_scale_min: float = 1.0,
@@ -456,6 +351,8 @@ class BilateralDetectionDataset(Dataset):
         self.input_h = input_h
         self.input_w = input_w
         self.augment = augment
+        self.aug_hflip_prob = aug_hflip_prob
+        self.aug_brightness_delta = aug_brightness_delta
         self.aug_contrast_min = aug_contrast_min
         self.aug_contrast_max = aug_contrast_max
         self.aug_scale_min = aug_scale_min
@@ -464,27 +361,23 @@ class BilateralDetectionDataset(Dataset):
     def __len__(self) -> int:
         return len(self.indices)
 
-    def _load_and_prepare_gray(
-        self,
-        path: Path,
-        target_ar: float,
-        boxes: Optional[np.ndarray] = None,
-        flip_h: bool = False,
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """Load image, AR-pad, and optionally flip horizontally.
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        sample = self.samples[self.indices[idx]]
 
-        Returns (gray [H_padded, W_padded], transformed_boxes) or (None, None) if failed.
-        boxes are transformed only if not None.
-        """
-        gray = load_gray_clahe(path)
-        if gray is None:
-            return None, None
+        try:
+            img = normalize_image(read_image_unicode(sample.image_path))
+        except FileNotFoundError:
+            img_t = torch.zeros(3, self.input_h, self.input_w, dtype=torch.float32)
+            target: Dict[str, torch.Tensor] = {
+                "boxes": torch.zeros((0, 4), dtype=torch.float32),
+                "labels": torch.zeros(0, dtype=torch.int64),
+            }
+            return img_t, target
 
-        orig_h, orig_w = gray.shape[:2]
+        orig_h, orig_w = img.shape[:2]
+        boxes = sample.boxes.copy()
 
-        # Clip boxes before padding
-        if boxes is not None and boxes.size > 0:
-            boxes = boxes.copy()
+        if boxes.size > 0:
             boxes[:, 0] = np.clip(boxes[:, 0], 0, orig_w - 1)
             boxes[:, 2] = np.clip(boxes[:, 2], 0, orig_w - 1)
             boxes[:, 1] = np.clip(boxes[:, 1], 0, orig_h - 1)
@@ -493,65 +386,31 @@ class BilateralDetectionDataset(Dataset):
             boxes = boxes[keep]
 
         # AR-preserving pad
-        gray, boxes = _pad_gray_to_target_ar(gray, boxes, target_ar)
-        padded_h, padded_w = gray.shape[:2]
-
-        # Horizontal flip to canonical left-facing space
-        if flip_h:
-            gray = gray[:, ::-1].copy()
-            if boxes is not None and boxes.size > 0:
-                boxes = _flip_boxes_h(boxes, padded_w)
-
-        return gray, boxes
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        sample = self.samples[self.indices[idx]]
-
         target_ar = self.input_h / max(self.input_w, 1)
-        is_right = (sample.laterality == "R")
+        actual_ar = orig_h / max(orig_w, 1)
+        if actual_ar < target_ar - 1e-6:
+            padded_h = int(round(orig_w * target_ar))
+            pad_top = (padded_h - orig_h) // 2
+            pad_bottom = padded_h - orig_h - pad_top
+            img = np.pad(img, ((pad_top, pad_bottom), (0, 0), (0, 0)), constant_values=0)
+            if boxes.size > 0:
+                boxes[:, 1] += pad_top
+                boxes[:, 3] += pad_top
+            orig_h = padded_h
+        elif actual_ar > target_ar + 1e-6:
+            padded_w = int(round(orig_h / target_ar))
+            pad_left = (padded_w - orig_w) // 2
+            pad_right = padded_w - orig_w - pad_left
+            img = np.pad(img, ((0, 0), (pad_left, pad_right), (0, 0)), constant_values=0)
+            if boxes.size > 0:
+                boxes[:, 0] += pad_left
+                boxes[:, 2] += pad_left
+            orig_w = padded_w
 
-        # --- Load primary ---
-        p_gray, boxes = self._load_and_prepare_gray(
-            sample.image_path,
-            target_ar=target_ar,
-            boxes=sample.boxes.copy(),
-            flip_h=is_right,  # R → flip to canonical
-        )
+        img_resized = cv2.resize(img, (self.input_w, self.input_h), interpolation=cv2.INTER_LINEAR)
 
-        if p_gray is None:
-            img_t = torch.zeros(3, self.input_h, self.input_w, dtype=torch.float32)
-            target: Dict[str, torch.Tensor] = {
-                "boxes": torch.zeros((0, 4), dtype=torch.float32),
-                "labels": torch.zeros(0, dtype=torch.int64),
-            }
-            return img_t, target
-
-        if boxes is None:
-            boxes = np.zeros((0, 4), dtype=np.float32)
-
-        # --- Load contra ---
-        # Contra is the opposite side: L contra for R primary (already canonical),
-        # R contra for L primary (needs flip).
-        contra_flip = not is_right  # contra is R when primary is L → flip contra
-        c_gray, _ = self._load_and_prepare_gray(
-            sample.contra_path,
-            target_ar=target_ar,
-            boxes=None,
-            flip_h=contra_flip,
-        )
-        if c_gray is None:
-            # Fall back to a black image for contralateral if not available
-            c_gray = np.zeros_like(p_gray)
-
-        padded_h, padded_w = p_gray.shape[:2]
-
-        # --- Resize both to input_h × input_w ---
-        p_resized = cv2.resize(p_gray, (self.input_w, self.input_h), interpolation=cv2.INTER_LINEAR)
-        c_resized = cv2.resize(c_gray, (self.input_w, self.input_h), interpolation=cv2.INTER_LINEAR)
-
-        # --- Scale boxes ---
-        scale_x = self.input_w / max(padded_w, 1)
-        scale_y = self.input_h / max(padded_h, 1)
+        scale_x = self.input_w / max(orig_w, 1)
+        scale_y = self.input_h / max(orig_h, 1)
         if boxes.size > 0:
             boxes[:, 0] *= scale_x
             boxes[:, 2] *= scale_x
@@ -560,37 +419,34 @@ class BilateralDetectionDataset(Dataset):
             keep = (boxes[:, 2] > boxes[:, 0] + 1) & (boxes[:, 3] > boxes[:, 1] + 1)
             boxes = boxes[keep]
 
-        # --- Augmentation (no hflip: would break bilateral semantics) ---
         if self.augment:
+            if self.rng.random() < self.aug_hflip_prob:
+                img_resized = img_resized[:, ::-1, :].copy()
+                if boxes.size > 0:
+                    old_x1 = boxes[:, 0].copy()
+                    old_x2 = boxes[:, 2].copy()
+                    boxes[:, 0] = self.input_w - old_x2
+                    boxes[:, 2] = self.input_w - old_x1
+            if self.aug_brightness_delta > 0:
+                delta = (self.rng.random() * 2 - 1) * self.aug_brightness_delta * 255
+                img_resized = np.clip(img_resized.astype(np.float32) + delta, 0, 255).astype(np.uint8)
             if self.aug_contrast_max > self.aug_contrast_min + 1e-6:
-                factor = self.aug_contrast_min + self.rng.random() * (
-                    self.aug_contrast_max - self.aug_contrast_min
-                )
-                # Apply same contrast factor to both channels so the diff channel
-                # remains meaningful (|f·p - f·c| = f·|p - c|).
-                for arr in (p_resized, c_resized):
-                    mean_val = float(arr.mean())
-                    arr[:] = np.clip(
-                        mean_val + (arr.astype(np.float32) - mean_val) * factor, 0, 255
-                    ).astype(np.uint8)
+                factor = self.aug_contrast_min + self.rng.random() * (self.aug_contrast_max - self.aug_contrast_min)
+                mean_val = float(img_resized.mean())
+                img_resized = np.clip(
+                    mean_val + (img_resized.astype(np.float32) - mean_val) * factor, 0, 255
+                ).astype(np.uint8)
             if self.aug_scale_min < 1.0 - 1e-6:
                 scale = self.aug_scale_min + self.rng.random() * (1.0 - self.aug_scale_min)
                 if scale < 1.0 - 1e-6:
                     scaled_h = max(int(self.input_h * scale), 1)
                     scaled_w = max(int(self.input_w * scale), 1)
+                    img_small = cv2.resize(img_resized, (scaled_w, scaled_h), interpolation=cv2.INTER_LINEAR)
                     pad_top_zo = (self.input_h - scaled_h) // 2
                     pad_left_zo = (self.input_w - scaled_w) // 2
-
-                    p_zoomed = np.zeros((self.input_h, self.input_w), dtype=np.uint8)
-                    p_small = cv2.resize(p_resized, (scaled_w, scaled_h), interpolation=cv2.INTER_LINEAR)
-                    p_zoomed[pad_top_zo:pad_top_zo + scaled_h, pad_left_zo:pad_left_zo + scaled_w] = p_small
-                    p_resized = p_zoomed
-
-                    c_zoomed = np.zeros((self.input_h, self.input_w), dtype=np.uint8)
-                    c_small = cv2.resize(c_resized, (scaled_w, scaled_h), interpolation=cv2.INTER_LINEAR)
-                    c_zoomed[pad_top_zo:pad_top_zo + scaled_h, pad_left_zo:pad_left_zo + scaled_w] = c_small
-                    c_resized = c_zoomed
-
+                    img_zoomed = np.zeros_like(img_resized)
+                    img_zoomed[pad_top_zo:pad_top_zo + scaled_h, pad_left_zo:pad_left_zo + scaled_w] = img_small
+                    img_resized = img_zoomed
                     if boxes.size > 0:
                         boxes[:, 0] = boxes[:, 0] * scale + pad_left_zo
                         boxes[:, 2] = boxes[:, 2] * scale + pad_left_zo
@@ -599,7 +455,7 @@ class BilateralDetectionDataset(Dataset):
                         keep = (boxes[:, 2] > boxes[:, 0] + 1) & (boxes[:, 3] > boxes[:, 1] + 1)
                         boxes = boxes[keep]
 
-        img_t = compose_bilateral_tensor(p_resized, c_resized)  # [3, H, W] float32 in [0, 1]
+        img_t = image_to_tensor(img_resized)
 
         if boxes.size > 0:
             target = {
@@ -624,11 +480,10 @@ def detection_collate_fn(
 
 
 def make_oversampling_weights(
-    samples: List[BilateralSample],
+    samples: List[Sample],
     indices: List[int],
     pos_oversample_factor: float = 4.0,
 ) -> torch.Tensor:
-    """Assign higher weight to positive-sample images for WeightedRandomSampler."""
     weights = []
     for i in indices:
         weights.append(pos_oversample_factor if samples[i].boxes.shape[0] > 0 else 1.0)
@@ -636,10 +491,297 @@ def make_oversampling_weights(
 
 
 # =============================================================================
+# Global Context Architecture Components
+# =============================================================================
+
+class GlobalContextEncoder(nn.Module):
+    """Lightweight CNN that encodes full-breast context from a downsampled image.
+
+    Input:  [B, 3, H/4, W/4]  (default: [B, 3, 256, 128] for 1024×512 full image)
+    Output: [B, out_ch, H/32, W/32]  (default: [B, 128, 32, 16])
+
+    Three stride-2 conv blocks reduce spatial resolution by 8× total.
+    The output spatial size matches FPN P5 when the full image is 1024×512.
+    F.interpolate is used to resize this context map to match each FPN level.
+    """
+
+    def __init__(self, in_channels: int = 3, out_channels: int = 128) -> None:
+        super().__init__()
+        self.encoder = nn.Sequential(
+            # 256×128 → 128×64
+            nn.Conv2d(in_channels, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            # 128×64 → 64×32
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            # 64×32 → 32×16
+            nn.Conv2d(64, out_channels, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.encoder(x)
+
+
+class GlobalAwareBackbone(nn.Module):
+    """Wraps a BackboneWithFPN, injecting global context into every FPN level.
+
+    Usage:
+        # Before each forward pass (training or inference):
+        model.backbone.set_global_image(small_img)   # [B, 3, H/4, W/4]
+        # Then call model normally — backbone.forward() will inject global features.
+
+    After forward(), backbone._cached_features holds the fused FPN feature dict
+    (keys '0'..'4' corresponding to P3..P7). Used by the ROI refinement head.
+
+    Fusion initialization: the 1×1 fusion convs are initialized so the global
+    branch contribution starts near zero (identity pass-through for local features).
+    This preserves the pretrained RetinaNet behaviour at the start of training.
+    """
+
+    def __init__(
+        self,
+        base_backbone: Any,
+        global_encoder: GlobalContextEncoder,
+        num_fpn_levels: int = 5,
+        fpn_channels: int = 256,
+        global_channels: int = 128,
+    ) -> None:
+        super().__init__()
+        self.base = base_backbone
+        self.global_enc = global_encoder
+        self.out_channels: int = fpn_channels
+
+        # Fusion convs: concat([local(256), global(128)]) → 256
+        self.fusion = nn.ModuleList([
+            nn.Conv2d(fpn_channels + global_channels, fpn_channels, kernel_size=1, bias=True)
+            for _ in range(num_fpn_levels)
+        ])
+        # Identity init: global path starts at zero contribution
+        for fc in self.fusion:
+            nn.init.zeros_(fc.weight)
+            nn.init.zeros_(fc.bias)
+            # Restore local identity: first fpn_channels input channels → identity output
+            with torch.no_grad():
+                fc.weight[:, :fpn_channels, 0, 0] = torch.eye(fpn_channels)
+
+        self._global_feat: Optional[torch.Tensor] = None
+        self._cached_features: Optional[Dict[str, torch.Tensor]] = None
+
+    def set_global_image(self, img_tensor: torch.Tensor) -> None:
+        """Pre-compute global context feature from downsampled image.
+        Must be called before each forward() call (training and inference).
+        """
+        self._global_feat = self.global_enc(img_tensor)
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        feats: Dict[str, torch.Tensor] = self.base(x)
+
+        if self._global_feat is not None:
+            keys = list(feats.keys())
+            for i, k in enumerate(keys):
+                if i < len(self.fusion):
+                    gf = F.interpolate(
+                        self._global_feat,
+                        size=feats[k].shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    feats[k] = self.fusion[i](torch.cat([feats[k], gf], dim=1))
+
+        self._cached_features = feats  # cache for ROI head (same tensors, no copy)
+        return feats
+
+
+class RoiRefinementHead(nn.Module):
+    """ROI Align from P3 + 2-layer FC → binary classification logit.
+
+    Pooling from P3 (stride=8) provides the highest spatial resolution among
+    FPN levels, which is important for the small lesions in mammography.
+    """
+
+    def __init__(self, in_channels: int = 256, roi_size: int = 7) -> None:
+        super().__init__()
+        self.roi_size = roi_size
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(in_channels * roi_size * roi_size, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.5),
+            nn.Linear(256, 1),
+        )
+
+    def forward(
+        self,
+        feature_map: torch.Tensor,
+        rois: torch.Tensor,
+        spatial_scale: float,
+    ) -> torch.Tensor:
+        """
+        Args:
+            feature_map: [B, C, H, W]  – P3 feature (after fusion)
+            rois:        [N, 5]         – (batch_idx, x1, y1, x2, y2) image coords
+            spatial_scale: float       – 1/stride (=1/8 for P3 at 1024×512)
+        Returns:
+            logits: [N, 1]
+        """
+        if not _ROI_ALIGN_OK:
+            raise RuntimeError("torchvision.ops.roi_align not available.")
+        pooled = _torchvision_roi_align(
+            feature_map,
+            rois,
+            output_size=self.roi_size,
+            spatial_scale=spatial_scale,
+            aligned=True,
+        )  # [N, C, roi_size, roi_size]
+        return self.fc(pooled)  # [N, 1]
+
+
+# =============================================================================
+# ROI Loss Helpers
+# =============================================================================
+
+def _box_iou_one_vs_many(box1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    """Compute IoU between box1 [4] and each box in boxes2 [N, 4]. Returns [N]."""
+    if boxes2.shape[0] == 0:
+        return torch.zeros(0, dtype=torch.float32, device=box1.device)
+    ix1 = torch.maximum(box1[0], boxes2[:, 0])
+    iy1 = torch.maximum(box1[1], boxes2[:, 1])
+    ix2 = torch.minimum(box1[2], boxes2[:, 2])
+    iy2 = torch.minimum(box1[3], boxes2[:, 3])
+    inter = torch.clamp(ix2 - ix1, min=0.0) * torch.clamp(iy2 - iy1, min=0.0)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+    union = area1 + area2 - inter
+    return inter / torch.clamp(union, min=1e-6)
+
+
+def _jitter_box(
+    box: torch.Tensor,
+    jitter_frac: float,
+    img_h: float,
+    img_w: float,
+    rng: random.Random,
+) -> torch.Tensor:
+    """Randomly jitter a box by ±jitter_frac of its size, clamped to image bounds."""
+    x1, y1, x2, y2 = box[0].item(), box[1].item(), box[2].item(), box[3].item()
+    bw, bh = max(x2 - x1, 1.0), max(y2 - y1, 1.0)
+    dx = (rng.random() * 2 - 1) * jitter_frac * bw
+    dy = (rng.random() * 2 - 1) * jitter_frac * bh
+    x1 = max(0.0, min(x1 + dx, img_w - bw))
+    y1 = max(0.0, min(y1 + dy, img_h - bh))
+    x2 = min(img_w, x1 + bw)
+    y2 = min(img_h, y1 + bh)
+    return torch.tensor([x1, y1, x2, y2], dtype=torch.float32, device=box.device)
+
+
+def _sample_background_box(
+    img_h: int,
+    img_w: int,
+    gt_boxes: torch.Tensor,
+    device: torch.device,
+    min_size: int = 32,
+    max_size: int = 256,
+    max_tries: int = 30,
+    rng: Optional[random.Random] = None,
+) -> Optional[torch.Tensor]:
+    """Sample a random box with IoU < 0.1 with all GT boxes. Returns None if failed."""
+    if rng is None:
+        rng = random.Random()
+    for _ in range(max_tries):
+        size = rng.randint(min_size, max_size)
+        if size >= img_w or size >= img_h:
+            size = max(min_size, min(img_w, img_h) // 2)
+        x1 = rng.randint(0, max(1, img_w - size))
+        y1 = rng.randint(0, max(1, img_h - size))
+        x2, y2 = x1 + size, y1 + size
+        candidate = torch.tensor([float(x1), float(y1), float(x2), float(y2)],
+                                  dtype=torch.float32, device=device)
+        if gt_boxes.shape[0] > 0:
+            iou = _box_iou_one_vs_many(candidate, gt_boxes)
+            if iou.max().item() > 0.1:
+                continue
+        return candidate
+    return None
+
+
+def compute_roi_loss(
+    cached_features: Dict[str, torch.Tensor],
+    roi_head: RoiRefinementHead,
+    targets: List[Dict[str, torch.Tensor]],
+    device: torch.device,
+    p3_stride: int = 8,
+    jitter_frac: float = 0.2,
+    neg_ratio: int = 3,
+    max_neg_per_img: int = 9,
+    rng: Optional[random.Random] = None,
+) -> torch.Tensor:
+    """Compute BCE loss for the ROI refinement head.
+
+    Positive ROIs: GT boxes with random jitter (×1).
+    Negative ROIs: background crops with IoU < 0.1 with all GT (×neg_ratio per positive).
+    For all-negative images: sample max_neg_per_img background crops as negatives only.
+
+    Returns scalar loss (0 if no ROIs sampled).
+    """
+    if rng is None:
+        rng = random.Random()
+    p3_feat = cached_features["0"]  # [B, 256, H/8, W/8]
+    spatial_scale = 1.0 / p3_stride
+    img_h = p3_feat.shape[2] * p3_stride
+    img_w = p3_feat.shape[3] * p3_stride
+
+    all_rois: List[torch.Tensor] = []
+    all_labels: List[float] = []
+
+    for batch_idx, target in enumerate(targets):
+        gt_boxes = target["boxes"].to(device)  # [N, 4]
+        n_gt = gt_boxes.shape[0]
+        batch_idx_f = float(batch_idx)
+
+        if n_gt > 0:
+            # Positive ROIs: each GT box with jitter
+            for gi in range(n_gt):
+                jb = _jitter_box(gt_boxes[gi], jitter_frac, float(img_h), float(img_w), rng)
+                all_rois.append(torch.cat([
+                    torch.tensor([batch_idx_f], dtype=torch.float32, device=device), jb.to(device)
+                ]))
+                all_labels.append(1.0)
+            # Negative ROIs: neg_ratio × n_gt background crops
+            n_neg_target = min(neg_ratio * n_gt, max_neg_per_img)
+        else:
+            n_neg_target = max_neg_per_img  # all-negative image: still train negatives
+
+        sampled_neg = 0
+        for _ in range(n_neg_target * 4):  # extra tries
+            if sampled_neg >= n_neg_target:
+                break
+            neg = _sample_background_box(img_h, img_w, gt_boxes, device, rng=rng)
+            if neg is not None:
+                all_rois.append(torch.cat([
+                    torch.tensor([batch_idx_f], dtype=torch.float32, device=device), neg
+                ]))
+                all_labels.append(0.0)
+                sampled_neg += 1
+
+    if len(all_rois) == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    rois = torch.stack(all_rois, dim=0)  # [N, 5]
+    labels = torch.tensor(all_labels, dtype=torch.float32, device=device)  # [N]
+
+    logits = roi_head(p3_feat, rois, spatial_scale).squeeze(1)  # [N]
+    return F.binary_cross_entropy_with_logits(logits, labels)
+
+
+# =============================================================================
 # Model
 # =============================================================================
 
-def build_retinanet_bilateral(
+def build_global_local_retinanet(
     medical_backbone_path: Optional[str] = None,
     num_classes: int = 1,
     anchor_sizes: Tuple = ((32,), (64,), (128,), (256,), (512,)),
@@ -651,38 +793,29 @@ def build_retinanet_bilateral(
     score_thresh: float = 0.05,
     detections_per_img: int = 500,
     focal_alpha: float = 0.25,
+    global_channels: int = 128,
 ) -> "RetinaNet":
-    """Build a RetinaNet with ResNet50-FPN backbone for 3-channel bilateral input.
-
-    conv1 initialization:
-      - channels 0 (primary) and 1 (contra): inherit the channel-averaged
-        RadImageNet weights (same as direction H, each channel sees single-image signal).
-      - channel 2 (|diff|): initialized at 0.1× weight to let the model
-        gradually learn how to exploit the difference signal.
-    """
+    """Build GlobalLocal RetinaNet: ResNet50-FPN + GlobalContextEncoder + RoiRefinementHead."""
     if not _TORCHVISION_DET_OK:
-        raise RuntimeError(
-            "torchvision detection module not available. "
-            "Requires torchvision >= 0.11 with detection support."
-        )
+        raise RuntimeError("torchvision detection module not available.")
 
-    # Build ResNet50-FPN backbone
+    # 1. Build ResNet50-FPN backbone (same as H)
     try:
-        backbone = resnet_fpn_backbone(
+        base_backbone = resnet_fpn_backbone(
             backbone_name="resnet50",
             weights=_IMAGENET_WEIGHTS,
             trainable_layers=trainable_backbone_layers,
         )
         print("[Info] Loaded ImageNet weights into backbone.")
     except TypeError:
-        backbone = resnet_fpn_backbone(  # type: ignore[call-arg]
+        base_backbone = resnet_fpn_backbone(  # type: ignore[call-arg]
             backbone_name="resnet50",
             pretrained=True,
             trainable_layers=trainable_backbone_layers,
         )
         print("[Info] Loaded ImageNet weights into backbone (legacy API).")
 
-    # Override with RadImageNet if provided
+    # 2. Override with RadImageNet if provided (same logic as H)
     if medical_backbone_path is not None:
         _idx_to_resnet = {
             "0": "conv1", "1": "bn1",
@@ -702,33 +835,42 @@ def build_retinanet_bilateral(
                 if m and m.group(1) in _idx_to_resnet:
                     k = f"{_idx_to_resnet[m.group(1)]}.{m.group(2)}"
                 stripped[k] = v
-            result = backbone.body.load_state_dict(stripped, strict=False)
+            result = base_backbone.body.load_state_dict(stripped, strict=False)
             missing = len(result.missing_keys) if result is not None else "?"
             unexpected = len(result.unexpected_keys) if result is not None else "?"
             print(f"[Info] Loaded RadImageNet backbone (missing={missing}, unexpected={unexpected}).")
         except Exception as exc:
             print(f"[Warning] Could not load RadImageNet backbone ({exc}). Keeping ImageNet weights.")
 
-    # Adapt conv1 for 3-channel bilateral input.
-    # Primary (ch0) and contra (ch1) get the grayscale-averaged weight;
-    # diff (ch2) gets a 0.1× scaled weight to start with a small contribution.
+    # 3. Adapt conv1 for grayscale-as-3channel
     try:
         with torch.no_grad():
-            mean_w = backbone.body.conv1.weight.mean(dim=1, keepdim=True)  # [64, 1, 7, 7]
-            new_w = mean_w.expand(-1, 3, -1, -1).clone()                   # [64, 3, 7, 7]
-            new_w[:, 2, :, :].mul_(0.1)                                     # diff channel: 0.1×
-            backbone.body.conv1.weight.copy_(new_w)
-        print("[Info] conv1 adapted for bilateral 3-channel input (primary/contra/diff).")
+            mean_w = base_backbone.body.conv1.weight.mean(dim=1, keepdim=True)
+            base_backbone.body.conv1.weight.copy_(mean_w.expand_as(base_backbone.body.conv1.weight))
+        print("[Info] conv1 weights averaged for grayscale-as-3channel input.")
     except AttributeError:
         print("[Warning] Could not adapt conv1.")
 
+    # 4. Build GlobalContextEncoder + GlobalAwareBackbone
+    fpn_channels: int = getattr(base_backbone, "out_channels", 256)
+    global_enc = GlobalContextEncoder(in_channels=3, out_channels=global_channels)
+    global_aware_backbone = GlobalAwareBackbone(
+        base_backbone=base_backbone,
+        global_encoder=global_enc,
+        num_fpn_levels=len(anchor_sizes),
+        fpn_channels=fpn_channels,
+        global_channels=global_channels,
+    )
+    print(f"[Info] GlobalContextEncoder added ({global_channels}ch global features, identity init).")
+
+    # 5. Build RetinaNet with the wrapped backbone
     anchor_generator = AnchorGenerator(
         sizes=anchor_sizes,
         aspect_ratios=aspect_ratios,
     )
 
     model = RetinaNet(
-        backbone=backbone,
+        backbone=global_aware_backbone,
         num_classes=num_classes,
         anchor_generator=anchor_generator,
         min_size=min_size,
@@ -738,12 +880,16 @@ def build_retinanet_bilateral(
         detections_per_img=detections_per_img,
     )
 
-    # Override focal loss alpha (torchvision default: 0.25)
+    # 6. Override focal loss alpha
     try:
         model.head.classification_head.focal_loss_alpha = float(focal_alpha)
         print(f"[Info] Focal loss alpha set to {focal_alpha}.")
     except AttributeError:
         print(f"[Warning] Could not set focal_loss_alpha on this torchvision version.")
+
+    # 7. Attach ROI refinement head as model attribute
+    model.roi_head = RoiRefinementHead(in_channels=fpn_channels, roi_size=7)  # type: ignore[attr-defined]
+    print(f"[Info] RoiRefinementHead attached (P3 stride=8, roi_size=7×7).")
 
     return model
 
@@ -759,47 +905,76 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     epochs: int,
+    roi_lambda: float = 0.5,
     accumulation_steps: int = 1,
     disable_tqdm: bool = False,
-) -> float:
+    roi_rng: Optional[random.Random] = None,
+) -> Tuple[float, float]:
+    """Train one epoch. Returns (avg_det_loss, avg_roi_loss)."""
     model.train()
-    running_loss = 0.0
+    running_det = 0.0
+    running_roi = 0.0
     count = 0
     optimizer.zero_grad(set_to_none=True)
+
+    if roi_rng is None:
+        roi_rng = random.Random(42 + epoch)
 
     pbar = tqdm(loader, desc=f"epoch {epoch + 1}/{epochs}", leave=False, disable=disable_tqdm)
     for i, (images, targets) in enumerate(pbar):
         images = [img.to(device) for img in images]
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        loss_dict = model(images, targets)
-        losses = sum(loss_dict.values())  # type: ignore[arg-type]
+        # Prepare global context: downsample batch 4× and feed to global encoder
+        with torch.no_grad():
+            imgs_stacked = torch.stack(images)  # [B, 3, H, W]
+            small_imgs = F.interpolate(
+                imgs_stacked, scale_factor=0.25, mode="bilinear", align_corners=False
+            )
+        model.backbone.set_global_image(small_imgs)
 
-        if not torch.isfinite(losses):
+        # Detection forward (also sets backbone._cached_features)
+        loss_dict = model(images, targets)
+        det_loss = sum(loss_dict.values())  # type: ignore[arg-type]
+
+        if not torch.isfinite(det_loss):
             optimizer.zero_grad(set_to_none=True)
             continue
 
-        (losses / float(accumulation_steps)).backward()
+        # ROI refinement loss (uses cached FPN features from above forward)
+        roi_loss = compute_roi_loss(
+            cached_features=model.backbone._cached_features,  # type: ignore[attr-defined]
+            roi_head=model.roi_head,  # type: ignore[attr-defined]
+            targets=targets,
+            device=device,
+            rng=roi_rng,
+        )
+
+        total_loss = det_loss + roi_lambda * roi_loss
+
+        (total_loss / float(accumulation_steps)).backward()
         if (i + 1) % accumulation_steps == 0 or (i + 1) == len(loader):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-        running_loss += float(losses.item())
+        running_det += float(det_loss.item())
+        running_roi += float(roi_loss.item())
         count += 1
         if not disable_tqdm:
-            pbar.set_postfix(loss=f"{losses.item():.4f}")  # type: ignore[union-attr]
+            pbar.set_postfix(det=f"{det_loss.item():.4f}", roi=f"{roi_loss.item():.4f}")  # type: ignore[union-attr]
 
-    return running_loss / max(count, 1)
+    n = max(count, 1)
+    return running_det / n, running_roi / n
 
 
 # =============================================================================
 # Validation
 # =============================================================================
 
-def validate_bilateral(
+def validate(
     model: "RetinaNet",
-    samples: List[BilateralSample],
+    samples: List[Sample],
     val_indices: List[int],
     device: torch.device,
     input_h: int,
@@ -807,12 +982,15 @@ def validate_bilateral(
     iou_threshold: float,
     collection_score_thresh: float = 0.01,
     nms_thresh: float = 0.3,
+    roi_score_thresh: float = 0.05,
     epoch: int = 0,
     epochs: int = 1,
     disable_tqdm: bool = False,
 ) -> Dict[str, float]:
-    """Validate with bilateral RetinaNet inference at multiple score thresholds."""
+    """Validate with full-image inference + ROI refinement at multiple score thresholds."""
     model.eval()
+    p3_stride = 8
+    p3_spatial_scale = 1.0 / p3_stride
 
     orig_score_thresh = model.score_thresh
     orig_nms_thresh = model.nms_thresh
@@ -827,47 +1005,89 @@ def validate_bilateral(
     }
     total_gt_boxes = 0
 
-    target_ar = input_h / max(input_w, 1)
-
     pbar = tqdm(val_indices, desc=f"val {epoch + 1}/{epochs}", leave=False, disable=disable_tqdm)
 
     with torch.no_grad():
         for sample_idx in pbar:
             sample = samples[sample_idx]
-            is_right = (sample.laterality == "R")
-
-            # Load primary
-            p_gray, gt_boxes = _load_val_bilateral(
-                primary_path=sample.image_path,
-                contra_path=sample.contra_path,
-                boxes=sample.boxes.astype(np.float32).copy(),
-                target_ar=target_ar,
-                input_h=input_h,
-                input_w=input_w,
-                is_right=is_right,
-            )
-            if p_gray is None:
+            try:
+                img = normalize_image(read_image_unicode(sample.image_path))
+            except FileNotFoundError:
                 continue
 
-            if gt_boxes is None:
-                gt_boxes = np.zeros((0, 4), dtype=np.float32)
+            orig_h, orig_w = img.shape[:2]
+            gt_boxes = sample.boxes.astype(np.float32).copy()
 
-            # Load contra
-            contra_flip = not is_right
-            c_gray_raw = load_gray_clahe(sample.contra_path)
-            if c_gray_raw is not None:
-                c_gray_raw, _ = _pad_gray_to_target_ar(c_gray_raw, None, target_ar)
-                if contra_flip:
-                    c_gray_raw = c_gray_raw[:, ::-1].copy()
-                c_resized = cv2.resize(c_gray_raw, (input_w, input_h), interpolation=cv2.INTER_LINEAR)
-            else:
-                c_resized = np.zeros((input_h, input_w), dtype=np.uint8)
+            # AR-preserving pad (must match training)
+            target_ar = input_h / max(input_w, 1)
+            actual_ar = orig_h / max(orig_w, 1)
+            if actual_ar < target_ar - 1e-6:
+                padded_h = int(round(orig_w * target_ar))
+                pad_top = (padded_h - orig_h) // 2
+                pad_bottom = padded_h - orig_h - pad_top
+                img = np.pad(img, ((pad_top, pad_bottom), (0, 0), (0, 0)), constant_values=0)
+                if gt_boxes.size > 0:
+                    gt_boxes[:, 1] += pad_top
+                    gt_boxes[:, 3] += pad_top
+                orig_h = padded_h
+            elif actual_ar > target_ar + 1e-6:
+                padded_w = int(round(orig_h / target_ar))
+                pad_left = (padded_w - orig_w) // 2
+                pad_right = padded_w - orig_w - pad_left
+                img = np.pad(img, ((0, 0), (pad_left, pad_right), (0, 0)), constant_values=0)
+                if gt_boxes.size > 0:
+                    gt_boxes[:, 0] += pad_left
+                    gt_boxes[:, 2] += pad_left
+                orig_w = padded_w
 
-            img_t = compose_bilateral_tensor(p_gray, c_resized).to(device)
+            scale_x = input_w / max(orig_w, 1)
+            scale_y = input_h / max(orig_h, 1)
+            if gt_boxes.size > 0:
+                gt_boxes[:, 0] *= scale_x
+                gt_boxes[:, 2] *= scale_x
+                gt_boxes[:, 1] *= scale_y
+                gt_boxes[:, 3] *= scale_y
+                keep = (gt_boxes[:, 2] > gt_boxes[:, 0] + 1) & (gt_boxes[:, 3] > gt_boxes[:, 1] + 1)
+                gt_boxes = gt_boxes[keep]
 
+            img_resized = cv2.resize(img, (input_w, input_h), interpolation=cv2.INTER_LINEAR)
+            img_t = image_to_tensor(img_resized).to(device)
+
+            # Set global context for this single image
+            small_img = F.interpolate(
+                img_t.unsqueeze(0), scale_factor=0.25, mode="bilinear", align_corners=False
+            )
+            model.backbone.set_global_image(small_img)
+
+            # Stage-1 detection (also sets _cached_features)
             outputs = model([img_t])
-            pred_boxes = outputs[0]["boxes"].cpu().numpy()
-            pred_scores = outputs[0]["scores"].cpu().numpy()
+            pred_boxes = outputs[0]["boxes"].cpu().numpy()    # (K, 4)
+            pred_scores = outputs[0]["scores"].cpu().numpy()  # (K,)
+
+            # Stage-2 ROI refinement: re-score proposals above roi_score_thresh
+            if _ROI_ALIGN_OK and len(pred_boxes) > 0 and model.backbone._cached_features is not None:  # type: ignore[attr-defined]
+                roi_mask = pred_scores >= roi_score_thresh
+                if roi_mask.any():
+                    roi_boxes = pred_boxes[roi_mask]
+                    roi_det_scores = pred_scores[roi_mask]
+
+                    p3_feat = model.backbone._cached_features["0"]  # type: ignore[attr-defined]
+                    rois_t = torch.cat([
+                        torch.zeros(len(roi_boxes), 1, device=device),
+                        torch.tensor(roi_boxes, dtype=torch.float32, device=device),
+                    ], dim=1)  # [M, 5]
+
+                    roi_logits = model.roi_head(p3_feat, rois_t, p3_spatial_scale).squeeze(1)  # type: ignore[attr-defined]
+                    roi_probs = torch.sigmoid(roi_logits).cpu().numpy()
+
+                    # Geometric mean: combined = sqrt(det_score * roi_score)
+                    combined = np.sqrt(np.clip(roi_det_scores, 1e-6, 1.0) *
+                                       np.clip(roi_probs, 1e-6, 1.0))
+
+                    # Merge back: non-refined boxes keep original scores
+                    final_scores = pred_scores.copy()
+                    final_scores[roi_mask] = combined
+                    pred_scores = final_scores
 
             for thresh in score_thresholds:
                 mask = pred_scores >= thresh
@@ -942,64 +1162,6 @@ def validate_bilateral(
     return result
 
 
-def _load_val_bilateral(
-    primary_path: Path,
-    contra_path: Path,
-    boxes: np.ndarray,
-    target_ar: float,
-    input_h: int,
-    input_w: int,
-    is_right: bool,
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    """Load and preprocess primary image + GT boxes for validation.
-
-    Returns (resized_gray [H, W] uint8, transformed_gt_boxes) or (None, None) if failed.
-    Boxes are returned in canonical (possibly flipped) resized coordinates.
-    """
-    p_gray = load_gray_clahe(primary_path)
-    if p_gray is None:
-        return None, None
-
-    orig_h, orig_w = p_gray.shape[:2]
-
-    gt_boxes = boxes.copy()
-
-    # Clip boxes
-    if gt_boxes.size > 0:
-        gt_boxes[:, 0] = np.clip(gt_boxes[:, 0], 0, orig_w - 1)
-        gt_boxes[:, 2] = np.clip(gt_boxes[:, 2], 0, orig_w - 1)
-        gt_boxes[:, 1] = np.clip(gt_boxes[:, 1], 0, orig_h - 1)
-        gt_boxes[:, 3] = np.clip(gt_boxes[:, 3], 0, orig_h - 1)
-        keep = (gt_boxes[:, 2] > gt_boxes[:, 0] + 1) & (gt_boxes[:, 3] > gt_boxes[:, 1] + 1)
-        gt_boxes = gt_boxes[keep]
-
-    # AR pad
-    p_gray, gt_boxes = _pad_gray_to_target_ar(p_gray, gt_boxes if gt_boxes.size > 0 else None, target_ar)
-    if gt_boxes is None:
-        gt_boxes = np.zeros((0, 4), dtype=np.float32)
-    padded_h, padded_w = p_gray.shape[:2]
-
-    # Flip R → canonical
-    if is_right:
-        p_gray = p_gray[:, ::-1].copy()
-        if gt_boxes.size > 0:
-            gt_boxes = _flip_boxes_h(gt_boxes, padded_w)
-
-    # Scale boxes
-    scale_x = input_w / max(padded_w, 1)
-    scale_y = input_h / max(padded_h, 1)
-    if gt_boxes.size > 0:
-        gt_boxes[:, 0] *= scale_x
-        gt_boxes[:, 2] *= scale_x
-        gt_boxes[:, 1] *= scale_y
-        gt_boxes[:, 3] *= scale_y
-        keep = (gt_boxes[:, 2] > gt_boxes[:, 0] + 1) & (gt_boxes[:, 3] > gt_boxes[:, 1] + 1)
-        gt_boxes = gt_boxes[keep]
-
-    p_resized = cv2.resize(p_gray, (input_w, input_h), interpolation=cv2.INTER_LINEAR)
-    return p_resized, gt_boxes
-
-
 # =============================================================================
 # Checkpoint
 # =============================================================================
@@ -1019,7 +1181,7 @@ def save_checkpoint(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a bilateral RetinaNet-ResNet50-FPN for VinDr lesion detection (Direction I)."
+        description="Train GlobalLocal RetinaNet (Direction J, rec_50) for VinDr lesion detection."
     )
     parser.add_argument("--csv-path", type=Path, default=None)
     parser.add_argument("--images-root", type=Path, default=None)
@@ -1034,21 +1196,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--min-delta", type=float, default=1e-4)
     parser.add_argument("--cliff-patience-ratio", type=float, default=0.0,
-                        help="Cliff-aware patience ratio (same semantics as direction H). "
-                             "0 = disabled (default). Recommended: 0.6.")
+                        help="Cliff-aware patience ratio. 0 = disabled. Recommended: 0.6.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--accumulation-steps", type=int, default=1)
-    parser.add_argument("--augment", action="store_true",
-                        help="Enable training augmentation (contrast jitter + zoom-out). "
-                             "Note: horizontal flip augmentation is intentionally disabled "
-                             "to preserve bilateral symmetry semantics.")
+    parser.add_argument("--augment", action="store_true")
+    parser.add_argument("--aug-hflip-prob", type=float, default=0.5)
+    parser.add_argument("--aug-brightness-delta", type=float, default=0.2)
     parser.add_argument("--aug-contrast-range", type=float, nargs=2, default=[1.0, 1.0],
-                        metavar=("MIN", "MAX"),
-                        help="Contrast jitter range. Same factor applied to primary and "
-                             "contra so |diff| stays proportional. Default: 1.0 1.0 (disabled).")
-    parser.add_argument("--aug-scale-min", type=float, default=1.0,
-                        help="Minimum zoom-out scale. 1.0 = disabled (default).")
+                        metavar=("MIN", "MAX"))
+    parser.add_argument("--aug-scale-min", type=float, default=1.0)
     parser.add_argument("--medical-backbone-path", type=Path, default=None)
     parser.add_argument("--pos-oversample-factor", type=float, default=4.0)
     parser.add_argument("--anchor-sizes", type=str, default="32,64,128,256,512")
@@ -1061,6 +1218,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lesion-types", type=str, default=None)
     parser.add_argument("--min-box-side", type=float, default=0.0)
     parser.add_argument("--max-box-ar", type=float, default=float("inf"))
+    # J-specific arguments
+    parser.add_argument("--roi-lambda", type=float, default=0.5,
+                        help="Weight of ROI refinement loss in total loss. "
+                             "total = det_loss + roi_lambda * roi_loss. Default 0.5.")
+    parser.add_argument("--global-channels", type=int, default=128,
+                        help="Output channels of GlobalContextEncoder. Default 128.")
     return parser.parse_args()
 
 
@@ -1075,15 +1238,15 @@ def main() -> None:
     repo_root = repo_root_from_file()
     csv_path = args.csv_path or repo_root / "data" / "raw" / "vindr_detection_folds.csv"
     images_root = args.images_root or repo_root / "data" / "processed" / "images_png"
-    save_path = args.save_path or repo_root / "models" / "bbox_resnet50.I.pth"
+    save_path = args.save_path or repo_root / "models" / "bbox_resnet50.J.pth"
 
     print(f"Start time:    {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Direction:     I (bilateral contralateral comparison) | rec_49")
+    print(f"Direction:     J (global-local dual branch) | rec_50")
     print(f"CSV: {csv_path}")
     print(f"Images root: {images_root}")
     print(f"Save path: {save_path}")
 
-    all_samples = load_bilateral_samples(
+    all_samples = load_samples(
         csv_path, images_root, split_name="training",
         lesion_types=[t.strip() for t in args.lesion_types.split(",")]
         if args.lesion_types else None,
@@ -1091,18 +1254,9 @@ def main() -> None:
         max_box_ar=float(args.max_box_ar),
         input_w=int(args.input_w),
     )
-    print(f"Total bilateral samples: {len(all_samples)}")
-    if args.lesion_types:
-        print(f"Lesion type filter: {args.lesion_types}")
+    print(f"Total samples: {len(all_samples)}")
     if float(args.min_box_side) > 0.0 or float(args.max_box_ar) < float("inf"):
         print(f"Box detectability filter: min_side≥{args.min_box_side:.1f}px, max_AR≤{args.max_box_ar:.1f}")
-
-    # Log view distribution
-    n_cc = sum(1 for s in all_samples if s.view == "CC")
-    n_mlo = sum(1 for s in all_samples if s.view == "MLO")
-    n_l = sum(1 for s in all_samples if s.laterality == "L")
-    n_r = sum(1 for s in all_samples if s.laterality == "R")
-    print(f"View distribution: CC={n_cc} MLO={n_mlo} | Laterality: L={n_l} R={n_r}")
 
     train_idx, val_idx = patient_level_split(all_samples, val_ratio=0.15, seed=int(args.seed))
     val_pos_idx = [i for i in val_idx if all_samples[i].boxes.shape[0] > 0]
@@ -1125,26 +1279,24 @@ def main() -> None:
     )
     print(f"Pos oversample factor: {args.pos_oversample_factor:.1f}")
     print(f"Monitor metric: {args.monitor_metric}")
-    if bool(args.augment):
-        print(
-            f"Augmentation: contrast=[{args.aug_contrast_range[0]:.2f}, {args.aug_contrast_range[1]:.2f}] "
-            f"scale_min={args.aug_scale_min:.2f} | hflip: disabled (bilateral semantics preserved)"
-        )
-    else:
-        print("Augmentation: disabled")
+    aug_str = (
+        f"contrast=[{args.aug_contrast_range[0]:.2f}, {args.aug_contrast_range[1]:.2f}] "
+        f"scale_min={args.aug_scale_min} hflip_p={args.aug_hflip_prob}"
+        if args.augment else "disabled"
+    )
+    print(f"Augmentation: {aug_str}")
     print(
         f"Cliff patience ratio: {args.cliff_patience_ratio} | "
         f"min_delta: {args.min_delta} | seed: {args.seed}"
     )
-
-    # Parse anchor sizes
     anchor_size_vals = [int(s.strip()) for s in str(args.anchor_sizes).split(",")]
     anchor_sizes = tuple((s,) for s in anchor_size_vals)
     aspect_ratios = ((0.5, 1.0, 2.0),) * len(anchor_size_vals)
     print(f"Anchor sizes: {anchor_sizes} | Aspect ratios: (0.5, 1.0, 2.0) per level")
+    print(f"ROI lambda: {args.roi_lambda} | Global channels: {args.global_channels}")
 
     # Build model
-    model = build_retinanet_bilateral(
+    model = build_global_local_retinanet(
         medical_backbone_path=(
             str(args.medical_backbone_path) if args.medical_backbone_path else None
         ),
@@ -1158,12 +1310,13 @@ def main() -> None:
         score_thresh=float(args.score_thresh),
         detections_per_img=500,
         focal_alpha=float(args.focal_alpha),
+        global_channels=int(args.global_channels),
     )
     model.to(device)
 
-    # Differential LR: encoder body vs FPN + head
-    body_param_ids = {id(p) for p in model.backbone.body.parameters()}
-    body_params = list(model.backbone.body.parameters())
+    # Differential LR: ResNet50 body (pretrained) vs everything else (new/FPN)
+    body_param_ids = {id(p) for p in model.backbone.base.body.parameters()}
+    body_params = list(model.backbone.base.body.parameters())
     other_params = [p for p in model.parameters() if id(p) not in body_param_ids]
 
     optimizer = torch.optim.AdamW(
@@ -1177,25 +1330,24 @@ def main() -> None:
         optimizer, T_max=int(args.epochs), eta_min=float(args.lr) * 0.01
     )
 
-    # Build training dataset
-    train_dataset = BilateralDetectionDataset(
+    train_dataset = DetectionDataset(
         samples=all_samples,
         indices=train_idx,
         input_h=int(args.input_h),
         input_w=int(args.input_w),
         augment=bool(args.augment),
+        aug_hflip_prob=float(args.aug_hflip_prob),
+        aug_brightness_delta=float(args.aug_brightness_delta),
         aug_contrast_min=float(args.aug_contrast_range[0]),
         aug_contrast_max=float(args.aug_contrast_range[1]),
         aug_scale_min=float(args.aug_scale_min),
         seed=int(args.seed),
     )
 
-    # Weighted sampler: oversample positive images
     sampler_weights = make_oversampling_weights(
         all_samples, train_idx, pos_oversample_factor=float(args.pos_oversample_factor)
     )
 
-    # Training state
     best_metric = 0.0
     best_epoch = 0
     no_improve = 0
@@ -1222,7 +1374,6 @@ def main() -> None:
         except (OSError, ValueError):
             pass
 
-    # Training loop
     for epoch in range(int(args.epochs)):
         print(f"\n{'─' * 72}")
         print(f"Epoch {epoch + 1} / {args.epochs}")
@@ -1245,19 +1396,22 @@ def main() -> None:
             pin_memory=torch.cuda.is_available(),
         )
 
-        avg_loss = train_one_epoch(
+        roi_rng = random.Random(int(args.seed) + epoch * 1000)
+        avg_det_loss, avg_roi_loss = train_one_epoch(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
             device=device,
             epoch=epoch,
             epochs=int(args.epochs),
+            roi_lambda=float(args.roi_lambda),
             accumulation_steps=int(args.accumulation_steps),
             disable_tqdm=bool(args.hide_progress_bar),
+            roi_rng=roi_rng,
         )
         lr_scheduler.step()
 
-        val_metrics = validate_bilateral(
+        val_metrics = validate(
             model=model,
             samples=all_samples,
             val_indices=val_pos_idx,
@@ -1292,7 +1446,7 @@ def main() -> None:
         report_prec = report_tp / max(report_tp + report_fp, 1)
 
         print(
-            f"Epoch {epoch + 1}/{args.epochs} | loss={avg_loss:.4f} | "
+            f"Epoch {epoch + 1}/{args.epochs} | det_loss={avg_det_loss:.4f} roi_loss={avg_roi_loss:.4f} | "
             f"{monitor_metric_name}={cur_monitor:.4f} @ score={monitor_thresh:.1f} "
             f"(TP={report_tp} FP={report_fp} FN={report_fn} "
             f"Recall={report_recall:.3f} Prec={report_prec:.3f}) | "
@@ -1324,7 +1478,7 @@ def main() -> None:
                     "anchor_sizes": str(args.anchor_sizes),
                     "nms_thresh": float(args.nms_thresh),
                     "focal_alpha": float(args.focal_alpha),
-                    "bilateral": True,
+                    "global_channels": int(args.global_channels),
                 },
             )
             print(f"  [Checkpoint] Epoch {epoch + 1} | Saved ({monitor_metric_name}={best_metric:.4f}, patience reset) -> {save_path}")
@@ -1355,7 +1509,9 @@ if __name__ == "__main__":
     start = time.time()
     main()
     end = time.time()
-    h, rem = divmod(int(end - start), 3600)
-    m, s = divmod(rem, 60)
-    print(f"End time:    {datetime.datetime.fromtimestamp(end).strftime('%Y-%m-%d %H:%M:%S')}")
+    elapsed = end - start
+    h = int(elapsed // 3600)
+    m = int((elapsed % 3600) // 60)
+    s = int(elapsed % 60)
+    print(f"End time:    {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Elapsed:     {h:02d}:{m:02d}:{s:02d}")
