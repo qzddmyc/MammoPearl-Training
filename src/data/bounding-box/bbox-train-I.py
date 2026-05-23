@@ -317,7 +317,7 @@ def load_bilateral_samples(
     ):
         first = group.iloc[0]
         lat = str(first.get("laterality", "")).strip().upper()
-        view_raw = str(first.get("view_position", "")).strip().upper()
+        view_raw = str(first.get("view", "")).strip().upper()
         if lat not in ("L", "R") or view_raw not in ("CC", "MLO"):
             continue
         pid = str(patient_id)
@@ -338,7 +338,7 @@ def load_bilateral_samples(
         first = group.iloc[0]
 
         lat = str(first.get("laterality", "")).strip().upper()
-        view_raw = str(first.get("view_position", "")).strip().upper()
+        view_raw = str(first.get("view", "")).strip().upper()
         if lat not in ("L", "R") or view_raw not in ("CC", "MLO"):
             continue
 
