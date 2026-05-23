@@ -480,6 +480,33 @@ Prompts for improvement:
     - val 多阈值报告（score@0.1–0.9）输出 TP/FP/FN/Recall/F1/F2。
     - patient_level_split 使用 sorted() 确保确定性（与 G 一致）。
     目标：超越 F+G 最佳 F2=0.4652，争取 F2 > 0.50。
+    最终结果（rec_48 upd_6）：best F2@0.3（固定阈值）=0.2788，ep9，ep9 之后无法突破。
+      val GT boxes=251，Recall@0.1≈53%，TP@0.3=60，TP@0.7=23。
+      根因：监控目标 fbeta2_ref（固定 @0.3）导致模型学会低置信度输出；
+      更深层根因：Asymmetry / Architectural_Distortion 需双侧对比才能识别，单视图无学习信号。
+    已训练模型：models/bbox_resnet50.H.pth
+
+-----------
+49. 方向 I：双侧对比检测（Bilateral Contralateral Comparison，rec_49）
+    【此文件未作修改，完整实现在分支文件 bbox-train-I.py 中】
+    切换动机：
+    - 方向 H (upd_6) 最终结果：best F2@0.3=0.2788，ep9，之后无法突破。
+    - 根因：单视图缺少双侧不对称语义信号；Asymmetry / Architectural_Distortion 类病变
+      需对侧对比才能识别，单图 RetinaNet 对此类病变几乎无学习信号。
+    - 方向 I 引入对侧同视角图作为参照，将三通道 [primary, contra, |primary-contra|] 送入
+      RetinaNet，差分通道显式提供"哪一侧不对称"的语义信号。
+    关键实现：
+    - BilateralSample：新增 laterality / view / contra_path 字段；
+      每张图恰好作为一次 primary，训练样本数 ≈16000（同 H）。
+    - 标准坐标系（canonical left-facing space）：R 侧水平翻转后与 L 侧解剖对齐；
+      翻转后差分通道反映真实解剖不对称性。
+    - conv1：primary / contra 通道继承 RadImageNet 均值权重；diff 通道 0.1× 权重
+      （让模型缓慢学习如何利用差分信号）。
+    - 增强：对比度 / 缩放，禁用 hflip（会破坏双侧坐标系语义）；
+      对比度因子同时作用于 primary 和 contra，保持差分通道比例。
+    - 数据验证：4999/5000 患者有完整四视角；881/924 阳性患者（95.3%）为单侧病变，
+      对侧可作为健康参照。
+    目标：突破 H 的 F2@0.3=0.2788，期望 >0.30。
 
 """
 
