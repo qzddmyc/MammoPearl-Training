@@ -1,9 +1,11 @@
 r"""
-方向 J：Global-Local 双分支检测（Global Context Fusion + ROI Refinement）
+方向 K：RetinaNet + GlobalContextEncoder（全图上下文融合，无 ROI 重打分）
+
+安装依赖（torchvision 已满足，无额外依赖）。
 
 运行命令（Git Bash）：
 
-python src/data/bounding-box/bbox-train-J.py \
+python src/data/bounding-box/bbox-train-K.py \
     --epochs 50 \
     --batch-size 4 \
     --lr 1e-4 \
@@ -13,7 +15,7 @@ python src/data/bounding-box/bbox-train-J.py \
     --patience 10 \
     --monitor-metric fbeta2_ref \
     --medical-backbone-path models/raw/ResNet50.pt \
-    --save-path models/bbox_resnet50.J.pth \
+    --save-path models/bbox_resnet50.K.pth \
     --augment \
     --aug-contrast-range 0.8 1.2 \
     --aug-scale-min 0.85 \
@@ -21,46 +23,49 @@ python src/data/bounding-box/bbox-train-J.py \
     --min-box-side 24.0 \
     --max-box-ar 3.0 \
     --cliff-patience-ratio 0.6 \
-    --roi-lambda 0.5 \
+    --global-channels 128 \
     --hide-progress-bar
 
-核心思想（相比方向 H 的改进）：
-  方向 H 的主要缺陷：模型能找到病灶（F2@0.1 ≈ 0.40），但置信度打分偏低
-  （F2@0.3 仅 0.28），说明模型缺乏"这个局部区域在全乳中是否可疑"的上下文判断。
+与方向 H 和方向 J 的核心差异：
 
-  方向 J 引入两个机制解决此问题：
+  方向 H（基线）：
+    纯 RetinaNet + ResNet50-FPN，全图直接检测，best F2@0.3=0.2788（ep9）。
 
-  1. Global Context Fusion（全局上下文注入）：
-     - 将 1024×512 图像降采样到 256×128
-     - 经过 GlobalContextEncoder（3 层 stride-2 CNN）得到 128 通道全局特征图
-     - 全局特征图在 5 个 FPN 层（P3-P7）分别上采样/下采样后与局部特征 concat
-     - 1×1 conv 融合，通道数保持 256（identity 初始化，全局分量初始权重接近零）
-     这给检测头提供了"整体乳腺的密度分布/形态轮廓"上下文，
-     使模型能区分"正常腺体"与"异常结构"。
+  方向 J（已失败）：
+    H + GlobalContextEncoder/GlobalAwareBackbone + ROI 重打分头。
+    best F2@0.3=0.1571（ep23）。失败根因分析：
+      · ROI 头每批正例极少，BCE 训练信号极不稳定，导致 roi_score 逐 epoch 大幅抖动。
+      · 几何均值 √(det×roi) 过激进，roi_score 低时把大量候选压至 0.3 以下。
+    无法判断失败原因是"全局融合无效"还是"ROI 头破坏了 det_score"。
 
-  2. ROI Refinement Head（兴趣区域置信度校正）：
-     - 训练时：从 GT box（正例）和背景随机 crop（负例）构造 ROI 样本
-       ROI Align from P3（stride=8，局部分辨率最高）→ 7×7×256 → FC(256) → 1
-       BCE loss：与检测损失联合反向传播
-     - 推理时：对 stage-1 检测分数 > 0.05 的候选框，经 ROI head 重打分
-       最终分数 = √(detection_score × roi_score)（几何均值融合）
-     - 无需两阶段训练：ROI head 与检测头同步端到端训练
+  方向 K（本文件）：
+    H + GlobalContextEncoder/GlobalAwareBackbone（单变量验证全局融合效果）。
+    完全移除 ROI 重打分头，推理分数直接使用 det_score（同 H）。
+    实验目的：分离"全局上下文融合"对 F2@0.3 的独立贡献。
+    · K > H → 全局融合有效，J 的失败主因是 ROI 头。
+    · K ≈ H → 全局融合本身也无效，需要换思路。
+
+GlobalContextEncoder：
+  输入全图 4× 下采样（256×128 for 1024×512），3 个 stride-2 BN-ReLU Conv 模块
+  将空间压缩 8× → 输出 [B, 128, 32, 16]（与 FPN P5 同分辨率）。
+  F.interpolate 上/下采样到各 FPN 层分辨率后 concat 再 1×1 融合。
+
+GlobalAwareBackbone：
+  包装 resnet_fpn_backbone，对 P3~P7 五层各注入全局上下文。
+  1×1 融合 conv 以 identity init（全局分支初始贡献为零），
+  保留预训练 RetinaNet 的起始行为，避免随机初始化破坏 early training。
 
 ─────────────────────────────────────────────────────────────────────────────
 改版历史
 ─────────────────────────────────────────────────────────────────────────────
 
-rec_50（初版，基于 H upd_6 改造）
-  - 核心改动：
-    · GlobalContextEncoder：3 层 stride-2 BN-ReLU conv，256×128 → 32×16 @ 128ch
-    · GlobalAwareBackbone：包装 ResNet50-FPN，按层注入全局上下文，缓存 P3~P7
-    · RoiRefinementHead：ROI Align(P3, 7×7) + 2-layer FC → 置信度校正
-    · build_global_local_retinanet()：组装以上组件
-    · 训练时 ROI 损失：GT box（+20% jitter）为正例，背景随机 crop 为负例（3:1 比）
-    · 推理时几何均值合并 stage-1 与 ROI 分数
-  - 数据加载：与 H 完全相同（单图，无双侧配对需求）
-  - 增强：保留 hflip（单图架构，不破坏双侧语义）
-  - 目标：突破 H 的 F2@0.3=0.2788
+rec_51（初版）
+  - 以方向 H（upd_6）为基础，加入 GlobalContextEncoder + GlobalAwareBackbone。
+  - 移除方向 J 的 RoiRefinementHead 及所有 ROI loss 辅助函数。
+  - 训练和验证中每批/每图调用 set_global_image（4× 下采样）。
+  - 差分 LR：model.backbone.base.body（ResNet50，低 LR = lr × encoder_lr_multiplier）
+             vs FPN + 检测头 + global_enc + fusion convs（高 LR = lr）。
+  - 新增 --global-channels 参数（默认 128）。
 """
 
 from __future__ import annotations
@@ -73,12 +78,10 @@ if not _omp or not _omp.isdigit() or int(_omp) < 1:
 import argparse
 import atexit
 import datetime
-import math
 import random
 import re
 import signal
 import time
-from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -98,12 +101,6 @@ try:
     _TORCHVISION_DET_OK = True
 except ImportError:
     _TORCHVISION_DET_OK = False
-
-try:
-    from torchvision.ops import roi_align as _torchvision_roi_align
-    _ROI_ALIGN_OK = True
-except ImportError:
-    _ROI_ALIGN_OK = False
 
 try:
     from torchvision.models import resnet50 as _resnet50
@@ -266,7 +263,7 @@ def load_samples(
     for (patient_id, _series_id, image_id), group in df.groupby(
         ["patient_id", "series_id", "image_id"], sort=True
     ):
-        first = group.iloc[0]
+        first = group.iloc[0]  # read orig_h/w before filtering
         if lesion_types:
             type_mask = pd.Series(False, index=group.index)
             for lt in lesion_types:
@@ -282,6 +279,7 @@ def load_samples(
             if invalid > 0:
                 print(f"[Warning] Found {invalid} invalid boxes in {image_path}")
 
+        # Detectability filter (in resized-image-space coordinates)
         if boxes.size > 0 and (min_box_side > 0.0 or max_box_ar < float("inf")):
             orig_w_val = float(first["width"]) if pd.notna(first["width"]) else float(input_w)
             scale = float(input_w) / max(orig_w_val, 1.0)
@@ -315,7 +313,7 @@ def patient_level_split(
     val_ratio: float = 0.15,
     seed: int = 42,
 ) -> Tuple[List[int], List[int]]:
-    patients = sorted({s.patient_id for s in samples})
+    patients = sorted({s.patient_id for s in samples})  # sorted → deterministic order
     rng = random.Random(seed)
     rng.shuffle(patients)
     n_val = max(1, int(len(patients) * val_ratio))
@@ -330,7 +328,12 @@ def patient_level_split(
 # =============================================================================
 
 class DetectionDataset(Dataset):
-    """Full-image detection dataset for torchvision RetinaNet (same as H)."""
+    """Full-image detection dataset for torchvision RetinaNet.
+
+    Each item is (image_tensor [3, H, W], target_dict) where target_dict
+    contains 'boxes' [N, 4] (xyxy) and 'labels' [N] (all 1 = lesion).
+    Negative images return empty boxes/labels.
+    """
 
     def __init__(
         self,
@@ -377,6 +380,7 @@ class DetectionDataset(Dataset):
         orig_h, orig_w = img.shape[:2]
         boxes = sample.boxes.copy()
 
+        # Clip and filter degenerate boxes
         if boxes.size > 0:
             boxes[:, 0] = np.clip(boxes[:, 0], 0, orig_w - 1)
             boxes[:, 2] = np.clip(boxes[:, 2], 0, orig_w - 1)
@@ -385,10 +389,11 @@ class DetectionDataset(Dataset):
             keep = (boxes[:, 2] > boxes[:, 0] + 1) & (boxes[:, 3] > boxes[:, 1] + 1)
             boxes = boxes[keep]
 
-        # AR-preserving pad
+        # AR-preserving pad: make H/W match target AR before resize to eliminate distortion.
+        # VinDr-Mammo images are 1520×912 (AR=1.667); target 1024×512 (AR=2.0) → pad H.
         target_ar = self.input_h / max(self.input_w, 1)
         actual_ar = orig_h / max(orig_w, 1)
-        if actual_ar < target_ar - 1e-6:
+        if actual_ar < target_ar - 1e-6:  # image too wide → pad height
             padded_h = int(round(orig_w * target_ar))
             pad_top = (padded_h - orig_h) // 2
             pad_bottom = padded_h - orig_h - pad_top
@@ -397,7 +402,7 @@ class DetectionDataset(Dataset):
                 boxes[:, 1] += pad_top
                 boxes[:, 3] += pad_top
             orig_h = padded_h
-        elif actual_ar > target_ar + 1e-6:
+        elif actual_ar > target_ar + 1e-6:  # image too tall → pad width
             padded_w = int(round(orig_h / target_ar))
             pad_left = (padded_w - orig_w) // 2
             pad_right = padded_w - orig_w - pad_left
@@ -407,8 +412,10 @@ class DetectionDataset(Dataset):
                 boxes[:, 2] += pad_left
             orig_w = padded_w
 
+        # Resize image
         img_resized = cv2.resize(img, (self.input_w, self.input_h), interpolation=cv2.INTER_LINEAR)
 
+        # Scale boxes to input_h×input_w space
         scale_x = self.input_w / max(orig_w, 1)
         scale_y = self.input_h / max(orig_h, 1)
         if boxes.size > 0:
@@ -416,9 +423,11 @@ class DetectionDataset(Dataset):
             boxes[:, 2] *= scale_x
             boxes[:, 1] *= scale_y
             boxes[:, 3] *= scale_y
+            # Re-filter after scaling
             keep = (boxes[:, 2] > boxes[:, 0] + 1) & (boxes[:, 3] > boxes[:, 1] + 1)
             boxes = boxes[keep]
 
+        # Augmentation
         if self.augment:
             if self.rng.random() < self.aug_hflip_prob:
                 img_resized = img_resized[:, ::-1, :].copy()
@@ -455,12 +464,12 @@ class DetectionDataset(Dataset):
                         keep = (boxes[:, 2] > boxes[:, 0] + 1) & (boxes[:, 3] > boxes[:, 1] + 1)
                         boxes = boxes[keep]
 
-        img_t = image_to_tensor(img_resized)
+        img_t = image_to_tensor(img_resized)  # [3, H, W] float32 in [0, 1]
 
         if boxes.size > 0:
             target = {
                 "boxes": torch.from_numpy(boxes.astype(np.float32)),
-                "labels": torch.zeros(boxes.shape[0], dtype=torch.int64),
+                "labels": torch.zeros(boxes.shape[0], dtype=torch.int64),  # class 0 = foreground (num_classes=1)
             }
         else:
             target = {
@@ -484,6 +493,7 @@ def make_oversampling_weights(
     indices: List[int],
     pos_oversample_factor: float = 4.0,
 ) -> torch.Tensor:
+    """Assign higher weight to positive-sample images for WeightedRandomSampler."""
     weights = []
     for i in indices:
         weights.append(pos_oversample_factor if samples[i].boxes.shape[0] > 0 else 1.0)
@@ -491,7 +501,7 @@ def make_oversampling_weights(
 
 
 # =============================================================================
-# Global Context Architecture Components
+# Global Context Modules
 # =============================================================================
 
 class GlobalContextEncoder(nn.Module):
@@ -534,9 +544,6 @@ class GlobalAwareBackbone(nn.Module):
         model.backbone.set_global_image(small_img)   # [B, 3, H/4, W/4]
         # Then call model normally — backbone.forward() will inject global features.
 
-    After forward(), backbone._cached_features holds the fused FPN feature dict
-    (keys '0'..'4' corresponding to P3..P7). Used by the ROI refinement head.
-
     Fusion initialization: the 1×1 fusion convs are initialized so the global
     branch contribution starts near zero (identity pass-through for local features).
     This preserves the pretrained RetinaNet behaviour at the start of training.
@@ -569,7 +576,6 @@ class GlobalAwareBackbone(nn.Module):
                 fc.weight[:, :fpn_channels, 0, 0] = torch.eye(fpn_channels)
 
         self._global_feat: Optional[torch.Tensor] = None
-        self._cached_features: Optional[Dict[str, torch.Tensor]] = None
 
     def set_global_image(self, img_tensor: torch.Tensor) -> None:
         """Pre-compute global context feature from downsampled image.
@@ -592,196 +598,14 @@ class GlobalAwareBackbone(nn.Module):
                     )
                     feats[k] = self.fusion[i](torch.cat([feats[k], gf], dim=1))
 
-        self._cached_features = feats  # cache for ROI head (same tensors, no copy)
         return feats
-
-
-class RoiRefinementHead(nn.Module):
-    """ROI Align from P3 + 2-layer FC → binary classification logit.
-
-    Pooling from P3 (stride=8) provides the highest spatial resolution among
-    FPN levels, which is important for the small lesions in mammography.
-    """
-
-    def __init__(self, in_channels: int = 256, roi_size: int = 7) -> None:
-        super().__init__()
-        self.roi_size = roi_size
-        self.fc = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(in_channels * roi_size * roi_size, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=0.5),
-            nn.Linear(256, 1),
-        )
-
-    def forward(
-        self,
-        feature_map: torch.Tensor,
-        rois: torch.Tensor,
-        spatial_scale: float,
-    ) -> torch.Tensor:
-        """
-        Args:
-            feature_map: [B, C, H, W]  – P3 feature (after fusion)
-            rois:        [N, 5]         – (batch_idx, x1, y1, x2, y2) image coords
-            spatial_scale: float       – 1/stride (=1/8 for P3 at 1024×512)
-        Returns:
-            logits: [N, 1]
-        """
-        if not _ROI_ALIGN_OK:
-            raise RuntimeError("torchvision.ops.roi_align not available.")
-        pooled = _torchvision_roi_align(
-            feature_map,
-            rois,
-            output_size=self.roi_size,
-            spatial_scale=spatial_scale,
-            aligned=True,
-        )  # [N, C, roi_size, roi_size]
-        return self.fc(pooled)  # [N, 1]
-
-
-# =============================================================================
-# ROI Loss Helpers
-# =============================================================================
-
-def _box_iou_one_vs_many(box1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
-    """Compute IoU between box1 [4] and each box in boxes2 [N, 4]. Returns [N]."""
-    if boxes2.shape[0] == 0:
-        return torch.zeros(0, dtype=torch.float32, device=box1.device)
-    ix1 = torch.maximum(box1[0], boxes2[:, 0])
-    iy1 = torch.maximum(box1[1], boxes2[:, 1])
-    ix2 = torch.minimum(box1[2], boxes2[:, 2])
-    iy2 = torch.minimum(box1[3], boxes2[:, 3])
-    inter = torch.clamp(ix2 - ix1, min=0.0) * torch.clamp(iy2 - iy1, min=0.0)
-    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
-    union = area1 + area2 - inter
-    return inter / torch.clamp(union, min=1e-6)
-
-
-def _jitter_box(
-    box: torch.Tensor,
-    jitter_frac: float,
-    img_h: float,
-    img_w: float,
-    rng: random.Random,
-) -> torch.Tensor:
-    """Randomly jitter a box by ±jitter_frac of its size, clamped to image bounds."""
-    x1, y1, x2, y2 = box[0].item(), box[1].item(), box[2].item(), box[3].item()
-    bw, bh = max(x2 - x1, 1.0), max(y2 - y1, 1.0)
-    dx = (rng.random() * 2 - 1) * jitter_frac * bw
-    dy = (rng.random() * 2 - 1) * jitter_frac * bh
-    x1 = max(0.0, min(x1 + dx, img_w - bw))
-    y1 = max(0.0, min(y1 + dy, img_h - bh))
-    x2 = min(img_w, x1 + bw)
-    y2 = min(img_h, y1 + bh)
-    return torch.tensor([x1, y1, x2, y2], dtype=torch.float32, device=box.device)
-
-
-def _sample_background_box(
-    img_h: int,
-    img_w: int,
-    gt_boxes: torch.Tensor,
-    device: torch.device,
-    min_size: int = 32,
-    max_size: int = 256,
-    max_tries: int = 30,
-    rng: Optional[random.Random] = None,
-) -> Optional[torch.Tensor]:
-    """Sample a random box with IoU < 0.1 with all GT boxes. Returns None if failed."""
-    if rng is None:
-        rng = random.Random()
-    for _ in range(max_tries):
-        size = rng.randint(min_size, max_size)
-        if size >= img_w or size >= img_h:
-            size = max(min_size, min(img_w, img_h) // 2)
-        x1 = rng.randint(0, max(1, img_w - size))
-        y1 = rng.randint(0, max(1, img_h - size))
-        x2, y2 = x1 + size, y1 + size
-        candidate = torch.tensor([float(x1), float(y1), float(x2), float(y2)],
-                                  dtype=torch.float32, device=device)
-        if gt_boxes.shape[0] > 0:
-            iou = _box_iou_one_vs_many(candidate, gt_boxes)
-            if iou.max().item() > 0.1:
-                continue
-        return candidate
-    return None
-
-
-def compute_roi_loss(
-    cached_features: Dict[str, torch.Tensor],
-    roi_head: RoiRefinementHead,
-    targets: List[Dict[str, torch.Tensor]],
-    device: torch.device,
-    p3_stride: int = 8,
-    jitter_frac: float = 0.2,
-    neg_ratio: int = 3,
-    max_neg_per_img: int = 9,
-    rng: Optional[random.Random] = None,
-) -> torch.Tensor:
-    """Compute BCE loss for the ROI refinement head.
-
-    Positive ROIs: GT boxes with random jitter (×1).
-    Negative ROIs: background crops with IoU < 0.1 with all GT (×neg_ratio per positive).
-    For all-negative images: sample max_neg_per_img background crops as negatives only.
-
-    Returns scalar loss (0 if no ROIs sampled).
-    """
-    if rng is None:
-        rng = random.Random()
-    p3_feat = cached_features["0"]  # [B, 256, H/8, W/8]
-    spatial_scale = 1.0 / p3_stride
-    img_h = p3_feat.shape[2] * p3_stride
-    img_w = p3_feat.shape[3] * p3_stride
-
-    all_rois: List[torch.Tensor] = []
-    all_labels: List[float] = []
-
-    for batch_idx, target in enumerate(targets):
-        gt_boxes = target["boxes"].to(device)  # [N, 4]
-        n_gt = gt_boxes.shape[0]
-        batch_idx_f = float(batch_idx)
-
-        if n_gt > 0:
-            # Positive ROIs: each GT box with jitter
-            for gi in range(n_gt):
-                jb = _jitter_box(gt_boxes[gi], jitter_frac, float(img_h), float(img_w), rng)
-                all_rois.append(torch.cat([
-                    torch.tensor([batch_idx_f], dtype=torch.float32, device=device), jb.to(device)
-                ]))
-                all_labels.append(1.0)
-            # Negative ROIs: neg_ratio × n_gt background crops
-            n_neg_target = min(neg_ratio * n_gt, max_neg_per_img)
-        else:
-            n_neg_target = max_neg_per_img  # all-negative image: still train negatives
-
-        sampled_neg = 0
-        for _ in range(n_neg_target * 4):  # extra tries
-            if sampled_neg >= n_neg_target:
-                break
-            neg = _sample_background_box(img_h, img_w, gt_boxes, device, rng=rng)
-            if neg is not None:
-                all_rois.append(torch.cat([
-                    torch.tensor([batch_idx_f], dtype=torch.float32, device=device), neg
-                ]))
-                all_labels.append(0.0)
-                sampled_neg += 1
-
-    if len(all_rois) == 0:
-        return torch.tensor(0.0, device=device, requires_grad=True)
-
-    rois = torch.stack(all_rois, dim=0)  # [N, 5]
-    labels = torch.tensor(all_labels, dtype=torch.float32, device=device)  # [N]
-
-    logits = roi_head(p3_feat, rois, spatial_scale).squeeze(1)  # [N]
-    return F.binary_cross_entropy_with_logits(logits, labels)
 
 
 # =============================================================================
 # Model
 # =============================================================================
 
-def build_global_local_retinanet(
+def build_global_retinanet(
     medical_backbone_path: Optional[str] = None,
     num_classes: int = 1,
     anchor_sizes: Tuple = ((32,), (64,), (128,), (256,), (512,)),
@@ -795,11 +619,21 @@ def build_global_local_retinanet(
     focal_alpha: float = 0.25,
     global_channels: int = 128,
 ) -> "RetinaNet":
-    """Build GlobalLocal RetinaNet: ResNet50-FPN + GlobalContextEncoder + RoiRefinementHead."""
-    if not _TORCHVISION_DET_OK:
-        raise RuntimeError("torchvision detection module not available.")
+    """Build a RetinaNet with ResNet50-FPN backbone + GlobalContextEncoder fusion.
 
-    # 1. Build ResNet50-FPN backbone (same as H)
+    Architecture:
+      ResNet50-FPN (base) → P3~P7 (5 FPN levels, 256ch each)
+      GlobalContextEncoder (input: 4× downsampled full image) → [B, global_channels, 32, 16]
+      Each FPN level: F.interpolate(global_feat) concat local → 1×1 fusion → fused features
+      RetinaNet detection head → boxes + scores (det_score only, no ROI reranking)
+    """
+    if not _TORCHVISION_DET_OK:
+        raise RuntimeError(
+            "torchvision detection module not available. "
+            "Requires torchvision >= 0.11 with detection support."
+        )
+
+    # Build ResNet50-FPN backbone
     try:
         base_backbone = resnet_fpn_backbone(
             backbone_name="resnet50",
@@ -808,6 +642,7 @@ def build_global_local_retinanet(
         )
         print("[Info] Loaded ImageNet weights into backbone.")
     except TypeError:
+        # Older torchvision API
         base_backbone = resnet_fpn_backbone(  # type: ignore[call-arg]
             backbone_name="resnet50",
             pretrained=True,
@@ -815,7 +650,7 @@ def build_global_local_retinanet(
         )
         print("[Info] Loaded ImageNet weights into backbone (legacy API).")
 
-    # 2. Override with RadImageNet if provided (same logic as H)
+    # Override with RadImageNet if provided
     if medical_backbone_path is not None:
         _idx_to_resnet = {
             "0": "conv1", "1": "bn1",
@@ -842,7 +677,7 @@ def build_global_local_retinanet(
         except Exception as exc:
             print(f"[Warning] Could not load RadImageNet backbone ({exc}). Keeping ImageNet weights.")
 
-    # 3. Adapt conv1 for grayscale-as-3channel
+    # Adapt conv1 for grayscale-as-3channel (average over input channels)
     try:
         with torch.no_grad():
             mean_w = base_backbone.body.conv1.weight.mean(dim=1, keepdim=True)
@@ -851,26 +686,24 @@ def build_global_local_retinanet(
     except AttributeError:
         print("[Warning] Could not adapt conv1.")
 
-    # 4. Build GlobalContextEncoder + GlobalAwareBackbone
-    fpn_channels: int = getattr(base_backbone, "out_channels", 256)
-    global_enc = GlobalContextEncoder(in_channels=3, out_channels=global_channels)
-    global_aware_backbone = GlobalAwareBackbone(
+    # Wrap backbone with GlobalAwareBackbone
+    global_encoder = GlobalContextEncoder(in_channels=3, out_channels=global_channels)
+    global_backbone = GlobalAwareBackbone(
         base_backbone=base_backbone,
-        global_encoder=global_enc,
-        num_fpn_levels=len(anchor_sizes),
-        fpn_channels=fpn_channels,
+        global_encoder=global_encoder,
+        num_fpn_levels=5,
+        fpn_channels=256,
         global_channels=global_channels,
     )
-    print(f"[Info] GlobalContextEncoder added ({global_channels}ch global features, identity init).")
+    print(f"[Info] GlobalAwareBackbone created (global_channels={global_channels}, identity init).")
 
-    # 5. Build RetinaNet with the wrapped backbone
     anchor_generator = AnchorGenerator(
         sizes=anchor_sizes,
         aspect_ratios=aspect_ratios,
     )
 
     model = RetinaNet(
-        backbone=global_aware_backbone,
+        backbone=global_backbone,
         num_classes=num_classes,
         anchor_generator=anchor_generator,
         min_size=min_size,
@@ -880,16 +713,12 @@ def build_global_local_retinanet(
         detections_per_img=detections_per_img,
     )
 
-    # 6. Override focal loss alpha
+    # Override focal loss alpha (torchvision default: 0.25)
     try:
         model.head.classification_head.focal_loss_alpha = float(focal_alpha)
         print(f"[Info] Focal loss alpha set to {focal_alpha}.")
     except AttributeError:
         print(f"[Warning] Could not set focal_loss_alpha on this torchvision version.")
-
-    # 7. Attach ROI refinement head as model attribute
-    model.roi_head = RoiRefinementHead(in_channels=fpn_channels, roi_size=7)  # type: ignore[attr-defined]
-    print(f"[Info] RoiRefinementHead attached (P3 stride=8, roi_size=7×7).")
 
     return model
 
@@ -905,20 +734,13 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     epochs: int,
-    roi_lambda: float = 0.5,
     accumulation_steps: int = 1,
     disable_tqdm: bool = False,
-    roi_rng: Optional[random.Random] = None,
-) -> Tuple[float, float]:
-    """Train one epoch. Returns (avg_det_loss, avg_roi_loss)."""
+) -> float:
     model.train()
-    running_det = 0.0
-    running_roi = 0.0
+    running_loss = 0.0
     count = 0
     optimizer.zero_grad(set_to_none=True)
-
-    if roi_rng is None:
-        roi_rng = random.Random(42 + epoch)
 
     pbar = tqdm(loader, desc=f"epoch {epoch + 1}/{epochs}", leave=False, disable=disable_tqdm)
     for i, (images, targets) in enumerate(pbar):
@@ -933,39 +755,25 @@ def train_one_epoch(
             )
         model.backbone.set_global_image(small_imgs)
 
-        # Detection forward (also sets backbone._cached_features)
         loss_dict = model(images, targets)
-        det_loss = sum(loss_dict.values())  # type: ignore[arg-type]
+        losses = sum(loss_dict.values())  # type: ignore[arg-type]
 
-        if not torch.isfinite(det_loss):
+        if not torch.isfinite(losses):
             optimizer.zero_grad(set_to_none=True)
             continue
 
-        # ROI refinement loss (uses cached FPN features from above forward)
-        roi_loss = compute_roi_loss(
-            cached_features=model.backbone._cached_features,  # type: ignore[attr-defined]
-            roi_head=model.roi_head,  # type: ignore[attr-defined]
-            targets=targets,
-            device=device,
-            rng=roi_rng,
-        )
-
-        total_loss = det_loss + roi_lambda * roi_loss
-
-        (total_loss / float(accumulation_steps)).backward()
+        (losses / float(accumulation_steps)).backward()
         if (i + 1) % accumulation_steps == 0 or (i + 1) == len(loader):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-        running_det += float(det_loss.item())
-        running_roi += float(roi_loss.item())
+        running_loss += float(losses.item())
         count += 1
         if not disable_tqdm:
-            pbar.set_postfix(det=f"{det_loss.item():.4f}", roi=f"{roi_loss.item():.4f}")  # type: ignore[union-attr]
+            pbar.set_postfix(loss=f"{losses.item():.4f}")  # type: ignore[union-attr]
 
-    n = max(count, 1)
-    return running_det / n, running_roi / n
+    return running_loss / max(count, 1)
 
 
 # =============================================================================
@@ -982,16 +790,14 @@ def validate(
     iou_threshold: float,
     collection_score_thresh: float = 0.01,
     nms_thresh: float = 0.3,
-    roi_score_thresh: float = 0.05,
     epoch: int = 0,
     epochs: int = 1,
     disable_tqdm: bool = False,
 ) -> Dict[str, float]:
-    """Validate with full-image inference + ROI refinement at multiple score thresholds."""
+    """Validate with full-image RetinaNet inference at multiple score thresholds."""
     model.eval()
-    p3_stride = 8
-    p3_spatial_scale = 1.0 / p3_stride
 
+    # Temporarily lower score_thresh to collect all candidate boxes
     orig_score_thresh = model.score_thresh
     orig_nms_thresh = model.nms_thresh
     orig_det_per_img = model.detections_per_img
@@ -1018,10 +824,10 @@ def validate(
             orig_h, orig_w = img.shape[:2]
             gt_boxes = sample.boxes.astype(np.float32).copy()
 
-            # AR-preserving pad (must match training)
+            # AR-preserving pad (must match training preprocessing)
             target_ar = input_h / max(input_w, 1)
             actual_ar = orig_h / max(orig_w, 1)
-            if actual_ar < target_ar - 1e-6:
+            if actual_ar < target_ar - 1e-6:  # pad height
                 padded_h = int(round(orig_w * target_ar))
                 pad_top = (padded_h - orig_h) // 2
                 pad_bottom = padded_h - orig_h - pad_top
@@ -1030,7 +836,7 @@ def validate(
                     gt_boxes[:, 1] += pad_top
                     gt_boxes[:, 3] += pad_top
                 orig_h = padded_h
-            elif actual_ar > target_ar + 1e-6:
+            elif actual_ar > target_ar + 1e-6:  # pad width
                 padded_w = int(round(orig_h / target_ar))
                 pad_left = (padded_w - orig_w) // 2
                 pad_right = padded_w - orig_w - pad_left
@@ -1040,6 +846,7 @@ def validate(
                     gt_boxes[:, 2] += pad_left
                 orig_w = padded_w
 
+            # Scale GT boxes to input_h×input_w coordinate space
             scale_x = input_w / max(orig_w, 1)
             scale_y = input_h / max(orig_h, 1)
             if gt_boxes.size > 0:
@@ -1059,35 +866,9 @@ def validate(
             )
             model.backbone.set_global_image(small_img)
 
-            # Stage-1 detection (also sets _cached_features)
-            outputs = model([img_t])
-            pred_boxes = outputs[0]["boxes"].cpu().numpy()    # (K, 4)
+            outputs = model([img_t])  # List[Dict] with 'boxes', 'scores', 'labels'
+            pred_boxes = outputs[0]["boxes"].cpu().numpy()    # (K, 4) xyxy
             pred_scores = outputs[0]["scores"].cpu().numpy()  # (K,)
-
-            # Stage-2 ROI refinement: re-score proposals above roi_score_thresh
-            if _ROI_ALIGN_OK and len(pred_boxes) > 0 and model.backbone._cached_features is not None:  # type: ignore[attr-defined]
-                roi_mask = pred_scores >= roi_score_thresh
-                if roi_mask.any():
-                    roi_boxes = pred_boxes[roi_mask]
-                    roi_det_scores = pred_scores[roi_mask]
-
-                    p3_feat = model.backbone._cached_features["0"]  # type: ignore[attr-defined]
-                    rois_t = torch.cat([
-                        torch.zeros(len(roi_boxes), 1, device=device),
-                        torch.tensor(roi_boxes, dtype=torch.float32, device=device),
-                    ], dim=1)  # [M, 5]
-
-                    roi_logits = model.roi_head(p3_feat, rois_t, p3_spatial_scale).squeeze(1)  # type: ignore[attr-defined]
-                    roi_probs = torch.sigmoid(roi_logits).cpu().numpy()
-
-                    # Geometric mean: combined = sqrt(det_score * roi_score)
-                    combined = np.sqrt(np.clip(roi_det_scores, 1e-6, 1.0) *
-                                       np.clip(roi_probs, 1e-6, 1.0))
-
-                    # Merge back: non-refined boxes keep original scores
-                    final_scores = pred_scores.copy()
-                    final_scores[roi_mask] = combined
-                    pred_scores = final_scores
 
             for thresh in score_thresholds:
                 mask = pred_scores >= thresh
@@ -1099,10 +880,12 @@ def validate(
 
             total_gt_boxes += int(gt_boxes.shape[0]) if gt_boxes.size > 0 else 0
 
+    # Restore model thresholds
     model.score_thresh = orig_score_thresh
     model.nms_thresh = orig_nms_thresh
     model.detections_per_img = orig_det_per_img
 
+    # Compute metrics
     f1_per_thresh: Dict[float, float] = {}
     recall_per_thresh: Dict[float, float] = {}
     fbeta2_per_thresh: Dict[float, float] = {}
@@ -1120,11 +903,11 @@ def validate(
 
     best_f1_thresh = max(f1_per_thresh, key=lambda t: f1_per_thresh[t])
     best_f1 = f1_per_thresh[best_f1_thresh]
-    best_recall_thresh: float = 0.3
+    best_recall_thresh: float = 0.3   # fixed reference threshold
     best_recall = recall_per_thresh[best_recall_thresh]
     best_fbeta2_thresh = max(fbeta2_per_thresh, key=lambda t: fbeta2_per_thresh[t])
     best_fbeta2 = fbeta2_per_thresh[best_fbeta2_thresh]
-    ref_fbeta2_thresh: float = 0.3
+    ref_fbeta2_thresh: float = 0.3    # fixed reference threshold for cross-epoch comparison
     ref_fbeta2 = fbeta2_per_thresh[ref_fbeta2_thresh]
 
     parts = []
@@ -1181,49 +964,78 @@ def save_checkpoint(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train GlobalLocal RetinaNet (Direction J, rec_50) for VinDr lesion detection."
+        description="Train a RetinaNet-ResNet50-FPN + GlobalContext detection model for VinDr lesion detection (Direction K)."
     )
     parser.add_argument("--csv-path", type=Path, default=None)
     parser.add_argument("--images-root", type=Path, default=None)
     parser.add_argument("--save-path", type=Path, default=None)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=4,
+                        help="Training batch size. Default 4 for full 1024×512 images on a 24GB GPU.")
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--encoder-lr-multiplier", type=float, default=0.1)
-    parser.add_argument("--input-h", type=int, default=1024)
-    parser.add_argument("--input-w", type=int, default=512)
-    parser.add_argument("--val-iou-threshold", type=float, default=0.1)
+    parser.add_argument("--encoder-lr-multiplier", type=float, default=0.1,
+                        help="LR multiplier for pretrained ResNet50 body. "
+                             "FPN + detection head + global_enc + fusion convs use full --lr.")
+    parser.add_argument("--input-h", type=int, default=1024,
+                        help="Resize height for model input.")
+    parser.add_argument("--input-w", type=int, default=512,
+                        help="Resize width for model input.")
+    parser.add_argument("--val-iou-threshold", type=float, default=0.1,
+                        help="IoU threshold for matching predicted boxes to GT during validation.")
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--min-delta", type=float, default=1e-4)
     parser.add_argument("--cliff-patience-ratio", type=float, default=0.0,
-                        help="Cliff-aware patience ratio. 0 = disabled. Recommended: 0.6.")
+                        help="Cliff-aware patience: if the monitored metric for an epoch falls "
+                             "below (best × cliff_patience_ratio), classify that epoch as a "
+                             "'cliff' and do NOT increment the patience counter. "
+                             "0 = disabled (default). Recommended: 0.6.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--accumulation-steps", type=int, default=1)
-    parser.add_argument("--augment", action="store_true")
+    parser.add_argument("--accumulation-steps", type=int, default=1,
+                        help="Gradient accumulation steps. Use 2–4 if GPU memory is tight.")
+    parser.add_argument("--augment", action="store_true",
+                        help="Enable training augmentation (hflip, brightness jitter).")
     parser.add_argument("--aug-hflip-prob", type=float, default=0.5)
     parser.add_argument("--aug-brightness-delta", type=float, default=0.2)
     parser.add_argument("--aug-contrast-range", type=float, nargs=2, default=[1.0, 1.0],
-                        metavar=("MIN", "MAX"))
-    parser.add_argument("--aug-scale-min", type=float, default=1.0)
-    parser.add_argument("--medical-backbone-path", type=Path, default=None)
-    parser.add_argument("--pos-oversample-factor", type=float, default=4.0)
-    parser.add_argument("--anchor-sizes", type=str, default="32,64,128,256,512")
-    parser.add_argument("--nms-thresh", type=float, default=0.3)
-    parser.add_argument("--score-thresh", type=float, default=0.05)
-    parser.add_argument("--focal-alpha", type=float, default=0.25)
+                        metavar=("MIN", "MAX"),
+                        help="Contrast jitter range (multiplicative factor around image mean). "
+                             "1.0 1.0 = disabled (default). Recommended: 0.8 1.2.")
+    parser.add_argument("--aug-scale-min", type=float, default=1.0,
+                        help="Minimum zoom-out scale for random scale augmentation. "
+                             "1.0 = disabled (default). Recommended: 0.85.")
+    parser.add_argument("--medical-backbone-path", type=Path, default=None,
+                        help="Path to RadImageNet ResNet50 checkpoint (.pt). "
+                             "If None, uses ImageNet weights only.")
+    parser.add_argument("--pos-oversample-factor", type=float, default=4.0,
+                        help="Weight multiplier for positive (lesion) images in the training sampler. "
+                             "4.0 → positive images sampled ~4× more than negatives.")
+    parser.add_argument("--anchor-sizes", type=str, default="32,64,128,256,512",
+                        help="Comma-separated anchor sizes (one per FPN level). "
+                             "Default: 32,64,128,256,512.")
+    parser.add_argument("--nms-thresh", type=float, default=0.3,
+                        help="NMS IoU threshold applied during inference. Default 0.3.")
+    parser.add_argument("--score-thresh", type=float, default=0.05,
+                        help="Minimum score threshold for reported detections. Default 0.05.")
+    parser.add_argument("--focal-alpha", type=float, default=0.25,
+                        help="Focal Loss foreground weight alpha. Default 0.25 (backward-compatible).")
     parser.add_argument("--monitor-metric", type=str, default="fbeta2",
-                        choices=["f1", "recall", "fbeta2", "fbeta2_ref"])
+                        choices=["f1", "recall", "fbeta2", "fbeta2_ref"],
+                        help="Metric to monitor for checkpoint saving and early stopping.")
     parser.add_argument("--hide-progress-bar", action="store_true")
-    parser.add_argument("--lesion-types", type=str, default=None)
-    parser.add_argument("--min-box-side", type=float, default=0.0)
-    parser.add_argument("--max-box-ar", type=float, default=float("inf"))
-    # J-specific arguments
-    parser.add_argument("--roi-lambda", type=float, default=0.5,
-                        help="Weight of ROI refinement loss in total loss. "
-                             "total = det_loss + roi_lambda * roi_loss. Default 0.5.")
+    parser.add_argument("--lesion-types", type=str, default=None,
+                        help="Comma-separated lesion type names to keep as positive GT boxes. "
+                             "Default: None (use all annotated boxes).")
+    parser.add_argument("--min-box-side", type=float, default=0.0,
+                        help="Minimum box shortest side in resized-image space (pixels). "
+                             "0 = no filter (default). Recommended: 24.0.")
+    parser.add_argument("--max-box-ar", type=float, default=float("inf"),
+                        help="Maximum box aspect ratio (max_side / min_side) to keep as positive GT. "
+                             "inf = no filter (default). Recommended: 3.0.")
     parser.add_argument("--global-channels", type=int, default=128,
-                        help="Output channels of GlobalContextEncoder. Default 128.")
+                        help="Output channels of GlobalContextEncoder. "
+                             "Determines the size of the global context vector injected into each "
+                             "FPN level. Default 128.")
     return parser.parse_args()
 
 
@@ -1238,23 +1050,22 @@ def main() -> None:
     repo_root = repo_root_from_file()
     csv_path = args.csv_path or repo_root / "data" / "raw" / "vindr_detection_folds.csv"
     images_root = args.images_root or repo_root / "data" / "processed" / "images_png"
-    save_path = args.save_path or repo_root / "models" / "bbox_resnet50.J.pth"
+    save_path = args.save_path or repo_root / "models" / "bbox_resnet50.K.pth"
 
     print(f"Start time:    {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Direction:     J (global-local dual branch) | rec_50")
     print(f"CSV: {csv_path}")
     print(f"Images root: {images_root}")
     print(f"Save path: {save_path}")
 
-    all_samples = load_samples(
-        csv_path, images_root, split_name="training",
-        lesion_types=[t.strip() for t in args.lesion_types.split(",")]
-        if args.lesion_types else None,
-        min_box_side=float(args.min_box_side),
-        max_box_ar=float(args.max_box_ar),
-        input_w=int(args.input_w),
-    )
+    all_samples = load_samples(csv_path, images_root, split_name="training",
+                               lesion_types=[t.strip() for t in args.lesion_types.split(",")]
+                               if args.lesion_types else None,
+                               min_box_side=float(args.min_box_side),
+                               max_box_ar=float(args.max_box_ar),
+                               input_w=int(args.input_w))
     print(f"Total samples: {len(all_samples)}")
+    if args.lesion_types:
+        print(f"Lesion type filter: {args.lesion_types}")
     if float(args.min_box_side) > 0.0 or float(args.max_box_ar) < float("inf"):
         print(f"Box detectability filter: min_side≥{args.min_box_side:.1f}px, max_AR≤{args.max_box_ar:.1f}")
 
@@ -1270,41 +1081,34 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     print(f"Input size: {args.input_h}×{args.input_w}")
+    print(f"Global channels: {args.global_channels}")
 
     encoder_lr = float(args.lr) * float(args.encoder_lr_multiplier)
     head_lr = float(args.lr)
     print(
-        f"Encoder LR: {encoder_lr:.2e} | Head/FPN LR: {head_lr:.2e} | "
+        f"Encoder LR (ResNet50 body): {encoder_lr:.2e} | "
+        f"Other LR (FPN/head/global_enc/fusion): {head_lr:.2e} | "
         f"Epochs: {args.epochs} | Batch: {args.batch_size} | Patience: {args.patience}"
     )
     print(f"Pos oversample factor: {args.pos_oversample_factor:.1f}")
     print(f"Monitor metric: {args.monitor_metric}")
-    aug_str = (
-        f"contrast=[{args.aug_contrast_range[0]:.2f}, {args.aug_contrast_range[1]:.2f}] "
-        f"scale_min={args.aug_scale_min} hflip_p={args.aug_hflip_prob}"
-        if args.augment else "disabled"
-    )
-    print(f"Augmentation: {aug_str}")
-    print(
-        f"Cliff patience ratio: {args.cliff_patience_ratio} | "
-        f"min_delta: {args.min_delta} | seed: {args.seed}"
-    )
+
+    # Parse anchor sizes
     anchor_size_vals = [int(s.strip()) for s in str(args.anchor_sizes).split(",")]
     anchor_sizes = tuple((s,) for s in anchor_size_vals)
     aspect_ratios = ((0.5, 1.0, 2.0),) * len(anchor_size_vals)
     print(f"Anchor sizes: {anchor_sizes} | Aspect ratios: (0.5, 1.0, 2.0) per level")
-    print(f"ROI lambda: {args.roi_lambda} | Global channels: {args.global_channels}")
 
     # Build model
-    model = build_global_local_retinanet(
+    model = build_global_retinanet(
         medical_backbone_path=(
             str(args.medical_backbone_path) if args.medical_backbone_path else None
         ),
         num_classes=1,
         anchor_sizes=anchor_sizes,
         aspect_ratios=aspect_ratios,
-        min_size=int(args.input_w),
-        max_size=int(args.input_h),
+        min_size=int(args.input_w),   # min dim = width
+        max_size=int(args.input_h),   # max dim = height
         trainable_backbone_layers=5,
         nms_thresh=float(args.nms_thresh),
         score_thresh=float(args.score_thresh),
@@ -1314,14 +1118,16 @@ def main() -> None:
     )
     model.to(device)
 
-    # Differential LR: ResNet50 body (pretrained) vs everything else (new/FPN)
-    body_param_ids = {id(p) for p in model.backbone.base.body.parameters()}
-    body_params = list(model.backbone.base.body.parameters())
-    other_params = [p for p in model.parameters() if id(p) not in body_param_ids]
+    # Differential LR:
+    #   - model.backbone.base.body (pretrained ResNet50 body): low LR
+    #   - everything else (FPN, detection head, global_enc, fusion convs): high LR
+    resnet_body_param_ids = {id(p) for p in model.backbone.base.body.parameters()}
+    resnet_body_params = list(model.backbone.base.body.parameters())
+    other_params = [p for p in model.parameters() if id(p) not in resnet_body_param_ids]
 
     optimizer = torch.optim.AdamW(
         [
-            {"params": body_params, "lr": encoder_lr},
+            {"params": resnet_body_params, "lr": encoder_lr},
             {"params": other_params, "lr": head_lr},
         ],
         weight_decay=1e-4,
@@ -1330,6 +1136,7 @@ def main() -> None:
         optimizer, T_max=int(args.epochs), eta_min=float(args.lr) * 0.01
     )
 
+    # Build training dataset (constant across epochs, augmentation is stochastic)
     train_dataset = DetectionDataset(
         samples=all_samples,
         indices=train_idx,
@@ -1344,10 +1151,14 @@ def main() -> None:
         seed=int(args.seed),
     )
 
+    # Weighted sampler: oversample positive images
     sampler_weights = make_oversampling_weights(
         all_samples, train_idx, pos_oversample_factor=float(args.pos_oversample_factor)
     )
+    # train_sampler and train_loader are rebuilt each epoch inside the loop
+    # (epoch-seeded generator) to break cross-epoch batch determinism.
 
+    # Training state
     best_metric = 0.0
     best_epoch = 0
     no_improve = 0
@@ -1374,11 +1185,14 @@ def main() -> None:
         except (OSError, ValueError):
             pass
 
+    # Training loop
     for epoch in range(int(args.epochs)):
         print(f"\n{'─' * 72}")
         print(f"Epoch {epoch + 1} / {args.epochs}")
         print(f"{'─' * 72}")
 
+        # Rebuild sampler with an epoch-specific seed so each epoch draws an
+        # independent batch sequence (still reproducible: same seed → same run).
         _epoch_gen = torch.Generator()
         _epoch_gen.manual_seed(int(args.seed) + epoch)
         train_sampler = WeightedRandomSampler(
@@ -1396,18 +1210,15 @@ def main() -> None:
             pin_memory=torch.cuda.is_available(),
         )
 
-        roi_rng = random.Random(int(args.seed) + epoch * 1000)
-        avg_det_loss, avg_roi_loss = train_one_epoch(
+        avg_loss = train_one_epoch(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
             device=device,
             epoch=epoch,
             epochs=int(args.epochs),
-            roi_lambda=float(args.roi_lambda),
             accumulation_steps=int(args.accumulation_steps),
             disable_tqdm=bool(args.hide_progress_bar),
-            roi_rng=roi_rng,
         )
         lr_scheduler.step()
 
@@ -1446,7 +1257,7 @@ def main() -> None:
         report_prec = report_tp / max(report_tp + report_fp, 1)
 
         print(
-            f"Epoch {epoch + 1}/{args.epochs} | det_loss={avg_det_loss:.4f} roi_loss={avg_roi_loss:.4f} | "
+            f"Epoch {epoch + 1}/{args.epochs} | loss={avg_loss:.4f} | "
             f"{monitor_metric_name}={cur_monitor:.4f} @ score={monitor_thresh:.1f} "
             f"(TP={report_tp} FP={report_fp} FN={report_fn} "
             f"Recall={report_recall:.3f} Prec={report_prec:.3f}) | "
@@ -1509,9 +1320,7 @@ if __name__ == "__main__":
     start = time.time()
     main()
     end = time.time()
-    elapsed = end - start
-    h = int(elapsed // 3600)
-    m = int((elapsed % 3600) // 60)
-    s = int(elapsed % 60)
-    print(f"End time:    {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    h, rem = divmod(int(end - start), 3600)
+    m, s = divmod(rem, 60)
+    print(f"End time:    {datetime.datetime.fromtimestamp(end).strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Elapsed:     {h:02d}:{m:02d}:{s:02d}")

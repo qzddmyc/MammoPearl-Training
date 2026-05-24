@@ -547,6 +547,38 @@ Prompts for improvement:
          - 对 stage-1 分数 > 0.05 的候选框做 ROI Align → roi_head
          - 最终分数 = √(det_score × roi_score)（几何均值融合）
     目标：突破基线 H 的 F2@0.3=0.2788
+    实验结果（2026-05-26，30 epoch，接近早停 ep33）：
+      best F2@0.3=0.1571，ep23；
+      F2@0.1 峰值 0.4499（ep12），之后持续下滑。
+      TP@0.3 序列极端震荡：0,0,4,13,0,5,21,15,16,9,18,32,25,26,16,16,26,8,24,20,17,18,33...
+    失败根因分析：
+      1. ROI 头训练信号极不稳定：每批正例 ROI 极少（仅 GT box），BCE loss 噪声大，
+         导致 roi_score 逐 epoch 大幅抖动，直接传导至 F2@0.3 的极端震荡。
+      2. 几何均值公式过激进：√(det×roi) 在 roi_score 较低时把大量候选分数压至 0.3 以下，
+         导致 TP@0.3 大量流失（基线 H 平均 TP@0.3≈40，K 仅 22）。
+      3. GlobalContextEncoder 效果无法独立评估：无法判断失败是"全局融合本身无效"
+         还是"ROI 头破坏了 det_score"。
+    结论：方向 J 判定失败；下一步方向 K 单独验证全局融合（去掉 ROI 头）。
+
+51. 方向 K：GlobalContextEncoder + RetinaNet（无 ROI 重打分）（rec_51）
+    【此文件未作修改，完整实现在分支文件 bbox-train-K.py 中】
+    切换动机：方向 J 失败后，无法确定失败根因是"全局融合无效"还是"ROI 头破坏了 det_score"。
+    方向 K 通过移除 ROI 重打分头，单独验证全局上下文融合的效果。
+    单变量对比：K vs H（唯一变量：有无 GlobalContextEncoder + GlobalAwareBackbone 融合）。
+    关键实现：
+      1. GlobalContextEncoder（与方向 J 相同）
+         - 将原始图像下采样至 1/4（256×128），经 3 个 stride-2 BN-ReLU conv 块
+           得到 128 通道全局特征图 @ 32×16
+      2. GlobalAwareBackbone（与方向 J 相同，但无 _cached_features 使用方）
+         - 包装 ResNet50-FPN，每个 FPN 层注入全局上下文（concat + 1×1 fusion）
+         - identity init（全局路径初始贡献为零），保留预训练特征
+      3. 完全移除 RoiRefinementHead 及所有 ROI loss 辅助函数
+      4. 推理分数直接使用 det_score（同方向 H），无任何后处理重打分
+      5. 差分 LR：model.backbone.base.body（低 LR）vs FPN/头/global_enc/fusion（高 LR）
+    实验解读预期：
+      K > H（F2@0.3 ≥ 0.28） → 全局融合有效，J 的失败主因是 ROI 头
+      K ≈ H                    → 全局融合本身无效，需要换思路
+    目标：K F2@0.3 ≥ 0.2788（不低于 H 基线）
 
 """
 
