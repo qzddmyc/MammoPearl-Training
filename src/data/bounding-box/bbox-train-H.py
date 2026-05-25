@@ -5,7 +5,7 @@ r"""
 
 安装依赖（torchvision 已满足，无额外依赖）。
 
-运行命令 upd_7（focal-gamma=1.0 + 1024×1024，rec_52）：
+运行命令 upd_8（focal-gamma=0.5 + ref-score=0.2，rec_53）：
 
 python src/data/bounding-box/bbox-train-H.py \
     --epochs 50 \
@@ -16,13 +16,14 @@ python src/data/bounding-box/bbox-train-H.py \
     --input-w 1024 \
     --patience 10 \
     --monitor-metric fbeta2_ref \
+    --ref-score 0.2 \
     --medical-backbone-path models/raw/ResNet50.pt \
     --save-path models/bbox_resnet50.H.pth \
     --augment \
     --aug-contrast-range 0.8 1.2 \
     --aug-scale-min 0.85 \
     --focal-alpha 0.25 \
-    --focal-gamma 1.0 \
+    --focal-gamma 0.5 \
     --min-box-side 24.0 \
     --max-box-ar 3.0 \
     --cliff-patience-ratio 0.6 \
@@ -177,6 +178,8 @@ upd_6（断崖感知 patience，解决 upd_5 提前停止问题）
     TP 存活率（@0.1→@0.3）从 H 的 45% 降至 K 的 30%，分数分布更压缩。
 ──────────────────────────────────────────────────────────────────────────────
 
+* 以下序号标记为52，从upd_7开始计算。
+
 upd_7（focal gamma 降低 + 1024×1024 分辨率，rec_52）
   根因分析（H ep9 vs K ep4 对比 + box 尺寸统计）：
     H 的两个独立失败模式：
@@ -197,7 +200,58 @@ upd_7（focal gamma 降低 + 1024×1024 分辨率，rec_52）
   [fix] load_samples box 过滤 scale 计算：增加 input_h 参数，根据 AR 关系
         正确判断 pad-height vs pad-width，避免 1024×1024 下 scale 计算错误
         （旧逻辑在 1024×1024 下 scale=1024/912=1.123 而实际为 1024/1520=0.674）。
-  [note] 运行命令见文件顶部 upd_7 命令示例（--batch-size 2, --focal-gamma 1.0）。
+  [note] 顶部命令已更新为 upd_8；upd_7 命令见下方 [cmd]。
+  [cmd]
+    python src/data/bounding-box/bbox-train-H.py \
+        --epochs 50 \
+        --batch-size 4 \
+        --lr 1e-4 \
+        --encoder-lr-multiplier 0.1 \
+        --input-h 1024 \
+        --input-w 1024 \
+        --patience 10 \
+        --monitor-metric fbeta2_ref \
+        --medical-backbone-path models/raw/ResNet50.pt \
+        --save-path models/bbox_resnet50.H.pth \
+        --augment \
+        --aug-contrast-range 0.8 1.2 \
+        --aug-scale-min 0.85 \
+        --focal-alpha 0.25 \
+        --focal-gamma 1.0 \
+        --min-box-side 24.0 \
+        --max-box-ar 3.0 \
+        --cliff-patience-ratio 0.6 \
+        --hide-progress-bar
+  [result] rec_52（2026-05-25，RTX 4090，7h51m，ep25 early stop）：
+    best ep=12 | F2@0.3=0.2836 | @0.3: TP=62 FP=15 Rec=0.244 Prec=0.805
+    @0.7: TP=21 FP=0 | @0.9: TP=6 FP=0 | Val GT=254（scale fix 多保留 3 个）
+    目标 ≥0.35 未达到。分析：
+      · γ=1.0 改善高置信区间：@0.7 TP ~2→21（+~10×），@0.9: 0→6，校准成功
+      · F2@0.3 仅 +1.7%（0.2788→0.2836），根因是 score floor 未解决：
+        ep12 共 113 个 @0.1 TP，其中 51 个（45%）卡在 [0.1, 0.3) 区间，
+        γ=1.0 不足以把这段推过 0.3 阈值
+      · 独立问题：141 个 GT box 完全未被 @0.1 检出（检测天花板），
+        与 score calibration 无关，需架构或分辨率升级
+      · 推理阈值改为 0.2 时 ep12 checkpoint 可得 F2@0.2=0.3225（+13.7%,
+        TP=73 FP=43），无需重训练
+    后续（rec_53 拟选方向）：
+      γ=0.5 进一步降低 score floor；新增 --ref-score 参数使 ref_fbeta2_thresh
+      可配置（当前硬编码第 927 行），用 F2@0.2 作为训练监控指标。
+
+upd_8（--ref-score 参数 + γ=0.5，rec_53）
+  根因分析（rec_52 + 项目架构对齐）：
+    rec_52 用 F2@0.3 作为 checkpoint 标准，而 README 明确 Stage 1 目标是
+    "高召回率，漏检不可接受，误报可容忍"。F2@0.3（Prec=80%）与此不符：
+      · ep12 @0.3 发送给 Stage 2：62 TP + 15 FP = 77 个候选框（漏掉 192 个 GT）
+      · ep12 @0.1 发送给 Stage 2：113 TP + 157 FP = 270 个候选框（Stage 2 过滤 FP）
+    ep4 @0.1 TP=132 对 Stage 2 比 ep12 @0.3 TP=62 更有价值，但被 F2@0.3 排除。
+    同时 rec_52 的 score floor 问题（51 个 TP 卡在 [0.1, 0.3)）说明 γ=1.0 不够低。
+  [new] --ref-score R：F2 和 Recall 监控指标使用的参考分数阈值（原 ref_fbeta2_thresh
+        和 best_recall_thresh 硬编码 0.3）。必须为 0.1/0.2/0.3/0.5/0.7/0.9 之一。
+        默认 0.3（向后兼容）。rec_53 推荐 0.2，与 Stage 1 高召回部署阈值对齐。
+  [change] --focal-gamma 0.5：γ 从 1.0 进一步降低，对 p_t=0.2 的梯度加权相比
+        γ=1.0 多 2.2 倍，预期将更多 stuck TP（[0.1, 0.3) 区间）推过 0.2 阈值。
+  [note] 运行命令见文件顶部 upd_8 命令示例。
 """
 
 from __future__ import annotations
@@ -814,6 +868,7 @@ def validate(
     epoch: int = 0,
     epochs: int = 1,
     disable_tqdm: bool = False,
+    ref_score: float = 0.3,
 ) -> Dict[str, float]:
     """Validate with full-image RetinaNet inference at multiple score thresholds."""
     model.eval()
@@ -827,6 +882,8 @@ def validate(
     model.detections_per_img = 1000
 
     score_thresholds = [0.1, 0.2, 0.3, 0.5, 0.7, 0.9]
+    if ref_score not in score_thresholds:
+        raise ValueError(f"--ref-score {ref_score} must be one of {score_thresholds}")
     stats: Dict[float, Dict[str, int]] = {
         t: {"tp": 0, "fp": 0, "fn": 0} for t in score_thresholds
     }
@@ -918,11 +975,11 @@ def validate(
 
     best_f1_thresh = max(f1_per_thresh, key=lambda t: f1_per_thresh[t])
     best_f1 = f1_per_thresh[best_f1_thresh]
-    best_recall_thresh: float = 0.3   # fixed reference threshold
+    best_recall_thresh: float = ref_score
     best_recall = recall_per_thresh[best_recall_thresh]
     best_fbeta2_thresh = max(fbeta2_per_thresh, key=lambda t: fbeta2_per_thresh[t])
     best_fbeta2 = fbeta2_per_thresh[best_fbeta2_thresh]
-    ref_fbeta2_thresh: float = 0.3    # fixed reference threshold for cross-epoch comparison
+    ref_fbeta2_thresh: float = ref_score
     ref_fbeta2 = fbeta2_per_thresh[ref_fbeta2_thresh]
 
     parts = []
@@ -1045,10 +1102,15 @@ def parse_args() -> argparse.Namespace:
                              "gradient suppression of medium-confidence predictions, shifting "
                              "score distribution upward. torchvision default 2.0; try 1.0 to "
                              "address score calibration bottleneck. Default 2.0 (backward-compatible).")
+    parser.add_argument("--ref-score", type=float, default=0.3,
+                        help="Reference score threshold used by fbeta2_ref and recall monitor "
+                             "metrics. Must be one of the evaluated thresholds: "
+                             "0.1, 0.2, 0.3, 0.5, 0.7, 0.9. Default 0.3 (backward-compatible). "
+                             "Use 0.2 to align with Stage-1 high-recall deployment.")
     parser.add_argument("--monitor-metric", type=str, default="fbeta2",
                         choices=["f1", "recall", "fbeta2", "fbeta2_ref"],
                         help="Metric to monitor for checkpoint saving and early stopping. "
-                             "fbeta2_ref uses F2 at the fixed reference threshold (0.3), "
+                             "fbeta2_ref uses F2 at the fixed reference threshold (--ref-score), "
                              "which is more stable than fbeta2 (best across all thresholds).")
     parser.add_argument("--hide-progress-bar", action="store_true")
     parser.add_argument("--lesion-types", type=str, default=None,
@@ -1262,6 +1324,7 @@ def main() -> None:
             epoch=epoch,
             epochs=int(args.epochs),
             disable_tqdm=bool(args.hide_progress_bar),
+            ref_score=float(args.ref_score),
         )
 
         if monitor_metric_name == "recall":
