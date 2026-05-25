@@ -579,6 +579,28 @@ Prompts for improvement:
       K > H（F2@0.3 ≥ 0.28） → 全局融合有效，J 的失败主因是 ROI 头
       K ≈ H                    → 全局融合本身无效，需要换思路
     目标：K F2@0.3 ≥ 0.2788（不低于 H 基线）
+    实验结果（rec_51）：best F2@0.3=0.2213 @ ep4，early stop ep16，Val GT=251。
+    失败根因：GlobalEncoder 随机初始化，backward 梯度扰动 FPN fusion conv；
+    TP 存活率（@0.1→@0.3）从 H 的 45% 降至 30%，分数分布更压缩。
+    结论：K ≈ H → 全局融合本身无效，方向 K 失败。
+
+52. 方向 H upd_7：focal gamma 降低（γ=1.0）+ 1024×1024 分辨率（rec_52）
+    【实现在 bbox-train-H.py upd_7，非本文件】
+    切换动机：对 H 的两个失败模式进行精准干预：
+      1. 低置信（H ep9：73 个 @0.1 TP 打分落在 [0.1, 0.3) 区间，存活率 45%）：
+         focal_loss_gamma=2.0 过度压制中等置信预测。降低到 γ=1.0，直接针对
+         score 校准瓶颈。理论天花板：若全部 @0.1 TP 均能 ≥0.3，F2@0.3 ≈ 0.58。
+      2. 检测缺失（118 FN @0.1）：1024×512 下 31% box 在 P3 仅 4~8px（min_side
+         P5=35px, P50=86px）。升至 1024×1024（scale 0.5614→0.6737），小病灶
+         feature map 表示增大 20%。
+    关键变更（相比 H upd_6）：
+      - --focal-gamma 1.0（新增参数，默认 2.0 向后兼容）
+      - --input-h 1024 --input-w 1024（方形输入）
+      - --batch-size 4（4090 24GB 可装下，与 upd_6 有效 batch 相同）
+      - [fix] load_samples scale 计算考虑 AR-preserving padding 方向，
+              避免 1024×1024 下 min_box_side 阈值计算错误
+    单变量原则：相比 H upd_6，同时改了 γ 和分辨率（组合实验）。
+    目标：F2@0.3 ≥ 0.35
 
 """
 

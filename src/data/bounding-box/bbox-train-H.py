@@ -1,9 +1,11 @@
 r"""
 方向 H：RetinaNet 全图直接检测（torchvision）
 
+硬件环境：NVIDIA GeForce RTX 4090，24 GB VRAM
+
 安装依赖（torchvision 已满足，无额外依赖）。
 
-运行命令（Git Bash）：
+运行命令 upd_7（focal-gamma=1.0 + 1024×1024，rec_52）：
 
 python src/data/bounding-box/bbox-train-H.py \
     --epochs 50 \
@@ -11,7 +13,7 @@ python src/data/bounding-box/bbox-train-H.py \
     --lr 1e-4 \
     --encoder-lr-multiplier 0.1 \
     --input-h 1024 \
-    --input-w 512 \
+    --input-w 1024 \
     --patience 10 \
     --monitor-metric fbeta2_ref \
     --medical-backbone-path models/raw/ResNet50.pt \
@@ -20,6 +22,7 @@ python src/data/bounding-box/bbox-train-H.py \
     --aug-contrast-range 0.8 1.2 \
     --aug-scale-min 0.85 \
     --focal-alpha 0.25 \
+    --focal-gamma 1.0 \
     --min-box-side 24.0 \
     --max-box-ar 3.0 \
     --cliff-patience-ratio 0.6 \
@@ -139,6 +142,62 @@ upd_6（断崖感知 patience，解决 upd_5 提前停止问题）
         普通徘徊在 60–96%，R=0.6 可以准确分离两类。
   [note] 断崖 epoch 的模型权重仍正常更新（不回滚），依赖下一个 epoch
         的采样顺序自然恢复。仅 patience 计数被跳过，不影响优化本身。
+  [result] rec_48_upd_6（rec_to48_upd_6.txt）：best F2@0.3=0.2788 @ ep9，
+        early stop ep23，Val GT=251。
+  [cmd]
+    python src/data/bounding-box/bbox-train-H.py \
+        --epochs 50 \
+        --batch-size 4 \
+        --lr 1e-4 \
+        --encoder-lr-multiplier 0.1 \
+        --input-h 1024 \
+        --input-w 512 \
+        --patience 10 \
+        --monitor-metric fbeta2_ref \
+        --medical-backbone-path models/raw/ResNet50.pt \
+        --save-path models/bbox_resnet50.H.pth \
+        --augment \
+        --aug-contrast-range 0.8 1.2 \
+        --aug-scale-min 0.85 \
+        --focal-alpha 0.25 \
+        --min-box-side 24.0 \
+        --max-box-ar 3.0 \
+        --cliff-patience-ratio 0.6 \
+        --hide-progress-bar
+
+─── 期间实验（均未超越基线 H upd_6）───────────────────────────────────────
+  方向 I（rec_49）：帧间差分特征融合，best F2@0.3=0.1901 @ ep3。
+    根因：像素级差分图引入结构性噪声，特征图中人工边界破坏 FPN 梯度。
+  方向 J（rec_50）：在 RetinaNet 上追加 ROI 分类头（两阶段联合训练），
+    best F2@0.3=0.1571 @ ep23。
+    根因：ROI 头训练信号不稳定（几何均值评分过激进 + 联合训练梯度相互干扰）。
+  方向 K（rec_51）：GlobalContextEncoder 注入 FPN 各层（无 ROI 头），
+    best F2@0.3=0.2213 @ ep4，early stop ep16，Val GT=251。
+    根因：GlobalEncoder 随机初始化，backward 梯度扰动 FPN fusion conv 权重；
+    TP 存活率（@0.1→@0.3）从 H 的 45% 降至 K 的 30%，分数分布更压缩。
+──────────────────────────────────────────────────────────────────────────────
+
+upd_7（focal gamma 降低 + 1024×1024 分辨率，rec_52）
+  根因分析（H ep9 vs K ep4 对比 + box 尺寸统计）：
+    H 的两个独立失败模式：
+      1. 低置信（73 个 TP 打分落在 [0.1, 0.3) 区间，存活率仅 45%）：
+         根因是 focal_loss_gamma=2.0 过度压制中等置信预测，公式
+         (1-p_t)^2.0 对 p_t∈[0.2,0.5] 的梯度衰减是 γ=1.0 时的 ~2.5 倍，
+         导致 score 分布向 0 压缩。理论上限：若 133 个 @0.1 TP 均能 ≥0.3，
+         F2@0.3 可达 ≈0.58（vs 当前 0.2788）。
+      2. 检测缺失（118 FN @0.1）：当前 1024×512（scale=0.5614）下，
+         31% 的 GT box 在 P3 上仅 4~8px（box 统计：min_side P5=35px,
+         P50=86px），升至 1024×1024（scale=0.6737）box 增大 20%，
+         改善小病灶特征表示。
+  [new] --focal-gamma G：Focal Loss 指数 γ（torchvision 默认 2.0）。降低 γ
+        减少对中等置信预测的梯度抑制，使 score 分布上移。默认 2.0（向后兼容）。
+        rec_52 推荐 1.0。
+  [new] 1024×1024 输入（--input-h 1024 --input-w 1024）：FPN 面积翻倍，
+        但 4090 24GB 仍可使用 batch=4（激活值约 12~16GB，总显存约 14~17GB）。
+  [fix] load_samples box 过滤 scale 计算：增加 input_h 参数，根据 AR 关系
+        正确判断 pad-height vs pad-width，避免 1024×1024 下 scale 计算错误
+        （旧逻辑在 1024×1024 下 scale=1024/912=1.123 而实际为 1024/1520=0.674）。
+  [note] 运行命令见文件顶部 upd_7 命令示例（--batch-size 2, --focal-gamma 1.0）。
 """
 
 from __future__ import annotations
@@ -324,6 +383,7 @@ def load_samples(
     min_box_side: float = 0.0,
     max_box_ar: float = float("inf"),
     input_w: int = 512,
+    input_h: int = 1024,
 ) -> List[Sample]:
     df = pd.read_csv(csv_path, low_memory=False)
     df = df[df["split"].astype(str).str.lower() == split_name.lower()].copy()
@@ -353,7 +413,15 @@ def load_samples(
         # Detectability filter (in resized-image-space coordinates)
         if boxes.size > 0 and (min_box_side > 0.0 or max_box_ar < float("inf")):
             orig_w_val = float(first["width"]) if pd.notna(first["width"]) else float(input_w)
-            scale = float(input_w) / max(orig_w_val, 1.0)
+            orig_h_val = float(first["height"]) if pd.notna(first["height"]) else float(input_h)
+            # AR-preserving scale: determine which dimension is padded, use the
+            # non-padded dimension to compute scale (matches Dataset preprocessing).
+            target_ar = float(input_h) / max(float(input_w), 1.0)
+            actual_ar = orig_h_val / max(orig_w_val, 1.0)
+            if actual_ar <= target_ar:  # pad height → x-scale = input_w / orig_w
+                scale = float(input_w) / max(orig_w_val, 1.0)
+            else:                       # pad width  → y-scale = input_h / orig_h
+                scale = float(input_h) / max(orig_h_val, 1.0)
             bw = (boxes[:, 2] - boxes[:, 0]) * scale
             bh = (boxes[:, 3] - boxes[:, 1]) * scale
             min_sides = np.minimum(bw, bh)
@@ -587,6 +655,7 @@ def build_retinanet(
     score_thresh: float = 0.05,
     detections_per_img: int = 500,
     focal_alpha: float = 0.25,
+    focal_gamma: float = 2.0,
 ) -> "RetinaNet":
     """Build a RetinaNet with ResNet50-FPN backbone.
 
@@ -668,12 +737,17 @@ def build_retinanet(
         detections_per_img=detections_per_img,
     )
 
-    # Override focal loss alpha (torchvision default: 0.25)
+    # Override focal loss alpha and gamma (torchvision defaults: alpha=0.25, gamma=2.0)
     try:
         model.head.classification_head.focal_loss_alpha = float(focal_alpha)
         print(f"[Info] Focal loss alpha set to {focal_alpha}.")
     except AttributeError:
         print(f"[Warning] Could not set focal_loss_alpha on this torchvision version.")
+    try:
+        model.head.classification_head.focal_loss_gamma = float(focal_gamma)
+        print(f"[Info] Focal loss gamma set to {focal_gamma}.")
+    except AttributeError:
+        print(f"[Warning] Could not set focal_loss_gamma on this torchvision version.")
 
     return model
 
@@ -966,6 +1040,11 @@ def parse_args() -> argparse.Namespace:
                              "positive-sample gradient weight, shifting score distribution "
                              "upward. torchvision default 0.25; try 0.4 to reduce "
                              "confidence suppression. Default 0.25 (backward-compatible).")
+    parser.add_argument("--focal-gamma", type=float, default=2.0,
+                        help="Focal Loss modulating exponent gamma. Lower values reduce "
+                             "gradient suppression of medium-confidence predictions, shifting "
+                             "score distribution upward. torchvision default 2.0; try 1.0 to "
+                             "address score calibration bottleneck. Default 2.0 (backward-compatible).")
     parser.add_argument("--monitor-metric", type=str, default="fbeta2",
                         choices=["f1", "recall", "fbeta2", "fbeta2_ref"],
                         help="Metric to monitor for checkpoint saving and early stopping. "
@@ -1013,7 +1092,8 @@ def main() -> None:
                                if args.lesion_types else None,
                                min_box_side=float(args.min_box_side),
                                max_box_ar=float(args.max_box_ar),
-                               input_w=int(args.input_w))
+                               input_w=int(args.input_w),
+                               input_h=int(args.input_h))
     print(f"Total samples: {len(all_samples)}")
     if args.lesion_types:
         print(f"Lesion type filter: {args.lesion_types}")
@@ -1056,13 +1136,14 @@ def main() -> None:
         num_classes=1,
         anchor_sizes=anchor_sizes,
         aspect_ratios=aspect_ratios,
-        min_size=int(args.input_w),   # min dim = width
-        max_size=int(args.input_h),   # max dim = height
+        min_size=min(int(args.input_w), int(args.input_h)),
+        max_size=max(int(args.input_w), int(args.input_h)),
         trainable_backbone_layers=5,
         nms_thresh=float(args.nms_thresh),
         score_thresh=float(args.score_thresh),
         detections_per_img=500,
         focal_alpha=float(args.focal_alpha),
+        focal_gamma=float(args.focal_gamma),
     )
     model.to(device)
 
@@ -1238,6 +1319,7 @@ def main() -> None:
                     "anchor_sizes": str(args.anchor_sizes),
                     "nms_thresh": float(args.nms_thresh),
                     "focal_alpha": float(args.focal_alpha),
+                    "focal_gamma": float(args.focal_gamma),
                 },
             )
             print(f"  [Checkpoint] Epoch {epoch + 1} | Saved ({monitor_metric_name}={best_metric:.4f}, patience reset) -> {save_path}")
