@@ -28,7 +28,6 @@ python src/data/bounding-box/bbox-train.py \
     --max-box-ar 3.0 \
     --cliff-patience-ratio 0.6 \
     --amp \
-    --compile \
     --hide-progress-bar
 
 
@@ -360,26 +359,6 @@ upd_6（断崖感知 patience，解决 upd_5 提前停止问题）
         的采样顺序自然恢复。仅 patience 计数被跳过，不影响优化本身。
   [result] rec_48_upd_6（rec_to48_upd_6.txt）：best F2@0.3=0.2788 @ ep9，
         early stop ep23，Val GT=251。
-  [cmd]
-    python src/data/bounding-box/bbox-train.py \
-        --epochs 50 \
-        --batch-size 4 \
-        --lr 1e-4 \
-        --encoder-lr-multiplier 0.1 \
-        --input-h 1024 \
-        --input-w 512 \
-        --patience 10 \
-        --monitor-metric fbeta2_ref \
-        --medical-backbone-path models/raw/ResNet50.pt \
-        --save-path models/bbox_resnet50.pth \
-        --augment \
-        --aug-contrast-range 0.8 1.2 \
-        --aug-scale-min 0.85 \
-        --focal-alpha 0.25 \
-        --min-box-side 24.0 \
-        --max-box-ar 3.0 \
-        --cliff-patience-ratio 0.6 \
-        --hide-progress-bar
 
 ─── 期间实验（均未超越基线 H upd_6）───────────────────────────────────────
   方向 I（rec_49）：帧间差分特征融合，best F2@0.3=0.1901 @ ep3。
@@ -415,28 +394,6 @@ upd_7（focal gamma 降低 + 1024×1024 分辨率，rec_52）
   [fix] load_samples box 过滤 scale 计算：增加 input_h 参数，根据 AR 关系
         正确判断 pad-height vs pad-width，避免 1024×1024 下 scale 计算错误
         （旧逻辑在 1024×1024 下 scale=1024/912=1.123 而实际为 1024/1520=0.674）。
-  [note] 顶部命令已更新为 upd_8；upd_7 命令见下方 [cmd]。
-  [cmd]
-    python src/data/bounding-box/bbox-train.py \
-        --epochs 50 \
-        --batch-size 4 \
-        --lr 1e-4 \
-        --encoder-lr-multiplier 0.1 \
-        --input-h 1024 \
-        --input-w 1024 \
-        --patience 10 \
-        --monitor-metric fbeta2_ref \
-        --medical-backbone-path models/raw/ResNet50.pt \
-        --save-path models/bbox_resnet50.pth \
-        --augment \
-        --aug-contrast-range 0.8 1.2 \
-        --aug-scale-min 0.85 \
-        --focal-alpha 0.25 \
-        --focal-gamma 1.0 \
-        --min-box-side 24.0 \
-        --max-box-ar 3.0 \
-        --cliff-patience-ratio 0.6 \
-        --hide-progress-bar
   [result] rec_52（2026-05-25，RTX 4090，7h51m，ep25 early stop）：
     best ep=12 | F2@0.3=0.2836 | @0.3: TP=62 FP=15 Rec=0.244 Prec=0.805
     @0.7: TP=21 FP=0 | @0.9: TP=6 FP=0 | Val GT=254（scale fix 多保留 3 个）
@@ -471,7 +428,7 @@ upd_8（--ref-score 参数 + γ=0.5）
   [new] --compile：torch.compile() 模型图编译（需 PyTorch ≥ 2.0），
         固定尺寸输入下每 epoch 减少约 15~25%。第一个 epoch 多花约 1 min 编译。
         默认关闭（向后兼容）。rec_52_upd_8 当前训练中。
-  [note] 运行命令见文件顶部 upd_8 命令示例。
+
 """
 
 from __future__ import annotations
@@ -1166,8 +1123,8 @@ def validate(
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
                 outputs = model([img_t])  # List[Dict] with 'boxes', 'scores', 'labels'
-            pred_boxes = outputs[0]["boxes"].cpu().numpy()    # (K, 4) xyxy
-            pred_scores = outputs[0]["scores"].cpu().numpy()  # (K,)
+            pred_boxes = outputs[0]["boxes"].cpu().float().numpy()    # (K, 4) xyxy
+            pred_scores = outputs[0]["scores"].cpu().float().numpy()  # (K,)
 
             for thresh in score_thresholds:
                 mask = pred_scores >= thresh
