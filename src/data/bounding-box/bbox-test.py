@@ -1,48 +1,60 @@
 # use:
-# python src/data/bounding-box/bbox-test.py --ckpt-path models/bbox_resnet50.pth --recall-sweep-detections-per-img 300
-# or:
-# python src/data/bounding-box/bbox-test.py --ckpt-path models/bbox_resnet50.pth --recall-sweep-detections-per-img 300 --save-predictions tmp/bbox_test_matches.csv
+# python src/data/bounding-box/bbox-test.py \
+#     --ckpt-path models/bbox_resnet50.pth \
+#     --min-box-side 24.0 --max-box-ar 3.0
+#
+# * input_h/input_w, anchor_sizes, nms_thresh, focal_alpha/gamma are auto-read
+#   from checkpoint meta.  Pass --min-box-side / --max-box-ar to match training.
 
-# * anchor sizes, internal box filtering, and matching thresholds will be auto-read from checkpoint meta when available.
+"""Evaluate a bbox detector (Direction H) on the VinDr test split.
 
+Mirrors the validation logic of bbox-train.py exactly:
+  - same AR-preserving pad + resize preprocessing
+  - same GT box loading (lesion type filter + min-box-side / max-box-ar)
+  - same model architecture (RetinaNet + ResNet50-FPN)
+  - F2 (beta=2) at [0.1, 0.2, 0.3, 0.5, 0.7, 0.9] thresholds
 
-"""Evaluate a bbox detector on the VinDr test split.
-
-This script loads `models/bbox_resnet50.pth`, runs inference on the test split, and
-compares predicted boxes with ground-truth boxes using IoU-based matching.
-It reports:
-
-- box precision / recall / F1 at the configured matching thresholds
-- image-level presence accuracy
-- mean IoU over matched boxes
-- mean absolute coordinate error (pixels)
+Config is read from the checkpoint meta written by bbox-train.py.
+Parameters not stored in meta (lesion types, box size filters) must be
+supplied on the command line with values matching the training run.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset
-from torchvision.models.detection.rpn import AnchorGenerator
+
 try:
-    from torchvision.models.detection import retinanet_resnet50_fpn_v2, RetinaNet_ResNet50_FPN_V2_Weights
-except Exception:  # pragma: no cover
-    retinanet_resnet50_fpn_v2 = None  # type: ignore
-    RetinaNet_ResNet50_FPN_V2_Weights = None
-from torchvision.ops import box_iou
+    from torchvision.models.detection import RetinaNet
+    from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
+    from torchvision.models.detection.anchor_utils import AnchorGenerator
+    _TORCHVISION_DET_OK = True
+except ImportError:
+    _TORCHVISION_DET_OK = False
+
+try:
+    from torchvision.models import ResNet50_Weights as _ResNet50Weights
+    _IMAGENET_WEIGHTS: Any = _ResNet50Weights.DEFAULT
+except ImportError:
+    _IMAGENET_WEIGHTS = True  # pretrained=True fallback
 
 try:
     from tqdm import tqdm
 except Exception:  # pragma: no cover
     tqdm = lambda x, **kwargs: x  # type: ignore[assignment]
 
+
+# =============================================================================
+# Utilities
+# =============================================================================
 
 def repo_root_from_file() -> Path:
     return Path(__file__).resolve().parents[3]
@@ -57,8 +69,8 @@ def read_image_unicode(path: Path) -> np.ndarray:
 
 
 def normalize_image(img: np.ndarray) -> np.ndarray:
+    """Convert image to RGB uint8 with CLAHE for grayscale."""
     if img.ndim == 2:
-        # Apply CLAHE to match bbox-train.py preprocessing (rec_37+).
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         img = clahe.apply(img)
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
@@ -82,582 +94,394 @@ def image_to_tensor(img: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 
 
-def detect_breast_region(
-    img: np.ndarray,
-    margin_ratio: float = 0.05,
-) -> Tuple[int, int, int, int]:
-    """Detect the breast-region crop on a processed mammogram."""
-    if img.ndim == 3:
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    else:
-        gray = img
 
-    if gray.dtype != np.uint8:
-        gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-    h, w = gray.shape[:2]
-    if h <= 0 or w <= 0:
-        return 0, 0, 0, 0
-    if np.max(gray) <= 0:
-        return 0, 0, w, h
-
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        ys, xs = np.where(gray > 0)
-        if xs.size == 0 or ys.size == 0:
-            return 0, 0, w, h
-        x1 = int(xs.min())
-        y1 = int(ys.min())
-        x2 = int(xs.max()) + 1
-        y2 = int(ys.max()) + 1
-    else:
-        contour = max(contours, key=cv2.contourArea)
-        x, y, cw, ch = cv2.boundingRect(contour)
-        x1 = int(x)
-        y1 = int(y)
-        x2 = int(x + cw)
-        y2 = int(y + ch)
-
-    margin_ratio = max(0.0, float(margin_ratio))
-    margin_x = int(round((x2 - x1) * margin_ratio))
-    margin_y = int(round((y2 - y1) * margin_ratio))
-    x1 = max(0, x1 - margin_x)
-    y1 = max(0, y1 - margin_y)
-    x2 = min(w, x2 + margin_x)
-    y2 = min(h, y2 + margin_y)
-
-    if x2 <= x1 or y2 <= y1:
-        return 0, 0, w, h
-    return x1, y1, x2, y2
+# =============================================================================
+# Data structures
+# =============================================================================
 
 
-def crop_image_and_boxes(
-    img: np.ndarray,
-    boxes: np.ndarray,
-    crop_box: Tuple[int, int, int, int],
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Crop image and remap boxes into crop-local coordinates."""
-    x1, y1, x2, y2 = crop_box
-    cropped_img = img[y1:y2, x1:x2]
-    if boxes.size == 0:
-        return cropped_img, np.zeros((0, 4), dtype=np.float32)
-
-    cropped_boxes = boxes.astype(np.float32).copy()
-    cropped_boxes[:, [0, 2]] -= float(x1)
-    cropped_boxes[:, [1, 3]] -= float(y1)
-
-    crop_h, crop_w = cropped_img.shape[:2]
-    cropped_boxes[:, 0] = np.clip(cropped_boxes[:, 0], 0, max(crop_w - 1, 0))
-    cropped_boxes[:, 2] = np.clip(cropped_boxes[:, 2], 0, max(crop_w - 1, 0))
-    cropped_boxes[:, 1] = np.clip(cropped_boxes[:, 1], 0, max(crop_h - 1, 0))
-    cropped_boxes[:, 3] = np.clip(cropped_boxes[:, 3], 0, max(crop_h - 1, 0))
-
-    keep = (cropped_boxes[:, 2] > cropped_boxes[:, 0] + 1) & (cropped_boxes[:, 3] > cropped_boxes[:, 1] + 1)
-    return cropped_img, cropped_boxes[keep]
+@dataclass
+class Sample:
+    patient_id: str
+    image_id: str
+    image_path: "Path"
+    boxes: "np.ndarray"
+    orig_size: tuple  # (H, W)
 
 
-# 不再需要缩放
-# def scale_boxes_to_image(boxes: np.ndarray, orig_size: Tuple[float, float], new_size: Tuple[int, int]) -> np.ndarray:
-#     orig_h, orig_w = orig_size
-#     new_h, new_w = new_size
-#     if orig_h <= 0 or orig_w <= 0:
-#         return boxes
+# =============================================================================
+# GT loading — mirrors load_samples() in bbox-train.py exactly
+# =============================================================================
 
-#     scale_x = float(new_w) / float(orig_w)
-#     scale_y = float(new_h) / float(orig_h)
-#     scaled = boxes.copy().astype(np.float32)
-#     scaled[:, [0, 2]] *= scale_x
-#     scaled[:, [1, 3]] *= scale_y
-#     scaled[:, 0::2] = np.clip(scaled[:, 0::2], 0, max(new_w - 1, 0))
-#     scaled[:, 1::2] = np.clip(scaled[:, 1::2], 0, max(new_h - 1, 0))
-#     keep = (scaled[:, 2] > scaled[:, 0]) & (scaled[:, 3] > scaled[:, 1])
-#     return scaled[keep]
+def load_samples(
+    csv_path, images_root, split_name,
+    lesion_types=None, min_box_side=0.0, max_box_ar=float("inf"),
+    input_w=1024, input_h=1024,
+):
+    df = pd.read_csv(csv_path, low_memory=False)
+    df = df[df["split"].astype(str).str.lower() == split_name.lower()].copy()
+    if df.empty:
+        raise ValueError(f"No rows found for split={split_name!r} in {csv_path}")
 
+    samples = []
+    for (patient_id, _series_id, image_id), group in df.groupby(
+        ["patient_id", "series_id", "image_id"], sort=True
+    ):
+        first = group.iloc[0]
+        if lesion_types:
+            type_mask = pd.Series(False, index=group.index)
+            for lt in lesion_types:
+                if lt in group.columns:
+                    type_mask = type_mask | (group[lt] == 1)
+            group = group[type_mask]
+        valid = group[["xmin", "ymin", "xmax", "ymax"]].dropna()
+        boxes = valid.to_numpy(dtype=np.float32) if not valid.empty else np.zeros((0, 4), dtype=np.float32)
+        image_path = images_root / str(patient_id) / f"{image_id}"
 
-class VinDrBboxDataset(Dataset):
-    def __init__(
-        self,
-        csv_path: Path,
-        images_root: Path,
-        split_name: str,
-        crop_breast_region: bool = False,
-        breast_crop_margin: float = 0.05,
-    ) -> None:
-        self.csv_path = csv_path
-        self.images_root = images_root
-        self.split_name = split_name
-        self.crop_breast_region = crop_breast_region
-        self.breast_crop_margin = breast_crop_margin
-
-        df = pd.read_csv(csv_path, low_memory=False)
-        df = df[df["split"].astype(str).str.lower() == split_name.lower()].copy()
-
-        if df.empty:
-            raise ValueError(f"No rows found for split={split_name!r} in {csv_path}")
-
-        self.samples: List[Dict[str, Any]] = []
-        grouped = df.groupby(["patient_id", "series_id", "image_id"], sort=True)
-
-        for (patient_id, _series_id, image_id), group in grouped:
-            valid = group[["xmin", "ymin", "xmax", "ymax"]].dropna()
-            if valid.empty:
-                boxes = np.zeros((0, 4), dtype=np.float32)
+        if boxes.size > 0 and (min_box_side > 0.0 or max_box_ar < float("inf")):
+            orig_w_val = float(first["width"]) if pd.notna(first["width"]) else float(input_w)
+            orig_h_val = float(first["height"]) if pd.notna(first["height"]) else float(input_h)
+            target_ar = float(input_h) / max(float(input_w), 1.0)
+            actual_ar = orig_h_val / max(orig_w_val, 1.0)
+            if actual_ar <= target_ar:
+                scale = float(input_w) / max(orig_w_val, 1.0)
             else:
-                boxes = valid.to_numpy(dtype=np.float32)
+                scale = float(input_h) / max(orig_h_val, 1.0)
+            bw = (boxes[:, 2] - boxes[:, 0]) * scale
+            bh = (boxes[:, 3] - boxes[:, 1]) * scale
+            min_sides = np.minimum(bw, bh)
+            ars = np.maximum(bw, bh) / np.maximum(min_sides, 1e-3)
+            keep = np.ones(len(boxes), dtype=bool)
+            if min_box_side > 0.0:
+                keep &= (min_sides >= min_box_side)
+            if max_box_ar < float("inf"):
+                keep &= (ars <= max_box_ar)
+            boxes = boxes[keep]
 
-            first = group.iloc[0]
-            orig_h = float(first["height"]) if pd.notna(first["height"]) else 0.0
-            orig_w = float(first["width"]) if pd.notna(first["width"]) else 0.0
+        orig_h = float(first["height"]) if pd.notna(first["height"]) else 0.0
+        orig_w = float(first["width"]) if pd.notna(first["width"]) else 0.0
+        samples.append(Sample(
+            patient_id=str(patient_id),
+            image_id=str(image_id),
+            image_path=image_path,
+            boxes=boxes,
+            orig_size=(orig_h, orig_w),
+        ))
+    return samples
 
-            image_path = images_root / str(patient_id) / f"{image_id}"
-            self.samples.append(
-                {
-                    "patient_id": str(patient_id),
-                    "image_id": str(image_id),
-                    "image_path": image_path,
-                    "boxes": boxes,
-                    "orig_size": (orig_h, orig_w),
-                }
-            )
 
-        if not self.samples:
-            raise ValueError(f"No samples could be built from {csv_path}")
+# =============================================================================
+# Dataset — AR-preserving pad + resize, no augmentation
+# =============================================================================
 
-    def __len__(self) -> int:
+class TestDataset(Dataset):
+    def __init__(self, samples, input_h, input_w):
+        self.samples = samples
+        self.input_h = input_h
+        self.input_w = input_w
+
+    def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, index: int):
-        sample = self.samples[index]
-        if not sample["image_path"].exists():
-            raise FileNotFoundError(f"Missing image: {sample['image_path']}")
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        try:
+            img = normalize_image(read_image_unicode(sample.image_path))
+        except FileNotFoundError:
+            img_t = torch.zeros(3, self.input_h, self.input_w, dtype=torch.float32)
+            target = {"boxes": torch.zeros((0, 4), dtype=torch.float32),
+                      "labels": torch.zeros(0, dtype=torch.int64)}
+            return img_t, target
 
-        img = normalize_image(read_image_unicode(sample["image_path"]))
-        h, w = img.shape[:2]
-
-        boxes = sample["boxes"].astype(np.float32)
+        orig_h, orig_w = img.shape[:2]
+        boxes = sample.boxes.copy()
 
         if boxes.size > 0:
-            boxes[:, 0] = np.clip(boxes[:, 0], 0, w - 1)
-            boxes[:, 2] = np.clip(boxes[:, 2], 0, w - 1)
-            boxes[:, 1] = np.clip(boxes[:, 1], 0, h - 1)
-            boxes[:, 3] = np.clip(boxes[:, 3], 0, h - 1)
+            boxes[:, 0] = np.clip(boxes[:, 0], 0, orig_w - 1)
+            boxes[:, 2] = np.clip(boxes[:, 2], 0, orig_w - 1)
+            boxes[:, 1] = np.clip(boxes[:, 1], 0, orig_h - 1)
+            boxes[:, 3] = np.clip(boxes[:, 3], 0, orig_h - 1)
             keep = (boxes[:, 2] > boxes[:, 0] + 1) & (boxes[:, 3] > boxes[:, 1] + 1)
             boxes = boxes[keep]
 
-        crop_box = (0, 0, w, h)
-        if self.crop_breast_region:
-            crop_box = detect_breast_region(img, margin_ratio=self.breast_crop_margin)
-            img, boxes = crop_image_and_boxes(img, boxes, crop_box)
+        # AR-preserving pad (matches DetectionDataset in bbox-train.py)
+        target_ar = self.input_h / max(self.input_w, 1)
+        actual_ar = orig_h / max(orig_w, 1)
+        if actual_ar < target_ar - 1e-6:
+            padded_h = int(round(orig_w * target_ar))
+            pad_top = (padded_h - orig_h) // 2
+            pad_bottom = padded_h - orig_h - pad_top
+            img = np.pad(img, ((pad_top, pad_bottom), (0, 0), (0, 0)), constant_values=0)
+            if boxes.size > 0:
+                boxes[:, 1] += pad_top
+                boxes[:, 3] += pad_top
+            orig_h = padded_h
+        elif actual_ar > target_ar + 1e-6:
+            padded_w = int(round(orig_h / target_ar))
+            pad_left = (padded_w - orig_w) // 2
+            pad_right = padded_w - orig_w - pad_left
+            img = np.pad(img, ((0, 0), (pad_left, pad_right), (0, 0)), constant_values=0)
+            if boxes.size > 0:
+                boxes[:, 0] += pad_left
+                boxes[:, 2] += pad_left
+            orig_w = padded_w
 
-        target = {
-            "boxes": torch.from_numpy(boxes) if boxes.size > 0 else torch.zeros((0, 4), dtype=torch.float32),
-            "image_id": torch.tensor([index], dtype=torch.int64),
-        }
-        sample = dict(sample)
-        sample["crop_box"] = crop_box
-        sample["original_image_size"] = (h, w)
-        return image_to_tensor(img), target, sample
+        img_resized = cv2.resize(img, (self.input_w, self.input_h), interpolation=cv2.INTER_LINEAR)
+
+        scale_x = self.input_w / max(orig_w, 1)
+        scale_y = self.input_h / max(orig_h, 1)
+        if boxes.size > 0:
+            boxes[:, 0] *= scale_x
+            boxes[:, 2] *= scale_x
+            boxes[:, 1] *= scale_y
+            boxes[:, 3] *= scale_y
+            keep = (boxes[:, 2] > boxes[:, 0] + 1) & (boxes[:, 3] > boxes[:, 1] + 1)
+            boxes = boxes[keep]
+
+        boxes_t = torch.from_numpy(boxes.astype(np.float32)) if boxes.size > 0 else torch.zeros((0, 4), dtype=torch.float32)
+        labels_t = torch.ones(len(boxes_t), dtype=torch.int64)
+        return image_to_tensor(img_resized), {"boxes": boxes_t, "labels": labels_t}
 
 
 def collate_fn(batch):
-    images, targets, samples = zip(*batch)
-    return list(images), list(targets), list(samples)
+    images, targets = zip(*batch)
+    return list(images), list(targets)
 
 
-def build_model(
-    num_classes: int = 2,
-    anchor_sizes: List[Tuple[int, ...]] | None = None,
-    score_thresh: float = 0.05,
-    detections_per_img: int = 100,
-    nms_thresh: float = 0.5,
-    focal_loss_alpha: float = 0.75,
-    focal_loss_gamma: float = 2.0,
-    input_min_size: int = 800,
-) -> torch.nn.Module:
-    """Build RetinaNet (retinanet_resnet50_fpn_v2) for inference.
+# =============================================================================
+# Model — mirrors build_retinanet() in bbox-train.py (no backbone loading)
+# =============================================================================
 
-    Mirrors the architecture of bbox-train.py build_model() at inference time.
-    Does NOT load COCO/RadImageNet weights — weights are loaded from the
-    saved checkpoint afterwards.
-
-    Args:
-        anchor_sizes: Per-FPN-level size tuples.  ``None`` keeps torchvision
-            default (9 anchors/location), required for rec_38+ checkpoints.
-        score_thresh: Model-internal score threshold for post-NMS filtering.
-        detections_per_img: Max detections kept per image after NMS.
-        nms_thresh: IoU threshold for NMS.
-        focal_loss_alpha: Positive class weight in Focal Loss.
-        focal_loss_gamma: Focusing exponent in Focal Loss.
-        input_min_size: Shorter side of the image after RetinaNet resize.
-            Must match the value used during training (stored in checkpoint meta).
-
-    When anchor_sizes is None the torchvision default AnchorGenerator is kept
-    (9 anchors/location: 3 scales x 3 aspects), which matches rec_38 checkpoints.
-    Custom anchor_sizes are applied via model.anchor_generator assignment *after*
-    construction to avoid the 'got multiple values' TypeError in newer torchvision.
-    """
-    if retinanet_resnet50_fpn_v2 is None:
-        raise RuntimeError(
-            "torchvision RetinaNet v2 not found. Please upgrade torchvision (>=0.14)."
-        )
-
-    # Build with torchvision defaults first (no anchor_generator kwarg — newer
-    # torchvision already passes it positionally inside the factory function).
+def build_retinanet(
+    num_classes=1,
+    anchor_sizes=((32,), (64,), (128,), (256,), (512,)),
+    aspect_ratios=((0.5, 1.0, 2.0),) * 5,
+    min_size=1024, max_size=1024,
+    nms_thresh=0.3, score_thresh=0.05, detections_per_img=500,
+    focal_alpha=0.25, focal_gamma=2.0,
+):
+    if not _TORCHVISION_DET_OK:
+        raise RuntimeError("torchvision detection module not available.")
     try:
-        model = retinanet_resnet50_fpn_v2(
-            weights=None,
-            num_classes=num_classes,
-            score_thresh=score_thresh,
-            nms_thresh=nms_thresh,
-            detections_per_img=detections_per_img,
-        )
+        backbone = resnet_fpn_backbone(backbone_name="resnet50", weights=_IMAGENET_WEIGHTS, trainable_layers=5)
     except TypeError:
-        model = retinanet_resnet50_fpn_v2(weights=None, num_classes=num_classes)
-        try:
-            model.score_thresh = score_thresh
-            model.nms_thresh = nms_thresh
-            model.detections_per_img = detections_per_img
-        except AttributeError:
-            pass
+        backbone = resnet_fpn_backbone(backbone_name="resnet50", pretrained=True, trainable_layers=5)  # type: ignore
 
-    # Replace anchor_generator only when custom sizes are explicitly requested.
-    # When anchor_sizes is None the torchvision default (9 anchors/location) is
-    # kept — required for rec_38 checkpoints whose head was built that way.
-    if anchor_sizes is not None:
-        aspect_ratios = tuple([(0.5, 1.0, 2.0) for _ in range(len(anchor_sizes))])
-        anchor_generator = AnchorGenerator(sizes=anchor_sizes, aspect_ratios=aspect_ratios)
-        model.anchor_generator = anchor_generator
-
-    if input_min_size != 800:
-        model.transform.min_size = (input_min_size,)
-        model.transform.max_size = int(input_min_size * 1333 / 800)
-
+    anchor_gen = AnchorGenerator(sizes=anchor_sizes, aspect_ratios=aspect_ratios)
+    model = RetinaNet(
+        backbone=backbone, num_classes=num_classes,
+        anchor_generator=anchor_gen,
+        min_size=min_size, max_size=max_size,
+        nms_thresh=nms_thresh, score_thresh=score_thresh,
+        detections_per_img=detections_per_img,
+    )
     try:
-        model.head.classification_head.focal_loss_alpha = focal_loss_alpha
-        model.head.classification_head.focal_loss_gamma = focal_loss_gamma
+        model.head.classification_head.focal_loss_alpha = float(focal_alpha)
+        model.head.classification_head.focal_loss_gamma = float(focal_gamma)
     except AttributeError:
         pass
-
     return model
 
 
-def load_checkpoint(model: torch.nn.Module, ckpt_path: Path, device: torch.device) -> Dict[str, Any]:
-    ckpt = torch.load(ckpt_path, map_location=device)
-    state_dict = ckpt.get("model_state_dict", ckpt)
-    model.load_state_dict(state_dict)
-    meta = ckpt.get("meta", {})
-    return meta
+# =============================================================================
+# Evaluation
+# =============================================================================
 
-
-def greedy_match(pred_boxes: torch.Tensor, pred_scores: torch.Tensor, gt_boxes: torch.Tensor, iou_threshold: float):
-    """Greedy one-to-one matching of predictions to GT boxes."""
-    if gt_boxes.numel() == 0 or pred_boxes.numel() == 0:
-        return []
-
-    order = torch.argsort(pred_scores, descending=True)
+def _greedy_match_tp(pred_boxes, pred_scores, gt_boxes, iou_thresh):
+    """Return TP count via greedy score-sorted matching."""
+    if len(pred_boxes) == 0 or len(gt_boxes) == 0:
+        return 0
+    order = np.argsort(pred_scores)[::-1]
     used_gt = set()
-    matches = []
+    tp = 0
+    for pi in order:
+        pb = pred_boxes[pi]
+        best_iou = 0.0
+        best_gi = -1
+        for gi in range(len(gt_boxes)):
+            if gi in used_gt:
+                continue
+            gb = gt_boxes[gi]
+            ix1, iy1 = max(pb[0], gb[0]), max(pb[1], gb[1])
+            ix2, iy2 = min(pb[2], gb[2]), min(pb[3], gb[3])
+            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+            if inter <= 0:
+                continue
+            union = (pb[2]-pb[0])*(pb[3]-pb[1]) + (gb[2]-gb[0])*(gb[3]-gb[1]) - inter
+            iou = inter / max(union, 1e-6)
+            if iou > best_iou:
+                best_iou = iou
+                best_gi = gi
+        if best_iou >= iou_thresh and best_gi >= 0:
+            used_gt.add(best_gi)
+            tp += 1
+    return tp
 
-    ious = box_iou(pred_boxes, gt_boxes)  # [P, G]
-    for pred_idx in order.tolist():
-        iou_row = ious[pred_idx]
-        best_iou, best_gt = torch.max(iou_row, dim=0)
-        gt_idx = int(best_gt.item())
-        if float(best_iou.item()) >= iou_threshold and gt_idx not in used_gt:
-            used_gt.add(gt_idx)
-            matches.append((pred_idx, gt_idx, float(best_iou.item())))
-    return matches
+
+def _fbeta(tp, fp, fn, beta=2.0):
+    b2 = beta * beta
+    denom = (1 + b2) * tp + b2 * fn + fp
+    return (1 + b2) * tp / denom if denom > 0 else 0.0
 
 
-def evaluate(
-    model: torch.nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    score_threshold: float,
-    iou_threshold: float,
-    # save_debug_dir: Optional[Path] = None,
-    # max_debug_images: int = 20,
-    # nms_iou: float = 0.5,
-):
+def evaluate(model, loader, device, score_thresholds, iou_threshold):
+    """Evaluate at multiple score thresholds in one inference pass."""
     model.eval()
 
-    total_gt = 0
-    total_pred = 0
-    total_tp = 0
-    total_fp = 0
-    total_fn = 0
-    image_correct = 0
-    image_total = 0
-
-    matched_ious: List[float] = []
-    coord_abs_errors: List[np.ndarray] = []
-    rows: List[Dict[str, Any]] = []
-
-    # saved_debug = 0
-    # printed_debug = 0
-    # if save_debug_dir is not None:
-    #     save_debug_dir.mkdir(parents=True, exist_ok=True)
-
+    # Collect per-image (pred_boxes, pred_scores, gt_boxes) tuples
+    per_image = []
     with torch.no_grad():
-        for images, targets, samples in tqdm(loader, desc="evaluating", leave=False):
+        for images, targets in tqdm(loader, desc="test", leave=False):
             images = [img.to(device) for img in images]
             outputs = model(images)
+            for output, target in zip(outputs, targets):
+                per_image.append({
+                    "pred_boxes": output["boxes"].detach().cpu().numpy(),
+                    "pred_scores": output["scores"].detach().cpu().numpy(),
+                    "gt_boxes": target["boxes"].cpu().numpy(),
+                })
 
-            for output, target, sample in zip(outputs, targets, samples):
-                pred_boxes = output["boxes"].detach().cpu()
-                pred_scores = output["scores"].detach().cpu()
-                keep = pred_scores >= score_threshold
-                pred_boxes = pred_boxes[keep]
-                pred_scores = pred_scores[keep]
+    total_gt = sum(len(r["gt_boxes"]) for r in per_image)
+    thresh_stats = {}
+    for thresh in score_thresholds:
+        total_tp = total_fp = 0
+        for r in per_image:
+            keep = r["pred_scores"] >= thresh
+            pb = r["pred_boxes"][keep]
+            ps = r["pred_scores"][keep]
+            n_gt = len(r["gt_boxes"])
+            if len(pb) == 0:
+                continue
+            if n_gt == 0:
+                total_fp += len(pb)
+                continue
+            tp = _greedy_match_tp(pb, ps, r["gt_boxes"], iou_threshold)
+            total_fp += len(pb) - tp
+            total_tp += tp
+        fn = total_gt - total_tp
+        thresh_stats[thresh] = {"tp": total_tp, "fp": total_fp, "fn": fn}
 
-                gt_boxes = target["boxes"].detach().cpu()
+    return {"gt_boxes": total_gt, "total_images": len(per_image), "thresholds": thresh_stats}
 
-                matches = greedy_match(pred_boxes, pred_scores, gt_boxes, iou_threshold=iou_threshold)
-                tp = len(matches)
-                fp = int(pred_boxes.shape[0] - tp)
-                fn = int(gt_boxes.shape[0] - tp)
 
-                total_gt += int(gt_boxes.shape[0])
-                total_pred += int(pred_boxes.shape[0])
-                total_tp += tp
-                total_fp += fp
-                total_fn += fn
+# =============================================================================
+# Argument parsing + main
+# =============================================================================
 
-                matched_ious.extend([m[2] for m in matches])
-
-                for pred_idx, gt_idx, iou_val in matches:
-                    pred = pred_boxes[pred_idx].numpy()
-                    gt = gt_boxes[gt_idx].numpy()
-                    coord_abs_errors.append(np.abs(pred - gt))
-                    crop_x1, crop_y1, crop_x2, crop_y2 = sample.get("crop_box", (0, 0, 0, 0))
-                    pred_orig = pred.copy()
-                    gt_orig = gt.copy()
-                    pred_orig[[0, 2]] += float(crop_x1)
-                    pred_orig[[1, 3]] += float(crop_y1)
-                    gt_orig[[0, 2]] += float(crop_x1)
-                    gt_orig[[1, 3]] += float(crop_y1)
-                    rows.append(
-                        {
-                            "patient_id": sample["patient_id"],
-                            "image_id": sample["image_id"],
-                            "crop_xmin": float(crop_x1),
-                            "crop_ymin": float(crop_y1),
-                            "crop_xmax": float(crop_x2),
-                            "crop_ymax": float(crop_y2),
-                            "pred_xmin": float(pred_orig[0]),
-                            "pred_ymin": float(pred_orig[1]),
-                            "pred_xmax": float(pred_orig[2]),
-                            "pred_ymax": float(pred_orig[3]),
-                            "gt_xmin": float(gt_orig[0]),
-                            "gt_ymin": float(gt_orig[1]),
-                            "gt_xmax": float(gt_orig[2]),
-                            "gt_ymax": float(gt_orig[3]),
-                            "iou": float(iou_val),
-                            "score": float(pred_scores[pred_idx].item()),
-                        }
-                    )
-
-                gt_present = gt_boxes.shape[0] > 0
-                pred_present = pred_boxes.shape[0] > 0
-                image_correct += int(gt_present == pred_present)
-                image_total += 1
-
-    precision = total_tp / total_pred if total_pred else 0.0
-    recall = total_tp / total_gt if total_gt else 0.0
-    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
-    image_accuracy = image_correct / image_total if image_total else 0.0
-    mean_iou = float(np.mean(matched_ious)) if matched_ious else 0.0
-    mean_abs_error = (
-        np.mean(np.stack(coord_abs_errors), axis=0).tolist() if coord_abs_errors else [0.0, 0.0, 0.0, 0.0]
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Evaluate Direction-H RetinaNet on VinDr test split."
     )
-
-    metrics = {
-        "images": image_total,
-        "gt_boxes": total_gt,
-        "pred_boxes": total_pred,
-        "tp": total_tp,
-        "fp": total_fp,
-        "fn": total_fn,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "image_accuracy": image_accuracy,
-        "mean_iou": mean_iou,
-        "mean_abs_error": {
-            "xmin": float(mean_abs_error[0]),
-            "ymin": float(mean_abs_error[1]),
-            "xmax": float(mean_abs_error[2]),
-            "ymax": float(mean_abs_error[3]),
-        },
-    }
-    return metrics, rows
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate bbox detector on VinDr test split.")
     parser.add_argument("--csv-path", type=Path, default=None)
     parser.add_argument("--images-root", type=Path, default=None)
-    parser.add_argument("--ckpt-path", type=Path, default=None)
-    parser.add_argument("--score-threshold", type=float, default=None, help="Score threshold used for matching; auto-read from checkpoint val_score_threshold if omitted")
-    parser.add_argument("--iou-threshold", type=float, default=None, help="IoU threshold used for matching; auto-read from checkpoint val_iou_threshold if omitted")
+    parser.add_argument("--ckpt-path", type=Path, default=None,
+                        help="Checkpoint path (default: models/bbox_resnet50.pth).")
+    parser.add_argument("--iou-threshold", type=float, default=0.1,
+                        help="IoU threshold for GT matching (default: 0.1).")
+    parser.add_argument("--score-thresholds", type=str, default="0.1,0.2,0.3,0.5,0.7,0.9",
+                        help="Comma-separated score thresholds.")
+    parser.add_argument("--min-box-side", type=float, default=0.0,
+                        help="Min GT box shortest side in resized space (must match training).")
+    parser.add_argument("--max-box-ar", type=float, default=float("inf"),
+                        help="Max GT box aspect ratio (must match training).")
+    parser.add_argument("--lesion-types", type=str, default=None,
+                        help="Comma-separated lesion type filter (must match training).")
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--save-predictions", type=Path, default=None, help="Optional CSV path for matched predictions.")
-    parser.add_argument("--anchor-sizes", type=str, default=None, help="Comma-separated anchor sizes; auto-read from checkpoint meta if omitted")
-    parser.add_argument("--box-score-thresh", type=float, default=None, help="Score threshold for model-internal box filtering; auto-read from checkpoint meta if omitted")
-    parser.add_argument("--box-detections-per-img", type=int, default=None, help="Max detections per image at inference time; auto-read from checkpoint meta if omitted")
-    parser.add_argument("--recall-sweep-detections-per-img", type=int, default=None, help="Temporarily override model.detections_per_img for the recall sweep (score_threshold=0.1/0.3/0.5). Use a larger value (e.g. 300) to prevent TP statistics from being truncated at the training inference cap. When omitted, uses the same value as --box-detections-per-img (backward-compatible).")
-    parser.add_argument("--force-breast-crop", action="store_true", help="Force breast-region cropping even if checkpoint meta does not request it")
-    parser.add_argument("--disable-breast-crop", action="store_true", help="Disable breast-region cropping even if checkpoint meta requests it")
-    parser.add_argument("--breast-crop-margin", type=float, default=None, help="Override breast crop padding ratio; defaults to checkpoint meta when available")
-    # parser.add_argument(
-    #     "--save-debug-dir",
-    #     type=Path,
-    #     default=None,
-    #     help="Optional folder to save debug images with GT (green) and predictions (red).",
-    # )
-    # parser.add_argument("--max-debug-images", type=int, default=50, help="Maximum number of debug images to save.")
-    # parser.add_argument(
-    #     "--nms-iou",
-    #     type=float,
-    #     default=0.5,
-    #     help="IoU threshold for per-image NMS applied before matching (set <=0 to disable).",
-    # )
+    parser.add_argument("--save-predictions", type=Path, default=None)
     return parser.parse_args()
 
 
-def main() -> None:
+def main():
     args = parse_args()
     root = repo_root_from_file()
     csv_path = args.csv_path or (root / "data" / "raw" / "vindr_detection_folds.csv")
     images_root = args.images_root or (root / "data" / "processed" / "images_png")
     ckpt_path = args.ckpt_path or (root / "models" / "bbox_resnet50.pth")
 
-    if not csv_path.exists():
-        raise FileNotFoundError(f"CSV not found: {csv_path}")
-    if not images_root.exists():
-        raise FileNotFoundError(f"Images root not found: {images_root}")
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    for p, label in [(csv_path, "CSV"), (images_root, "images root"), (ckpt_path, "checkpoint")]:
+        if not p.exists():
+            raise FileNotFoundError(f"{label} not found: {p}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[Info] device={device}")
 
-    # Load checkpoint to inspect meta first (may contain anchor sizes / config)
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     meta = ckpt.get("meta", {})
+    print(f"[Info] Checkpoint meta: {meta}")
 
-    # "16,32,64,128,256" is the sentinel value written to meta when the training
-    # command used the default anchor arg, which maps to anchor_sizes=None (i.e.
-    # the torchvision default 9 anchors/location).  Reproduce the same logic here
-    # so test model head dimensions match the checkpoint.
-    _DEFAULT_ANCHOR_SENTINEL = "16,32,64,128,256"
-    anchor_str = args.anchor_sizes if args.anchor_sizes is not None else meta.get("anchor_sizes", _DEFAULT_ANCHOR_SENTINEL)
-    if str(anchor_str).strip() == _DEFAULT_ANCHOR_SENTINEL:
-        anchor_sizes = None  # torchvision default 9 anchors/location
-        print(f"[Info] anchor_sizes='{anchor_str}' → torchvision default (9 anchors/location)")
-    else:
-        anchor_sizes = tuple((int(s.strip()),) for s in str(anchor_str).split(",") if s.strip())
-        print(f"[Info] Using custom anchor sizes: {anchor_str}")
+    input_h = int(meta.get("input_h", 1024))
+    input_w = int(meta.get("input_w", 1024))
+    anchor_str = str(meta.get("anchor_sizes", "32,64,128,256,512"))
+    anchor_sizes = tuple((int(s.strip()),) for s in anchor_str.split(",") if s.strip())
+    nms_thresh = float(meta.get("nms_thresh", 0.3))
+    focal_alpha = float(meta.get("focal_alpha", 0.25))
+    focal_gamma = float(meta.get("focal_gamma", 2.0))
+    print(f"[Info] input={input_h}x{input_w} | anchors={anchor_str} | nms={nms_thresh} | focal a={focal_alpha} g={focal_gamma}")
 
-    box_score_thresh = args.box_score_thresh if args.box_score_thresh is not None else float(meta.get("box_score_thresh", 0.05))
-    box_detections_per_img = args.box_detections_per_img if args.box_detections_per_img is not None else int(meta.get("box_detections_per_img", 100))
-    box_nms_thresh = float(meta.get("box_nms_thresh", 0.5))
-    focal_loss_alpha = float(meta.get("focal_loss_alpha", 0.75))
-    focal_loss_gamma = float(meta.get("focal_loss_gamma", 2.0))
-    input_min_size = int(meta.get("input_min_size", 800))
-    print(f"[Info] box_score_thresh={box_score_thresh}, box_detections_per_img={box_detections_per_img}, nms_thresh={box_nms_thresh}, input_min_size={input_min_size}")
-    print(f"[Info] Focal Loss: alpha={focal_loss_alpha}, gamma={focal_loss_gamma}")
-    score_threshold = args.score_threshold if args.score_threshold is not None else float(meta.get("val_score_threshold", 0.5))
-    iou_threshold = args.iou_threshold if args.iou_threshold is not None else float(meta.get("val_iou_threshold", 0.5))
-    print(f"[Info] eval score_threshold={score_threshold}, iou_threshold={iou_threshold}")
+    score_thresholds = [float(t.strip()) for t in args.score_thresholds.split(",") if t.strip()]
+    lesion_types = [t.strip() for t in args.lesion_types.split(",")] if args.lesion_types else None
+    print(f"[Info] lesion_types={lesion_types or 'all'} | min_box_side={args.min_box_side} | max_box_ar={args.max_box_ar}")
 
-    crop_from_meta = bool(meta.get("crop_breast_region", False))
-    if args.force_breast_crop:
-        crop_breast_region = True
-    elif args.disable_breast_crop:
-        crop_breast_region = False
-    else:
-        crop_breast_region = crop_from_meta
-    breast_crop_margin = float(args.breast_crop_margin) if args.breast_crop_margin is not None else float(meta.get("breast_crop_margin", 0.05))
-    print(f"[Info] breast_crop_region={crop_breast_region}, breast_crop_margin={breast_crop_margin}")
-
-    dataset = VinDrBboxDataset(
-        csv_path=csv_path,
-        images_root=images_root,
-        split_name="test",
-        crop_breast_region=crop_breast_region,
-        breast_crop_margin=breast_crop_margin,
+    print("[Info] Loading test GT samples ...")
+    samples = load_samples(
+        csv_path=csv_path, images_root=images_root, split_name="test",
+        lesion_types=lesion_types, min_box_side=float(args.min_box_side),
+        max_box_ar=float(args.max_box_ar), input_w=input_w, input_h=input_h,
     )
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
+    n_pos = sum(1 for s in samples if len(s.boxes) > 0)
+    total_gt = sum(len(s.boxes) for s in samples)
+    print(f"[Info] test split: {len(samples)} images ({n_pos} positive) | GT boxes: {total_gt}")
 
-    model = build_model(
-        num_classes=2,
+    dataset = TestDataset(samples=samples, input_h=input_h, input_w=input_w)
+    loader = DataLoader(dataset, batch_size=1, shuffle=False,
+                        num_workers=args.num_workers, collate_fn=collate_fn)
+
+    model = build_retinanet(
+        num_classes=1,
         anchor_sizes=anchor_sizes,
-        score_thresh=box_score_thresh,
-        detections_per_img=box_detections_per_img,
-        nms_thresh=box_nms_thresh,
-        focal_loss_alpha=focal_loss_alpha,
-        focal_loss_gamma=focal_loss_gamma,
-        input_min_size=input_min_size,
+        aspect_ratios=((0.5, 1.0, 2.0),) * len(anchor_sizes),
+        min_size=min(input_h, input_w), max_size=max(input_h, input_w),
+        nms_thresh=nms_thresh, score_thresh=0.05, detections_per_img=500,
+        focal_alpha=focal_alpha, focal_gamma=focal_gamma,
     )
-    model.to(device)
-
-    # load weights
     state_dict = ckpt.get("model_state_dict", ckpt)
     model.load_state_dict(state_dict)
+    model.to(device)
+    print("[Info] Model loaded.")
 
-    metrics, rows = evaluate(
-        model=model,
-        loader=loader,
-        device=device,
-        score_threshold=score_threshold,
-        iou_threshold=iou_threshold,
-        # save_debug_dir=args.save_debug_dir,
-        # max_debug_images=args.max_debug_images,
-        # nms_iou=args.nms_iou,
+    results = evaluate(
+        model=model, loader=loader, device=device,
+        score_thresholds=score_thresholds, iou_threshold=float(args.iou_threshold),
     )
 
-    print(json.dumps(metrics, ensure_ascii=False, indent=2))
-
-    # Recall sweep: evaluate at score_threshold = 0.1 / 0.3 / 0.5
-    # This is aligned with the [Recall] log line in bbox-train.py.
-    # Optionally override detections_per_img so TP@0.1 is not truncated at the
-    # training inference cap (same principle as --val-detections-per-img in bbox-train.py).
-    gt_total = metrics["gt_boxes"]
-    recall_thresholds = [0.1, 0.3, 0.5]
-    recall_parts = []
-    _recall_det = args.recall_sweep_detections_per_img
-    _orig_det = getattr(model, "detections_per_img", None)
-    if _recall_det is not None and _orig_det is not None and _orig_det != _recall_det:
-        model.detections_per_img = _recall_det
-        print(f"[Info] recall sweep: detections_per_img temporarily overridden {_orig_det} → {_recall_det}")
-    for st in recall_thresholds:
-        m, _ = evaluate(
-            model=model,
-            loader=loader,
-            device=device,
-            score_threshold=st,
-            iou_threshold=iou_threshold,
-        )
-        tp = m["tp"]
-        fp = m["fp"]
-        rec = tp / gt_total if gt_total else 0.0
-        recall_parts.append(f"Recall@{st}={rec:.3f}({tp}/{gt_total}) FP={fp}")
-    if _recall_det is not None and _orig_det is not None and _orig_det != _recall_det:
-        model.detections_per_img = _orig_det
-    print(f"[Recall] GT_boxes={gt_total} | iou_thresh={iou_threshold} | " + " | ".join(recall_parts))
-
-    if meta:
-        print("Checkpoint meta:")
-        print(json.dumps(meta, ensure_ascii=False, indent=2))
+    gt_total = results["gt_boxes"]
+    sep = "=" * 72
+    print(f"\n{sep}")
+    print(f"Test-set evaluation  |  {ckpt_path.name}")
+    print(f"GT boxes: {gt_total}  |  IoU threshold: {args.iou_threshold}  |  images: {results['total_images']}")
+    print("-" * 72)
+    print(f"{'Thresh':>7}  {'TP':>6}  {'FP':>6}  {'FN':>6}  {'Recall':>8}  {'Prec':>8}  {'F2':>8}")
+    print("-" * 72)
+    best_f2, best_thresh = 0.0, score_thresholds[0]
+    for thresh in score_thresholds:
+        st = results["thresholds"][thresh]
+        tp, fp, fn = st["tp"], st["fp"], st["fn"]
+        recall = tp / gt_total if gt_total else 0.0
+        prec = tp / (tp + fp) if (tp + fp) else 0.0
+        f2 = _fbeta(tp, fp, fn, beta=2.0)
+        if f2 > best_f2:
+            best_f2, best_thresh = f2, thresh
+        print(f"  @{thresh:<5.1f}  {tp:>6}  {fp:>6}  {fn:>6}  {recall:>8.3f}  {prec:>8.3f}  {f2:>8.4f}")
+    print("-" * 72)
+    print(f"Best F2={best_f2:.4f} @ score_threshold={best_thresh}")
+    print(f"{sep}\n")
 
     if args.save_predictions is not None:
+        import json, csv as _csv
         args.save_predictions.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame(rows).to_csv(args.save_predictions, index=False)
-        print(f"Saved matched predictions to: {args.save_predictions}")
+        with open(args.save_predictions, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"Saved results to: {args.save_predictions}")
 
 
 if __name__ == "__main__":
