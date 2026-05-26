@@ -16,7 +16,7 @@ python src/data/bounding-box/bbox-train.py \
     --input-w 1024 \
     --patience 10 \
     --monitor-metric fbeta2_ref \
-    --ref-score 0.2 \
+    --ref-score 0.3 \
     --medical-backbone-path models/raw/ResNet50.pt \
     --save-path models/bbox_resnet50.pth \
     --augment \
