@@ -412,6 +412,11 @@ def main() -> None:
     save_path = Path(args.save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # 全正基线 F2（Recall=1, FP=val_neg, FN=0），用于过滤退化态
+    _val_pos = int(val_df["label"].sum())
+    _val_neg = len(val_df) - _val_pos
+    trivial_f2 = 5 * _val_pos / (5 * _val_pos + _val_neg)  # beta=2
+
     best_f2 = -1.0
     no_improve = 0
     eval_thresholds = [0.1, 0.2, 0.3, 0.5, args.ref_score]
@@ -454,15 +459,8 @@ def main() -> None:
                 flush=True,
             )
 
-        # 取所有阈值中的最优 F2（不附带任何预设偏觡）
-        # 排除"全正预测"退化态（prec <= 0.10 视为无效），避免固定基线阻碍 early stop
-        valid_results = {thr: m for thr, m in results.items() if m["prec"] > 0.10}
-        if valid_results:
-            best_thr, best_thr_metrics = max(valid_results.items(), key=lambda kv: kv[1]["f2"])
-        else:
-            # 全部阈值都是退化态，用最低 FP 的阈值兜底
-            best_thr, best_thr_metrics = max(results.items(), key=lambda kv: kv[1]["f2"])
-        best_epoch_f2 = best_thr_metrics["f2"]
+        # 只取 F2 > 全正基线的阈值（真正有区分能力），全部退化则计入 patience
+        valid_results = {thr: m for thr, m in results.items() if m["f2"] > trivial_f2}
 
         epoch_log = {
             "epoch": epoch,
@@ -473,26 +471,33 @@ def main() -> None:
         }
         history.append(epoch_log)
 
-        if best_epoch_f2 > best_f2:
-            best_f2 = best_epoch_f2
-            no_improve = 0
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "best_f2": best_f2,
-                "best_thr": best_thr,
-                "in_channels": in_channels,
-                "args": vars(args),
-                "history": history,
-            }, str(save_path))
-            print(f"  ★ New best F2={best_f2:.4f} @{best_thr:.2f}  → Saved: {save_path}", flush=True)
+        if valid_results:
+            best_thr, best_thr_metrics = max(valid_results.items(), key=lambda kv: kv[1]["f2"])
+            best_epoch_f2 = best_thr_metrics["f2"]
+            if best_epoch_f2 > best_f2:
+                best_f2 = best_epoch_f2
+                no_improve = 0
+                torch.save({
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "best_f2": best_f2,
+                    "best_thr": best_thr,
+                    "in_channels": in_channels,
+                    "args": vars(args),
+                    "history": history,
+                }, str(save_path))
+                print(f"  ★ New best F2={best_f2:.4f} @{best_thr:.2f}  → Saved: {save_path}", flush=True)
+            else:
+                no_improve += 1
+                print(f"  patience {no_improve}/{args.patience}", flush=True)
         else:
             no_improve += 1
-            print(f"  patience {no_improve}/{args.patience}", flush=True)
-            if no_improve >= args.patience:
-                print(f"  Early stop: no improvement for {args.patience} epochs.")
-                break
+            print(f"  (degenerate)  patience {no_improve}/{args.patience}", flush=True)
+
+        if no_improve >= args.patience:
+            print(f"  Early stop: no improvement for {args.patience} epochs.")
+            break
         print(_SEP, flush=True)
 
     print(f"\nTraining complete. Best F2={best_f2:.4f}")
