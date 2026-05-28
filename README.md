@@ -51,7 +51,7 @@ bash ./build_dataset.sh
 
 ### 深度学习路线
 
-本项目采用两阶段级联架构：
+本项目采用三阶段流水线架构：
 
 ```
 乳腺 X 光原图（PNG）
@@ -63,26 +63,32 @@ bash ./build_dataset.sh
     • CLAHE 对比度增强（提升局部微小病灶可见度）
     │
     ▼
-[Stage 1 - 病灶框检测]  src/data/bounding-box/
-    • 模型：RetinaNet (ResNet-50 FPN v2)
+[Stage 1 - 图像级病灶筛查]  src/data/deep-learning/
+    • 模型：EfficientNet-B4（预训练 ImageNet，Fine-tune）
     • 目标：高召回率（漏检不可接受，误报可容忍）
-    • 输出：病灶候选框列表 + 各框置信度分数
+    • 输出：suspicious_score（0–1）+ GradCAM 热图（粗定位）
     │
-    ├─── 未检出病灶框 → 低患病风险（权重低）
+    ├─── score < threshold → 阴性，低患病风险
     │
-    └─── 检出病灶框  → 框位置 + 置信度作为附加特征
-                              │
-                              ▼
-                    [Stage 2 - 患病分类]  （下游，待实现）
-                        • 输入：原图 + 病灶框位置 + 置信度
-                        • 目标：判断是否患病 / 病灶类型
-                        • 病灶框的存在及置信度作为先验权重
-                              │
-                              ▼
-                         最终诊断结论
+    └─── score ≥ threshold → 阳性
+                  │
+                  ▼
+        [可选：病灶 Mask 精炼]  src/data/segment/
+            • GradCAM 热图 → 阈值化 → 粗 bbox
+            • extract_cell_mask_from_bbox() 精细化前景 mask
+            • 输出：二值 mask（可用于 Stage 2 ROI 输入）
+                  │
+                  ▼
+        [Stage 2 - 患病分类]  （下游，待实现）
+            • 输入：原图 + suspicious_score + GradCAM/mask 位置先验
+            • 目标：判断是否患病 / 病灶类型（BI-RADS 分级）
+            • 可选：利用 mask ROI 做局部特征提取
+                  │
+                  ▼
+             最终诊断结论
 ```
 
-**设计逻辑**：Stage 1 只负责"是否有可疑区域"及"在哪里"，Stage 2 利用这些位置信息进行更精确的患病判断。
+**设计逻辑**：Stage 1 负责"是否有可疑区域"（图像级二分类，不需要精确坐标），GradCAM 提供粗定位，分割模块可选地将热图精炼为二值 mask，Stage 2 利用上述信息进行更精确的患病判断。
 
 ### 传统机器学习路线
 
