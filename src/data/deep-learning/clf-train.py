@@ -246,7 +246,7 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
-    scaler: torch.cuda.amp.GradScaler | None,
+    scaler: torch.amp.GradScaler | None,
     amp: bool,
     hide_progress: bool,
 ) -> float:
@@ -408,7 +408,7 @@ def main() -> None:
         optimizer, T_max=args.epochs, eta_min=args.lr * 1e-2
     )
 
-    scaler = torch.cuda.amp.GradScaler() if args.amp else None
+    scaler = torch.amp.GradScaler("cuda") if args.amp else None
 
     # ── 训练循环 ────────────────────────────────────────────────────────────
     save_path = Path(args.save_path)
@@ -431,7 +431,6 @@ def main() -> None:
         scheduler.step()
 
         results = evaluate(model, val_loader, device, eval_thresholds, args.amp)
-        ref = results[args.ref_score]
         elapsed = time.time() - t0
 
         # ── 表格输出 ────────────────────────────────────────────────
@@ -449,13 +448,19 @@ def main() -> None:
         print(f"  {'─'*5}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}  "
               f"{'─'*5}  {'─'*6}  {'─'*4}", flush=True)
         for thr, m in results.items():
-            marker = "  ← ref" if thr == args.ref_score else ""
+            marker = "  <- ref" if thr == args.ref_score else ""
             print(
                 f"  {thr:>5.2f}  {m['recall']:>7.4f}  {m['prec']:>7.4f}  "
                 f"{m['f1']:>7.4f}  {m['f2']:>7.4f}  "
                 f"{m['tp']:>5}  {m['fp']:>6}  {m['fn']:>4}{marker}",
                 flush=True,
             )
+
+        # 取所有阈值中的最优 F2（不附带任何预设偏觡）
+        best_thr, best_epoch_f2 = max(
+            results.items(), key=lambda kv: kv[1]["f2"]
+        )
+        best_epoch_f2 = best_epoch_f2["f2"]
 
         epoch_log = {
             "epoch": epoch,
@@ -466,20 +471,20 @@ def main() -> None:
         }
         history.append(epoch_log)
 
-        current_f2 = ref["f2"]
-        if current_f2 > best_f2:
-            best_f2 = current_f2
+        if best_epoch_f2 > best_f2:
+            best_f2 = best_epoch_f2
             no_improve = 0
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "best_f2": best_f2,
+                "best_thr": best_thr,
                 "in_channels": in_channels,
                 "args": vars(args),
                 "history": history,
             }, str(save_path))
-            print(f"  ★ New best F2={best_f2:.4f} @{args.ref_score}  → Saved: {save_path}", flush=True)
+            print(f"  ★ New best F2={best_f2:.4f} @{best_thr:.2f}  → Saved: {save_path}", flush=True)
         else:
             no_improve += 1
             print(f"  patience {no_improve}/{args.patience}", flush=True)
@@ -488,7 +493,7 @@ def main() -> None:
                 break
         print(_SEP, flush=True)
 
-    print(f"\nTraining complete. Best F2@{args.ref_score}={best_f2:.4f}")
+    print(f"\nTraining complete. Best F2={best_f2:.4f}")
     print(f"Checkpoint: {save_path}")
 
     # 保存完整历史
