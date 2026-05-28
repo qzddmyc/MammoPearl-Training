@@ -346,3 +346,68 @@ def compute_sample_weights(img_df: pd.DataFrame) -> list[float]:
     w_pos = 1.0 / pos if pos > 0 else 1.0
     w_neg = 1.0 / neg if neg > 0 else 1.0
     return [w_pos if lbl == 1 else w_neg for lbl in img_df["label"]]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 2: 风险分级标签（BI-RADS → 0/1/2）
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_risk_label_df(
+    csv_path: str | Path = DEFAULT_CSV,
+    split: str | None = None,
+    fold_val: int | None = None,
+    is_val: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """返回 (img_df, bbox_df)，其中 img_df['label'] 为三分类风险等级。
+
+    Risk mapping（来自 breast_birads 列）：
+      0 = BI-RADS 1/2（低风险，阴性或良性）
+      1 = BI-RADS 3  （中风险，建议随访）
+      2 = BI-RADS 4/5（高风险，建议活检）
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+    if split is not None:
+        df = df[df["split"].str.lower() == split.lower()]
+
+    img_df = (
+        df.groupby(["patient_id", "image_id"], sort=False)
+        .agg(
+            breast_birads=("breast_birads", "first"),
+            fold=("fold", "first"),
+        )
+        .reset_index()
+    )
+
+    def _birads_to_risk(s: str) -> int:
+        if pd.isna(s) or s in ("BI-RADS 1", "BI-RADS 2"):
+            return 0
+        if s == "BI-RADS 3":
+            return 1
+        return 2  # BI-RADS 4 or 5
+
+    img_df["label"] = img_df["breast_birads"].map(_birads_to_risk)
+
+    if fold_val is not None:
+        if is_val:
+            img_df = img_df[img_df["fold"] == fold_val]
+        else:
+            img_df = img_df[img_df["fold"] != fold_val]
+
+    bbox_cols = ["patient_id", "image_id", "xmin", "ymin", "xmax", "ymax"]
+    bbox_df = (
+        df[bbox_cols].dropna(subset=["xmin"])
+        .copy()
+        .reset_index(drop=True)
+    )
+    valid_keys = set(zip(img_df["patient_id"], img_df["image_id"]))
+    bbox_df = bbox_df[
+        bbox_df.apply(lambda r: (r["patient_id"], r["image_id"]) in valid_keys, axis=1)
+    ].reset_index(drop=True)
+
+    return img_df.reset_index(drop=True), bbox_df
+
+
+def compute_sample_weights_multiclass(img_df: pd.DataFrame) -> list[float]:
+    """返回多类采样权重，用于 WeightedRandomSampler（平衡 0/1/2 类）。"""
+    counts = img_df["label"].value_counts().to_dict()
+    return [1.0 / counts.get(int(lbl), 1) for lbl in img_df["label"]]
