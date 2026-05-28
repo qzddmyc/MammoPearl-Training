@@ -215,7 +215,7 @@ def main() -> None:
     print(f"Checkpoint: epoch={best_ep}, best_val_F2={best_f2:.4f}")
 
     # ── 数据集 ──────────────────────────────────────────────────────────────
-    test_df = build_image_label_df(args.csv_path, split="test")
+    test_df, _ = build_image_label_df(args.csv_path, split="test")
     print(f"Test images: {len(test_df)} "
           f"(pos={test_df['label'].sum()}, neg={len(test_df)-test_df['label'].sum()})")
 
@@ -230,13 +230,19 @@ def main() -> None:
     # ── 评估 ──────────────────────────────────────────────────────────────
     results = evaluate(model, test_loader, device, args.thresholds, amp)
 
-    print("\nTest-set evaluation results:")
-    print(f"{'Thresh':>8} | {'TP':>6} {'FP':>6} {'FN':>6} | {'Recall':>7} {'Prec':>7} {'F1':>7} {'F2':>7}")
-    print("-" * 72)
+    _SEP = "─" * 66
+    print(f"\n{_SEP}")
+    print("Test-set evaluation")
+    print(f"  {'Thr':>5}  {'Recall':>7}  {'Prec':>7}  {'F1':>7}  {'F2':>7}  "
+          f"{'TP':>5}  {'FP':>6}  {'FN':>4}")
+    print(f"  {'─'*5}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}  "
+          f"{'─'*5}  {'─'*6}  {'─'*4}")
     for thr in sorted(results.keys()):
         m = results[thr]
-        print(f"  @{thr:.2f}  | {m['tp']:>6} {m['fp']:>6} {m['fn']:>6} | "
-              f"{m['recall']:>7.4f} {m['prec']:>7.4f} {m['f1']:>7.4f} {m['f2']:>7.4f}")
+        print(f"  {thr:>5.2f}  {m['recall']:>7.4f}  {m['prec']:>7.4f}  "
+              f"{m['f1']:>7.4f}  {m['f2']:>7.4f}  "
+              f"{m['tp']:>5}  {m['fp']:>6}  {m['fn']:>4}")
+    print(_SEP)
 
     # ── 每图预测 CSV ─────────────────────────────────────────────────────
     if args.output_csv:
