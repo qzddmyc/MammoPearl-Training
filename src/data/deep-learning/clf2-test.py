@@ -58,7 +58,7 @@ from torch.utils.data import DataLoader
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
-from dataset import DEFAULT_CSV, DEFAULT_IMAGES_ROOT, MammoDataset, build_risk_label_df
+from dataset import DEFAULT_CSV, DEFAULT_IMAGES_ROOT, MammoDataset, build_lesion_type_df
 
 # 动态导入 clf2-train.py（文件名含连字符）
 _spec = _ilu.spec_from_file_location("clf2_train", _HERE / "clf2-train.py")
@@ -116,7 +116,7 @@ def main() -> None:
     model.eval()
 
     # ── 测试集 ────────────────────────────────────────────────────────────────
-    test_df, _ = build_risk_label_df(args.csv_path, split="test")
+    test_df, _ = build_lesion_type_df(args.csv_path, split="test")
 
     # 可选：按 Stage 1 预测过滤
     if args.stage1_pred_csv:
@@ -131,9 +131,10 @@ def main() -> None:
 
     print(
         f"Test images: {len(test_df)}  "
-        f"(low={int((test_df['label']==0).sum())}  "
-        f"med={int((test_df['label']==1).sum())}  "
-        f"high={int((test_df['label']==2).sum())})"
+        f"(none={int((test_df['label']==0).sum())}  "
+        f"mass={int((test_df['label']==1).sum())}  "
+        f"calc={int((test_df['label']==2).sum())}  "
+        f"asym={int((test_df['label']==3).sum())})"
     )
 
     test_ds = MammoDataset(test_df, args.images_root, input_h, input_w, augment=False)
@@ -160,7 +161,7 @@ def main() -> None:
         )
     print(
         f"  Macro F1={results['macro_f1']:.4f}  |  "
-        f"Mean F1(Med+High)={results['target_score']:.4f}"
+        f"Macro F1(lesion types)={results['target_score']:.4f}"
     )
     print(_SEP)
 

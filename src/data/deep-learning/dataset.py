@@ -408,6 +408,95 @@ def build_risk_label_df(
 
 
 def compute_sample_weights_multiclass(img_df: pd.DataFrame) -> list[float]:
-    """返回多类采样权重，用于 WeightedRandomSampler（平衡 0/1/2 类）。"""
+    """返回多类采样权重，用于 WeightedRandomSampler（任意类数，每类等权）。"""
     counts = img_df["label"].value_counts().to_dict()
     return [1.0 / counts.get(int(lbl), 1) for lbl in img_df["label"]]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 2: 病变类型标签（finding_categories → 0/1/2/3）
+# ──────────────────────────────────────────────────────────────────────────────
+
+import ast as _ast  # noqa: E402  (local import for this section only)
+
+
+def _parse_finding_cats(s: str) -> list[str]:
+    """将 finding_categories 字符串解析为病变名称列表（去掉 No Finding）。"""
+    try:
+        cats = _ast.literal_eval(s)
+        return [c for c in cats if c != "No Finding"] if isinstance(cats, list) else []
+    except Exception:
+        return []
+
+
+def _cats_to_lesion_label(cats: list[str]) -> int:
+    """将病变名称列表映射为单一标签（优先级：Mass > Calcification > Asymmetry）。
+
+    标签定义：
+      0 = No Finding（含 Skin_Other，已合并）
+      1 = Mass
+      2 = Calcification（Suspicious Calcification）
+      3 = Asymmetry_Distortion（含 Architectural Distortion、Asymmetry、
+                               Focal Asymmetry、Global Asymmetry、Skin_Other）
+    """
+    if not cats:
+        return 0
+    if any("Mass" in c for c in cats):
+        return 1
+    if any("Calcification" in c for c in cats):
+        return 2
+    # Asymmetry / Distortion / Skin_Other → 3
+    return 3
+
+
+def build_lesion_type_df(
+    csv_path: str | Path = DEFAULT_CSV,
+    split: str | None = None,
+    fold_val: int | None = None,
+    is_val: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """返回 (img_df, bbox_df)，其中 img_df['label'] 为四分类病变类型。
+
+    标签（来自 finding_categories 列，图像级聚合）：
+      0 = No Finding（无病变或仅有 Skin_Other 等罕见类别）
+      1 = Mass（肿块，优先级最高）
+      2 = Calcification（可疑钙化）
+      3 = Asymmetry_Distortion（不对称 / 结构扭曲 / Skin_Other，优先级最低）
+
+    若一张图像有多种病变，按上述优先级取最高者。
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+    if split is not None:
+        df = df[df["split"].str.lower() == split.lower()]
+
+    img_df = (
+        df.groupby(["patient_id", "image_id"], sort=False)
+        .agg(
+            finding_categories=("finding_categories", "first"),
+            fold=("fold", "first"),
+        )
+        .reset_index()
+    )
+
+    img_df["label"] = img_df["finding_categories"].map(
+        lambda s: _cats_to_lesion_label(_parse_finding_cats(s))
+    )
+
+    if fold_val is not None:
+        if is_val:
+            img_df = img_df[img_df["fold"] == fold_val]
+        else:
+            img_df = img_df[img_df["fold"] != fold_val]
+
+    bbox_cols = ["patient_id", "image_id", "xmin", "ymin", "xmax", "ymax"]
+    bbox_df = (
+        df[bbox_cols].dropna(subset=["xmin"])
+        .copy()
+        .reset_index(drop=True)
+    )
+    valid_keys = set(zip(img_df["patient_id"], img_df["image_id"]))
+    bbox_df = bbox_df[
+        bbox_df.apply(lambda r: (r["patient_id"], r["image_id"]) in valid_keys, axis=1)
+    ].reset_index(drop=True)
+
+    return img_df.reset_index(drop=True), bbox_df

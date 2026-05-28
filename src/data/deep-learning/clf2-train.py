@@ -1,14 +1,17 @@
 r"""
-MammoPearl Deep-Learning -- Stage 2 风险分级训练脚本
+MammoPearl Deep-Learning -- Stage 2 病变类型分类训练脚本
 
-Stage 2 对图像进行三分类风险分级（基于 breast_birads 标签）：
-  - 类别 0：低风险（BI-RADS 1/2）-- 阴性或良性
-  - 类别 1：中风险（BI-RADS 3）  -- 建议随访
-  - 类别 2：高风险（BI-RADS 4/5）-- 建议活检
+Stage 2 对图像进行四分类病变类型识别（基于 finding_categories 标签）：
+  - 类别 0：No Finding（无病变；也用于接收 Stage 1 的误报）
+  - 类别 1：Mass（肿块）
+  - 类别 2：Calcification（可疑钙化）
+  - 类别 3：Asymmetry_Distortion（不对称 / 结构扭曲，含 Skin_Other）
 
-在完整流水线中，Stage 1 负责过滤大量阴性图像，Stage 2 在通过 Stage 1
-筛选的图像上进行精细的风险分级。训练时使用全部 training split（含阴性），
-推理时再结合 Stage 1 阈值决定送入 Stage 2 的图像。
+多病变图像按优先级取主要类型：Mass > Calcification > Asymmetry_Distortion。
+
+在完整流水线中，Stage 1 负责粗筛（高召回），Stage 2 对疑似阳性图像进行
+精细的病变类型分类。训练时使用全部 training split（含阴性），使得 Stage 2
+也能将 Stage 1 的误报重新归类为 No Finding。
 
 ------------------------------------------------------------------
 运行命令（基础）：
@@ -28,7 +31,7 @@ python src/data/deep-learning/clf2-train.py \
     Stage 2 模型保存路径，请与 Stage 1 的路径区分（默认名称不同）。
 
 --patience 10
-    Stage 2 收敛通常比 Stage 1 慢（类别更多、更难区分），
+    Stage 2 收敛通常比 Stage 1 慢（类别更多、样本更少），
     建议 patience >= 10。
 
 --encoder-lr-multiplier 0.1
@@ -38,9 +41,10 @@ python src/data/deep-learning/clf2-train.py \
 注意：
   1. Stage 2 在全部 training split 上训练，不预先过滤 Stage 1 输出。
      在推理阶段（clf2-test.py）再结合 Stage 1 阈值过滤。
-  2. 类别极度不平衡（低:中:高 约 19:1:1），WeightedRandomSampler 已
-     在代码中处理。不额外使用 class weight，避免双重过补偿。
-  3. Checkpoint 判据：类别 1 和 2 的 F1 均值（不漏中高风险患者）。
+  2. 类别极度不平衡（No Finding:Mass:Calc:Asym ≈ 44:2.5:0.7:1），
+     WeightedRandomSampler 在代码中处理，不额外使用 class weight。
+  3. Checkpoint 判据：类别 1/2/3（病变类型）的 macro F1，
+     No Finding（类别 0）不参与判据计算。
 
 ------------------------------------------------------------------
 """
@@ -65,7 +69,7 @@ from dataset import (
     DEFAULT_CSV,
     DEFAULT_IMAGES_ROOT,
     MammoDataset,
-    build_risk_label_df,
+    build_lesion_type_df,
     compute_sample_weights_multiclass,
 )
 
@@ -73,8 +77,8 @@ from dataset import (
 # 模型
 # ──────────────────────────────────────────────────────────────────────────────
 
-NUM_CLASSES = 3
-CLASS_NAMES = {0: "Low ", 1: "Med ", 2: "High"}
+NUM_CLASSES = 4
+CLASS_NAMES = {0: "None", 1: "Mass", 2: "Calc", 3: "Asym"}
 
 
 def build_stage2_model(pretrained: bool = True, num_classes: int = NUM_CLASSES) -> nn.Module:
@@ -144,8 +148,8 @@ def evaluate_stage2(
         results[c] = dict(tp=tp, fp=fp, fn=fn, n=tp + fn, prec=prec, recall=rec, f1=f1)
 
     results["macro_f1"]     = sum(results[c]["f1"] for c in range(NUM_CLASSES)) / NUM_CLASSES
-    # 目标指标：类别 1 和 2 的 F1 均值（不漏中高风险）
-    results["target_score"] = (results[1]["f1"] + results[2]["f1"]) / 2
+    # 目标指标：病变类型 1/2/3 的 macro F1（排除 No Finding）
+    results["target_score"] = sum(results[c]["f1"] for c in range(1, NUM_CLASSES)) / (NUM_CLASSES - 1)
     return results
 
 
@@ -242,15 +246,16 @@ def main() -> None:
     print(f"Start time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
     # ── 数据集 ──────────────────────────────────────────────────────────────
-    train_df, _ = build_risk_label_df(args.csv_path, split="training",
-                                      fold_val=args.fold_val, is_val=False)
-    val_df,   _ = build_risk_label_df(args.csv_path, split="training",
-                                      fold_val=args.fold_val, is_val=True)
+    train_df, _ = build_lesion_type_df(args.csv_path, split="training",
+                                       fold_val=args.fold_val, is_val=False)
+    val_df,   _ = build_lesion_type_df(args.csv_path, split="training",
+                                       fold_val=args.fold_val, is_val=True)
 
     def _dist(df: pd.DataFrame) -> str:
-        return (f"low={int((df['label']==0).sum())}  "
-                f"med={int((df['label']==1).sum())}  "
-                f"high={int((df['label']==2).sum())}")
+        return (f"none={int((df['label']==0).sum())}  "
+                f"mass={int((df['label']==1).sum())}  "
+                f"calc={int((df['label']==2).sum())}  "
+                f"asym={int((df['label']==3).sum())}")
 
     print(f"Train: {len(train_df)}  ({_dist(train_df)})")
     print(f"Val:   {len(val_df)}    ({_dist(val_df)})")
@@ -333,7 +338,7 @@ def main() -> None:
             )
         macro  = results["macro_f1"]
         target = results["target_score"]
-        print(f"  Macro F1={macro:.4f}  |  Target (mean F1 of Med+High)={target:.4f}", flush=True)
+        print(f"  Macro F1={macro:.4f}  |  Target (macro F1 of lesion types)={target:.4f}", flush=True)
 
         epoch_log = {
             "epoch": epoch,
