@@ -278,14 +278,12 @@ def train_one_epoch(
         total_loss += loss.item()
 
         if not hide_progress:
-            # 每 25% 进度打印一次，覆盖同一行
+            # 每 25% 进度打印一次
             milestones = {max(1, len(loader) * k // 4) for k in range(1, 5)}
             if (i + 1) in milestones:
                 pct = (i + 1) / len(loader) * 100
-                bar_len = 30
-                filled = int(bar_len * (i + 1) / len(loader))
-                bar = "█" * filled + "░" * (bar_len - filled)
-                print(f"  [{i+1:4d}/{len(loader)}] [{bar}] {pct:5.1f}%  loss={loss.item():.4f}", flush=True)
+                bar = "=" * int(30 * (i + 1) / len(loader))
+                print(f"  [{i+1:4d}/{len(loader)}] [{bar:<30}]  {pct:5.1f}%  loss={loss.item():.4f}", flush=True)
 
     return total_loss / max(len(loader), 1)
 
@@ -457,10 +455,14 @@ def main() -> None:
             )
 
         # 取所有阈值中的最优 F2（不附带任何预设偏觡）
-        best_thr, best_epoch_f2 = max(
-            results.items(), key=lambda kv: kv[1]["f2"]
-        )
-        best_epoch_f2 = best_epoch_f2["f2"]
+        # 排除"全正预测"退化态（prec <= 0.10 视为无效），避免固定基线阻碍 early stop
+        valid_results = {thr: m for thr, m in results.items() if m["prec"] > 0.10}
+        if valid_results:
+            best_thr, best_thr_metrics = max(valid_results.items(), key=lambda kv: kv[1]["f2"])
+        else:
+            # 全部阈值都是退化态，用最低 FP 的阈值兜底
+            best_thr, best_thr_metrics = max(results.items(), key=lambda kv: kv[1]["f2"])
+        best_epoch_f2 = best_thr_metrics["f2"]
 
         epoch_log = {
             "epoch": epoch,
