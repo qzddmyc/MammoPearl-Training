@@ -1,9 +1,11 @@
 r"""
 MammoPearl Deep-Learning -- Stage 2 测试集评估脚本
 
-对测试集进行三分类风险分级评估，可选：
+对测试集进行四分类病变类型评估，可选：
   1. 结合 Stage 1 预测 CSV，只评估 Stage 1 通过的图像
   2. 保存每张图的预测结果 CSV
+
+类别：0=No Finding, 1=Mass, 2=Calcification, 3=Asymmetry_Distortion
 
 ------------------------------------------------------------------
 运行命令（基础，全量评估）：
@@ -198,11 +200,12 @@ def _save_pred_csv(
             rows.append({
                 "patient_id":  row["patient_id"],
                 "image_id":    row["image_id"],
-                "gt_risk":     int(label),
-                "pred_risk":   pred_class,
-                "prob_low":    float(probs[0]),
-                "prob_med":    float(probs[1]),
-                "prob_high":   float(probs[2]),
+                "gt_type":     int(label),
+                "pred_type":   pred_class,
+                "prob_none":   float(probs[0]),
+                "prob_mass":   float(probs[1]),
+                "prob_calc":   float(probs[2]),
+                "prob_asym":   float(probs[3]),
             })
 
     with open(output_path, "w", newline="") as f:
