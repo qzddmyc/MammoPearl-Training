@@ -277,8 +277,15 @@ def train_one_epoch(
 
         total_loss += loss.item()
 
-        if not hide_progress and (i + 1) % 20 == 0:
-            print(f"  step {i+1}/{len(loader)} | loss={loss.item():.4f}", flush=True)
+        if not hide_progress:
+            # 每 25% 进度打印一次，覆盖同一行
+            milestones = {max(1, len(loader) * k // 4) for k in range(1, 5)}
+            if (i + 1) in milestones:
+                pct = (i + 1) / len(loader) * 100
+                bar_len = 30
+                filled = int(bar_len * (i + 1) / len(loader))
+                bar = "█" * filled + "░" * (bar_len - filled)
+                print(f"  [{i+1:4d}/{len(loader)}] [{bar}] {pct:5.1f}%  loss={loss.item():.4f}", flush=True)
 
     return total_loss / max(len(loader), 1)
 
@@ -388,7 +395,9 @@ def main() -> None:
     model.to(device)
 
     # ── 损失函数 ────────────────────────────────────────────────────────────
-    pos_weight = torch.tensor([compute_pos_weight(train_df)], device=device)
+    # WeightedRandomSampler 已在采样层面平衡正负，pos_weight 设为 1.0 避免双重过补偿
+    # （若未使用 sampler，可将 pos_weight 改回 compute_pos_weight(train_df)）
+    pos_weight = torch.tensor([1.0], device=device)
     print(f"pos_weight = {pos_weight.item():.2f}")
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
@@ -425,21 +434,28 @@ def main() -> None:
         ref = results[args.ref_score]
         elapsed = time.time() - t0
 
+        # ── 表格输出 ────────────────────────────────────────────────
+        _SEP = "─" * 66
+        print(f"\n{_SEP}", flush=True)
         print(
-            f"Epoch {epoch:03d}/{args.epochs:03d} | "
-            f"loss={train_loss:.4f} | "
-            f"@{args.ref_score:.1f}: Recall={ref['recall']:.4f} "
-            f"F2={ref['f2']:.4f} "
-            f"(TP={ref['tp']} FP={ref['fp']} FN={ref['fn']}) | "
-            f"lr={scheduler.get_last_lr()[1]:.2e} | {elapsed:.0f}s",
+            f"Epoch {epoch:03d}/{args.epochs:03d}  "
+            f"loss={train_loss:.4f}  "
+            f"lr={scheduler.get_last_lr()[1]:.2e}  "
+            f"{elapsed:.0f}s",
             flush=True,
         )
-
-        # 打印全部阈值摘要
-        parts = []
+        print(f"  {'Thr':>5}  {'Recall':>7}  {'Prec':>7}  {'F1':>7}  {'F2':>7}  "
+              f"{'TP':>5}  {'FP':>6}  {'FN':>4}", flush=True)
+        print(f"  {'─'*5}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}  "
+              f"{'─'*5}  {'─'*6}  {'─'*4}", flush=True)
         for thr, m in results.items():
-            parts.append(f"@{thr:.1f}: TP={m['tp']} FP={m['fp']} Rec={m['recall']:.3f} F2={m['f2']:.4f}")
-        print("  " + " | ".join(parts), flush=True)
+            marker = "  ← ref" if thr == args.ref_score else ""
+            print(
+                f"  {thr:>5.2f}  {m['recall']:>7.4f}  {m['prec']:>7.4f}  "
+                f"{m['f1']:>7.4f}  {m['f2']:>7.4f}  "
+                f"{m['tp']:>5}  {m['fp']:>6}  {m['fn']:>4}{marker}",
+                flush=True,
+            )
 
         epoch_log = {
             "epoch": epoch,
@@ -463,12 +479,14 @@ def main() -> None:
                 "args": vars(args),
                 "history": history,
             }, str(save_path))
-            print(f"  [Checkpoint] Epoch {epoch} | Saved (F2@{args.ref_score}={best_f2:.4f}) -> {save_path}")
+            print(f"  ★ New best F2={best_f2:.4f} @{args.ref_score}  → Saved: {save_path}", flush=True)
         else:
             no_improve += 1
+            print(f"  patience {no_improve}/{args.patience}", flush=True)
             if no_improve >= args.patience:
-                print(f"  [Early Stop] No improvement for {args.patience} epochs.")
+                print(f"  Early stop: no improvement for {args.patience} epochs.")
                 break
+        print(_SEP, flush=True)
 
     print(f"\nTraining complete. Best F2@{args.ref_score}={best_f2:.4f}")
     print(f"Checkpoint: {save_path}")
