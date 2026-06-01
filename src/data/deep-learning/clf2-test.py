@@ -118,10 +118,10 @@ def main() -> None:
     model.to(device)
     model.eval()
 
-    # ── 测试集 ────────────────────────────────────────────────────────────────
-    test_df, _ = build_lesion_type_df(args.csv_path, split="test")
+    # ── 测试集（仅阳性图像）─────────────────────────────────────────────────────
+    test_df, _ = build_lesion_type_df(args.csv_path, split="test", positive_only=True)
 
-    # 可选：按 Stage 1 预测过滤
+    # 可选：按 Stage 1 预测过滤（保留阳性图中 Stage 1 预测通过的子集）
     if args.stage1_pred_csv:
         s1 = pd.read_csv(args.stage1_pred_csv)
         # 兼容 clf-test.py 输出列：patient_id, image_id, label, prob
@@ -130,14 +130,14 @@ def main() -> None:
         s1_pass = s1[s1["prob"] >= args.stage1_threshold][["patient_id", "image_id"]]
         before = len(test_df)
         test_df = test_df.merge(s1_pass, on=["patient_id", "image_id"])
-        print(f"Stage 1 filter @{args.stage1_threshold}: {before} -> {len(test_df)} images")
+        print(f"Stage 1 filter @{args.stage1_threshold}: {before} positive images -> "
+              f"{len(test_df)} passed (true positives that Stage 1 did not miss)")
 
     print(
         f"Test images: {len(test_df)}  "
-        f"(none={int((test_df['label']==0).sum())}  "
-        f"mass={int((test_df['label']==1).sum())}  "
-        f"calc={int((test_df['label']==2).sum())}  "
-        f"asym={int((test_df['label']==3).sum())})"
+        f"(mass={int((test_df['label']==0).sum())}  "
+        f"calc={int((test_df['label']==1).sum())}  "
+        f"asym={int((test_df['label']==2).sum())})"
     )
 
     test_ds = MammoDataset(test_df, args.images_root, input_h, input_w, augment=False)
