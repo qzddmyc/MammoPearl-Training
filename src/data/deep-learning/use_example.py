@@ -1,6 +1,8 @@
 """
 use_example.py — use.py 使用示例
 
+注意，该文件依赖 use.py 文件。
+
 直接执行此脚本即可查看完整推理输出：
     python src/data/deep-learning/use_example.py
 

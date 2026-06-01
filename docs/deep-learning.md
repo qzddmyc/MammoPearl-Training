@@ -83,12 +83,14 @@ src/data/deep-learning/
 | `clf-test.py` | Stage 1 多阈值评估；可选 GradCAM 可视化（`--vis-dir`）与预测 CSV 输出（`--output-csv`） |
 | `clf2-train.py` | Stage 2, 3 类条件分类训练（Mass/Calc/Asym，仅阳性图）；导出 `build_stage2_model`、`evaluate_stage2` 供 `clf2-test.py` 动态导入 |
 | `clf2-test.py` | Stage 2 阳性图评估；可选 Stage 1 预测 CSV 过滤（`--stage1-pred-csv`）与预测 CSV 输出 |
-| `use.py` | 独立推理接口，封装两阶段推理流程；提供 `MammoPearlPredictor` 类（批量）和 `predict()` 便捷函数（单次） |
+| `use.py` | 项目内推理接口，封装两阶段推理流程；提供 `MammoPearlPredictor` 类（批量）和 `predict()` 便捷函数（单次） |
 | `use_example.py` | 可直接执行的推理示例，演示 `MammoPearlPredictor` 批量用法、字节流输入和 `predict()` 调用 |
 
 ---
 
-## 四、文件与产出物依赖关系
+## 四、文件依赖关系
+
+### 1. 文件与产出物
 
 ```mermaid
 graph TB
@@ -125,7 +127,9 @@ graph TB
 
 > 实线箭头为数据/文件的输入输出关系，虚线为可选依赖（仅在使用 `--stage1-pred-csv` 时需要）。
 
-**源码级依赖**（import 关系）：
+### 2. 文件间依赖
+
+**源码级依赖**：
 
 | 脚本 | 依赖文件 | 依赖方式 |
 |------|----------|----------|
@@ -135,6 +139,19 @@ graph TB
 | `clf2-train.py` | `dataset.py` | 直接 import |
 | `clf2-test.py` | `dataset.py` | 直接 import |
 | `clf2-test.py` | `clf2-train.py` | 动态 import（`importlib`） |
+
+**`use.py` 运行依赖**：
+
+| 项目 | 是否需要 | 说明 |
+|------|----------|------|
+| `models/clf_efficientnet_b4.pth` | 必需 | Stage 1 checkpoint |
+| `models/clf2_cond_efficientnet_b4.pth` | 必需 | Stage 2 checkpoint |
+| `clf-train.py` | 必需 | `use.py` 会动态导入它来调用 `build_model()` |
+| `clf2-train.py` | 必需 | `use.py` 会动态导入它来调用 `build_stage2_model()` |
+| `torch` / `numpy` / `opencv-python` | 必需 | 推理运行环境 |
+| 输入图像文件或图像 bytes | 必需 | 推理输入 |
+| `dataset.py` | 不需要 | 推理阶段不依赖数据集构建逻辑 |
+| `data/raw/vindr_detection_folds.csv` | 不需要 | 推理阶段不依赖 CSV 标注 |
 
 ---
 

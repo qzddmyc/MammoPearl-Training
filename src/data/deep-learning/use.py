@@ -6,6 +6,14 @@ MammoPearl 推理接口（use.py）
   Stage 2：条件病变类型分类（Mass / Calcification / Asymmetry_Distortion，
            仅在 Stage 1 判断为阳性时运行）
 
+独立性说明：
+    本文件是“项目内推理接口”，可脱离训练数据集、CSV 标注和 dataset.py 单独用于推理；
+    但它并不是“只保留 use.py 一个文件即可运行”的单文件脚本。
+    运行时仍依赖：
+        1. Stage 1 / Stage 2 checkpoint（.pth）
+        2. 同目录下的 clf-train.py 与 clf2-train.py（用于动态构建模型结构）
+        3. torch / numpy / opencv-python 运行环境
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 快速上手
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
