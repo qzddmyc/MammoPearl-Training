@@ -47,18 +47,19 @@
 
 | 标签 | 训练集 | 测试集 |
 |------|--------|--------|
-| 0（阴性） | ~14,600 | 3,616 |
-| 1（阳性） | ~1,400  | 384   |
+| 0（阴性） | ~14,600 | 3,643 |
+| 1（阳性） | ~1,400  | 357   |
 
 **Stage 2 标签分布（3 类，仅阳性图像）**
 
-| 标签 | 含义 | 训练集（fold 0 out） | 验证集（fold 0） | 测试集 |
-|------|------|----------------------|-----------------|--------|
-| 0 | Mass | 614 | 203 | 197 |
-| 1 | Calcification | 147 | 70 | 74 |
-| 2 | Asymmetry_Distortion | 300 | 77 | 86 |
+| 标签 | 含义 | 原始 finding_categories | 训练集（fold 0 out） | 验证集（fold 0） | 测试集 |
+|------|------|-------------------------|----------------------|-----------------|--------|
+| 0 | Mass | Mass | 614 | 203 | 197 |
+| 1 | Calcification | Suspicious Calcification | 147 | 70 | 74 |
+| 2 | Asymmetry_Distortion | Architectural Distortion、Asymmetry、Focal Asymmetry、Global Asymmetry、Skin_Other（合并） | 300 | 77 | 86 |
 
-多病变图像采用优先级规则取主要类型：**Mass > Calcification > Asymmetry_Distortion**。
+**多病变图像处理规则**：CSV 中同一图像可能同时有多个 finding，取优先级最高者作为唯一标签：
+**Mass（最高）> Calcification > Asymmetry_Distortion（最低）**。
 
 ---
 
@@ -70,61 +71,20 @@ src/data/deep-learning/
 ├── clf-train.py       # Stage 1 训练脚本
 ├── clf-test.py        # Stage 1 测试脚本
 ├── clf2-train.py      # Stage 2 训练脚本
-└── clf2-test.py       # Stage 2 测试脚本
+├── clf2-test.py       # Stage 2 测试脚本
+├── use.py             # 推理接口
+└── use_example.py     # 推理使用示例
 ```
 
-### 3.1 `dataset.py`（公共）
-
-| 函数 | 用途 |
+| 文件 | 作用 |
 |------|------|
-| `build_image_label_df(csv, split, fold_val, is_val)` | Stage 1 二分类 DataFrame（label=0/1，来自 `has_lesion`） |
-| `build_lesion_type_df(csv, split, fold_val, is_val, positive_only)` | Stage 2 病变类型 DataFrame（`positive_only=False` 时 4 类 0/1/2/3；`positive_only=True` 时 3 类 0/1/2，过滤无病变图） |
-| `build_risk_label_df(csv, split, fold_val, is_val)` | BI-RADS 三分类 DataFrame（备用，来自 `breast_birads`） |
-| `compute_sample_weights(img_df)` | Stage 1 WeightedRandomSampler 权重 |
-| `compute_sample_weights_multiclass(img_df)` | Stage 2 WeightedRandomSampler 权重（任意类数） |
-| `MammoDataset` | 通用 PyTorch Dataset，letterbox 缩放，支持数据增强 |
-| `compute_pos_weight(img_df)` | Stage 1 BCEWithLogitsLoss 的正类权重（目前固定为 1.0） |
-
-### 3.2 `clf-train.py`（Stage 1）
-
-**模型**：EfficientNet-B4，输出 1 个 logit（BCEWithLogitsLoss）
-
-**关键设计**：
-- `pos_weight = 1.0`（WeightedRandomSampler 已平衡，不叠加权重）
-- Checkpoint 判据：动态最优阈值 + trivial_f2 基线过滤（排除全正退化态）
-- 进度条格式：`[====    ] 50.0% loss=0.6234`
-
-**定义的函数（供 clf-test.py 动态导入）**：
-- `build_model(pretrained, in_channels)` → EfficientNet-B4 with 1-class head
-- `evaluate(model, loader, device, amp)` → 多阈值 Recall/Prec/F2/F1/TP/FP/FN
-
-### 3.3 `clf-test.py`（Stage 1 测试）
-
-- 动态导入 `clf-train.py` 以获取 `build_model`、`evaluate`
-- 多阈值扫描（0.05 ~ 0.95），输出对齐表格
-- 可选 GradCAM 可视化（`--vis-dir`）
-- 可选预测 CSV 输出（`--output-csv`）
-
-### 3.4 `clf2-train.py`（Stage 2）
-
-**模型**：EfficientNet-B4，输出 3 个 logits（CrossEntropyLoss，uniform weight）
-
-**关键设计**：
-- 仅加载阳性图像训练（`positive_only=True`），彻底消除无病变图像对特征空间的影响
-- 类别标签：0=Mass，1=Calcification，2=Asymmetry_Distortion
-- `WeightedRandomSampler` 平衡 3 类；不额外使用 class weight（避免双重过补偿）
-- Checkpoint 判据：全部 3 类的 macro F1（所有类均为病变类）
-
-**定义的函数（供 clf2-test.py 动态导入）**：
-- `build_stage2_model(pretrained, num_classes)` → EfficientNet-B4 with 3-class head
-- `evaluate_stage2(model, loader, device, amp)` → per-class TP/FP/FN/Recall/Prec/F1 + target_score
-
-### 3.5 `clf2-test.py`（Stage 2 测试）
-
-- 动态导入 `clf2-train.py` 以获取 `build_stage2_model`、`evaluate_stage2`
-- 测试集默认只包含阳性图像（`positive_only=True`）
-- 可选 Stage 1 过滤（`--stage1-pred-csv`）：在阳性图中仅保留 Stage 1 预测通过的子集
-- 可选预测 CSV 输出（`--output-csv`）
+| `dataset.py` | 公共数据加载工具，提供两阶段 DataFrame 构建、`MammoDataset` 类与采样权重计算 |
+| `clf-train.py` | Stage 1 EfficientNet-B4 二分类训练；导出 `build_model`、`evaluate` 供 `clf-test.py` 动态导入 |
+| `clf-test.py` | Stage 1 多阈值评估；可选 GradCAM 可视化（`--vis-dir`）与预测 CSV 输出（`--output-csv`） |
+| `clf2-train.py` | Stage 2, 3 类条件分类训练（Mass/Calc/Asym，仅阳性图）；导出 `build_stage2_model`、`evaluate_stage2` 供 `clf2-test.py` 动态导入 |
+| `clf2-test.py` | Stage 2 阳性图评估；可选 Stage 1 预测 CSV 过滤（`--stage1-pred-csv`）与预测 CSV 输出 |
+| `use.py` | 独立推理接口，封装两阶段推理流程；提供 `MammoPearlPredictor` 类（批量）和 `predict()` 便捷函数（单次） |
+| `use_example.py` | 可直接执行的推理示例，演示 `MammoPearlPredictor` 批量用法、字节流输入和 `predict()` 调用 |
 
 ---
 
@@ -290,6 +250,15 @@ python src/data/deep-learning/clf2-test.py \
 | `tmp/gradcam/*.jpg`（可选） | Stage 1 测试 | GradCAM 热力图可视化（高置信度预测） |
 | `tmp/clf2_preds.csv` | Stage 2 测试 | 每张测试图的预测类型（patient_id, image_id, gt_type, pred_type, prob_mass, prob_calc, prob_asym） |
 
+**Checkpoint 文件命名说明**
+
+| 文件名组成部分 | 含义 |
+|--------------|------|
+| `clf` | Stage 1 分类器（classifier，二分类） |
+| `clf2` | Stage 2 分类器（stage-2 classifier，3 类） |
+| `cond` | 条件分类器（conditional），仅对 Stage 1 判为阳性的图像运行 |
+| `efficientnet_b4` | 主干网络架构（EfficientNet-B4） |
+
 ---
 
 ## 七、模型架构说明
@@ -310,19 +279,33 @@ python src/data/deep-learning/clf2-test.py \
 
 ---
 
-## 八、训练结果参考（已训练版本）
+## 八、训练结果参考
 
 ### Stage 1（Epoch 22，30 轮最优）
 
-| 阈值 | Recall | Precision | F2 | FP 数 |
-|------|--------|-----------|-----|-------|
-| 0.10 | 95.5% | ~11% | — | 2816 |
-| 0.30 | ~85%  | ~25% | — | — |
-| 0.40 | 63.3% | 25.7% | 0.479 | 704 |
+> 测试集共 4,000 张（阳性 357，阴性 3,643）。各列含义：
+> **Thr**=决策阈值；**Recall**=召回率；**Prec**=精确率；**F2**=F2 分数（召回权重更高）；
+> **TP/FP/FN**=真阳/假阳/假阴数量。
 
-> @0.10 高召回工作点：漏检 16 张（总 356 张阳性），可作为 Stage 2 的输入。
+| Thr | Recall | Prec | F1 | F2 | TP | FP | FN |
+|-----|--------|------|-----|-----|-----|------|-----|
+| 0.10 | 95.52% | 10.80% | 19.41% | 37.19% | 341 | 2816 | 16 |
+| 0.20 | 83.75% | 14.75% | 25.08% | 43.27% | 299 | 1728 | 58 |
+| 0.30 | 72.83% | 19.16% | 30.34% | 46.68% | 260 | 1097 | 97 |
+| **0.40** | **63.31%** | **24.30%** | **35.12%** | **47.92%** | **226** | **704** | **131** |
+| 0.50 | 50.98% | 28.17% | 36.29% | 43.88% | 182 | 464 | 175 |
+| 0.60 | 42.30% | 33.71% | 37.52% | 40.25% | 151 | 297 | 206 |
+| 0.70 | 34.45% | 41.84% | 37.79% | 35.71% | 123 | 171 | 234 |
+| 0.80 | 27.17% | 50.00% | 35.21% | 29.90% | 97 | 97 | 260 |
+| 0.90 | 18.21% | 64.36% | 28.38% | 21.26% | 65 | 36 | 292 |
+
+> @0.10 高召回工作点：漏检 16 张（总 357 张阳性），可作为 Stage 2 的输入。  
+> @0.40 为最优 F2 工作点（0.479），精确率与召回率最佳折衷。
 
 ### Stage 2（条件分类器，仅阳性图像，fold=0，Epoch 6）
+
+> 各列含义：**N**=该类的真实样本数；**Recall**=该类的召回率（正确识别的比例）；
+> **Precision**=该类的精确率（预测为该类中实际正确的比例）；**F1**=召回与精确的调和平均。
 
 **验证集（350 张阳性）：**
 
@@ -370,20 +353,44 @@ Stage 2 是**条件分类器**：它的输入前提已经是"Stage 1 判断为�
 
 仅用阳性图像训练后，三类样本数比为 614:147:300，类别平衡问题大幅改善。
 
-### Q2：`--use-gt-mask` 为什么没有在 Stage 2 中使用？
+### Q2：分割（Segment）模块与分类流水线的关系是什么？是否有必要使用？
 
-`--use-gt-mask` 在测试时需要提供 GT 分割掩码作为第 4 输入通道，
-而真实部署中无法获取 GT 信息（否则已经知道答案了）。
-测试时第 4 通道全 0 与训练时阳性样本第 4 通道有值，
-会导致分布不一致，反而降低泛化性。
+**分割模块做什么**
+
+`src/data/segment/segment.py` 是独立的预处理工具，与分类训练脚本分离。
+它先用 FasterRCNN（`models/bbox.pth`）检测病灶 bbox，再在 bbox 区域内
+用阈值 + 形态学方法提取前景 mask，产出的二值 mask 保存至
+`data/segmented/mask/<patient_id>/<image_id>.png`，对应的裁剪基底图保存至 `data/segmented/base/`。
+
+**如何把分割结果引入分类训练**
+
+Stage 1（`clf-train.py`）提供了 `--use-gt-mask` 开关，启用后会以
+**标注文件中的 GT bbox** 直接绘制二值 mask，作为第 4 输入通道附加到模型（`in_channels=4`）。
+这与 `segment.py` 的产出不同——前者直接从 CSV 标注坐标绘制，后者需要先跑检测模型再做图像处理。
+
+示例命令（GT mask 模式，仅用于实验）：
+
+```bash
+python src/data/deep-learning/clf-train.py \
+    --epochs 30 --batch-size 16 --lr 1e-4 \
+    --encoder-lr-multiplier 0.1 --input-h 512 --input-w 512 \
+    --fold-val 0 --patience 8 \
+    --save-path models/clf_efficientnet_b4_mask.pth \
+    --amp --augment \
+    --use-gt-mask
+```
+
+**为什么当前流水线不使用**
+
+1. **GT mask 无法用于生产推理**：`--use-gt-mask` 要求训练和测试均提供 GT bbox，但真实推理时没有标注信息。若测试时把第 4 通道置零，会造成训练/测试分布不一致，实际泛化性反而下降。因此该模式仅适合衡量 GT 引导效果的上界实验。
+2. **`segment.py` 的 predicted mask 引入额外依赖**：需要先运行 bbox 检测模型得到坐标，再生成 mask，再送入分类模型。一旦检测模型漏检（阴性图 bbox 为空），mask 全零，帮助有限；同时也增加了推理链路的复杂度和潜在失败点。
+3. **Stage 2 不需要**：Stage 2 的输入已经是 Stage 1 过滤后的疑似阳性图，病变信息相对集中。Asymmetry_Distortion 召回率低（~12%）的根本原因在于全图级的细微对称差异难以捕捉，粗粒度的 bbox mask 对此帮助有限。
+
+**结论**：在当前数据规模和模型配置下，不使用分割特征是合理的。
+如需探索上限，建议先用 `--use-gt-mask` 做对照实验验证收益，
+再决定是否值得接入 `segment.py` 的预测 mask 以支持端到端可部署的版本。
 
 ### Q3：两个模型可以同时训练吗？
 
 可以。两个模型训练时互相独立（分别读取原始 CSV）。
 只有 Stage 2 测试的"过滤模式"需要等 Stage 1 测试产出 `tmp/clf_preds.csv`。
-
-### Q4：为什么不再使用双重 class weight（WeightedRandomSampler + class_weight）？
-
-实验发现两者叠加会造成过补偿，导致模型预测全部倒向少数类
-（Stage 1 全正预测，F2 虚高）。使用 WRS 后，mini-batch 已近似平衡，
-无需再在损失函数中加 class weight。详见：Stage 1 修复记录。

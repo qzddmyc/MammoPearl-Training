@@ -7,6 +7,10 @@ RetinaNet 全图直接检测（torchvision）
 
 运行命令：
 
+需要下载 RadImageNet ResNet50 预训练权重，即 models/raw/ResNet50.pt 文件：
+bash src/init/download_backbone.sh
+
+正式训练：
 python src/data/bounding-box/bbox-train.py \
     --epochs 50 \
     --batch-size 4 \

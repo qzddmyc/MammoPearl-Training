@@ -36,6 +36,11 @@ python src/data/segment/segment-test.py
 
 文件夹下的 `output.txt` 是最终保留轮的训练与测试的日志产出。
 
+注意，如果你需要运行 `bbox-train.py`，请先下载预训练权重文件：
+```bash
+bash src/init/download_backbone.sh
+```
+
 ## 传统机器学习分类
 
 基于手工特征（GLCM 纹理、LBP、Wavelet、Gabor 滤波等）和传统机器学习算法（SVM + XGBoost），实现了一套无深度学习依赖的双阶段乳腺癌分类系统。
@@ -47,3 +52,19 @@ python src/data/recognition-traditional/run_pipeline.py
 ```
 
 详细说明（特征提取方法、训练成果、算法说明）请参见 [docs/recognition-traditional.md](./recognition-traditional.md)。
+
+## 深度学习分类
+
+基于 EfficientNet-B4（ImageNet 预训练）和两阶段流水线，实现了端到端的全图乳腺 X 光病变筛查与类型分类系统。与传统方法的核心区别在于：输入是完整的乳腺 X 光图（512×512），无需预先知道病灶位置，由模型自行在图像级别判断。
+
+代码位于 `src/data/deep-learning/`，详细说明（数据分布、训练命令、测试结果、推理接口说明）请参见 [docs/deep-learning.md](./deep-learning.md)。
+
+**Stage 1（二分类筛查）**：判断整张图像是否含有病变。模型输出一个概率值，在高召回工作点（阈值 0.10）下测试集召回率达到 95.5%，仅漏检 16 张（总 357 张阳性）。
+
+**Stage 2（条件分类）**：仅在 Stage 1 判为阳性的图像上运行，区分三种病变类型：Mass（肿块）、Calcification（可疑钙化）、Asymmetry_Distortion（不对称/结构扭曲）。三类均为病变类，以 Macro F1 为训练目标。测试集 Macro F1 = 0.363（全量阳性）/ 0.368（Stage 1 过滤后）。
+
+**推理接口**：`use.py` 提供 `MammoPearlPredictor` 类，加载一次模型即可对任意图像批量推理；`use_example.py` 是可直接执行的使用示例。
+
+## 传统学习与深度学习成果总结
+
+参见 [docs/traditional-vs-deep-learning.md](./traditional-vs-deep-learning.md)。

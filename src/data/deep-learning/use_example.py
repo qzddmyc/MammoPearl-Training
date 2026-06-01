@@ -66,8 +66,15 @@ def _label(patient_id: str, image_id: str) -> str:
     return mapping.get(image_id, "未知")
 
 
-def _print_result(tag: str, result) -> None:
-    print(f"\n[{tag}]  期望：{_label(*tag.split('/')[-2:])}")
+def _print_result(
+    tag: str,
+    result,
+    *,
+    expected: tuple[str, str] | None = None,
+) -> None:
+    if expected is None:
+        expected = tuple(tag.split('/')[-2:])
+    print(f"\n[{tag}]  期望：{_label(*expected)}")
     print(f"  has_lesion   : {result.has_lesion}")
     print(f"  stage1_prob  : {result.stage1_prob:.4f}")
     if result.has_lesion:
@@ -114,7 +121,7 @@ with open(path, "rb") as f:
     image_bytes = f.read()
 
 result = predictor.predict(image=image_bytes)   # 传入 bytes，结果与路径方式完全相同
-_print_result(f"{pid}/{iid} (bytes)", result)
+_print_result(f"{pid}/{iid} (bytes)", result, expected=(pid, iid))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 示例 3：predict() 顶层便捷函数

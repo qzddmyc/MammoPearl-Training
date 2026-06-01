@@ -19,18 +19,22 @@ MammoPearl-Training/
 │   │   └── images_png/     # 预处理后的数据目录
 │   └── segmented/          # 分割后的图像
 │       ├── base/           # 基于 processed 的原图
-│       └── mask/           # 遮罩
+│       └── mask/           # 分割形成的遮罩
+├── models/                 # 训练产出的模型
+│   └── raw/                # 预训练权重存放目录
 ├── src/
 │   ├── init/
-│   │   └── download-dataset.py         # 原始数据下载脚本
+│   │   ├── download-dataset.py         # 原始数据下载脚本
+│   │   └── download_backbone.sh        # 病灶框检测预训练权重下载脚本
 │   └── data/
-│       ├── pre-process/    # 数据预处理
-│       ├── segment/        # 图像分隔
-│       ├── bounding-box/   # 深度学习路线 - 病灶框检测
-│       └── recognition-traditional/  # 传统机器学习路线 - 病灶分类
+│       ├── pre_process/                # 数据预处理
+│       ├── segment/                    # 图像分割
+│       ├── bounding-box/               # 病灶框区域检测
+│       ├── recognition-traditional/    # 传统机器学习
+│       └── deep-learning/              # 深度学习
 │
+├── docs/                   # 项目文档
 ├── tools/                  # 工具文件
-├── models/                 # 训练产出的模型
 ├── README.md
 ├── build_dataset.sh        # 项目及数据集初始化脚本
 └── requirements.txt        # Python 依赖列表
@@ -43,52 +47,11 @@ MammoPearl-Training/
 bash ./build_dataset.sh
 ```
 
-## 数据训练
+## 项目详细描述文档
 
 详见：[docs/train-process.md](./docs/train-process.md)。
 
 ## 系统架构
-
-### 深度学习路线
-
-本项目采用三阶段流水线架构：
-
-```
-乳腺 X 光原图（PNG）
-    │
-    ▼
-[预处理]  src/data/pre_process/
-    • 乳腺区域提取（Otsu 阈值 + 最大轮廓掩膜，去除背景和人工标记）
-    • 双边滤波降噪（保留病灶边缘及钙化点）
-    • CLAHE 对比度增强（提升局部微小病灶可见度）
-    │
-    ▼
-[Stage 1 - 图像级病灶筛查]  src/data/deep-learning/
-    • 模型：EfficientNet-B4（预训练 ImageNet，Fine-tune）
-    • 目标：高召回率（漏检不可接受，误报可容忍）
-    • 输出：suspicious_score（0–1）+ GradCAM 热图（粗定位）
-    │
-    ├─── score < threshold → 阴性，低患病风险
-    │
-    └─── score ≥ threshold → 阳性
-                  │
-                  ▼
-        [可选：病灶 Mask 精炼]  src/data/segment/
-            • GradCAM 热图 → 阈值化 → 粗 bbox
-            • extract_cell_mask_from_bbox() 精细化前景 mask
-            • 输出：二值 mask（可用于 Stage 2 ROI 输入）
-                  │
-                  ▼
-        [Stage 2 - 患病分类]  （下游，待实现）
-            • 输入：原图 + suspicious_score + GradCAM/mask 位置先验
-            • 目标：判断是否患病 / 病灶类型（BI-RADS 分级）
-            • 可选：利用 mask ROI 做局部特征提取
-                  │
-                  ▼
-             最终诊断结论
-```
-
-**设计逻辑**：Stage 1 负责"是否有可疑区域"（图像级二分类，不需要精确坐标），GradCAM 提供粗定位，分割模块可选地将热图精炼为二值 mask，Stage 2 利用上述信息进行更精确的患病判断。
 
 ### 传统机器学习路线
 
@@ -119,3 +82,38 @@ patch 采样 + 手工特征提取
                     Skin_Other / Suspicious_Calcification
             • Accuracy ≈ 0.652
 ```
+
+### 深度学习路线
+
+当前深度学习方案采用两阶段分类流水线：
+
+```
+乳腺 X 光原图（PNG）
+    │
+    ▼
+[预处理]  src/data/pre_process/
+    • 乳腺区域提取（Otsu 阈值 + 最大轮廓掩膜，去除背景和人工标记）
+    • 双边滤波降噪（保留病灶边缘及钙化点）
+    • CLAHE 对比度增强（提升局部微小病灶可见度）
+    │
+    ▼
+[Stage 1 - 图像级二分类筛查]  src/data/deep-learning/
+    • 模型：EfficientNet-B4（二分类，是否存在病变）
+    • 目标：高召回率优先，@0.10 阈值时 Recall ≈ 95.5%
+    • 输出：stage1_prob（0–1）
+    │
+    ├─── prob < threshold → 阴性，流程结束
+    │
+    └─── prob ≥ threshold → 阳性
+                  │
+                  ▼
+        [Stage 2 - 条件病变类型分类]  src/data/deep-learning/
+            • 模型：EfficientNet-B4（三分类）
+            • 类别：Mass / Calcification / Asymmetry_Distortion（含 Skin_Other）
+            • 仅对 Stage 1 判阳性的图像运行
+                  │
+                  ▼
+             最终输出：有无病变 + 病变类型
+```
+
+**设计逻辑**：Stage 1 负责高召回筛查，尽量少漏检；Stage 2 只在阳性图像上细分病变类型。

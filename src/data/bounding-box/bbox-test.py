@@ -6,7 +6,7 @@
 # * input_h/input_w, anchor_sizes, nms_thresh, focal_alpha/gamma are auto-read
 #   from checkpoint meta.  Pass --min-box-side / --max-box-ar to match training.
 
-"""Evaluate a bbox detector (Direction H) on the VinDr test split.
+"""Evaluate a bbox detector on the VinDr test split.
 
 Mirrors the validation logic of bbox-train.py exactly:
   - same AR-preserving pad + resize preprocessing
