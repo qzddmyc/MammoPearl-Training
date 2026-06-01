@@ -454,14 +454,22 @@ def build_lesion_type_df(
     split: str | None = None,
     fold_val: int | None = None,
     is_val: bool = False,
+    positive_only: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """返回 (img_df, bbox_df)，其中 img_df['label'] 为四分类病变类型。
+    """返回 (img_df, bbox_df)，其中 img_df['label'] 为病变类型标签。
 
     标签（来自 finding_categories 列，图像级聚合）：
-      0 = No Finding（无病变或仅有 Skin_Other 等罕见类别）
-      1 = Mass（肿块，优先级最高）
-      2 = Calcification（可疑钙化）
-      3 = Asymmetry_Distortion（不对称 / 结构扭曲 / Skin_Other，优先级最低）
+      正常模式（positive_only=False，4 类）：
+        0 = No Finding（无病变或仅有 Skin_Other 等罕见类别）
+        1 = Mass（肿块，优先级最高）
+        2 = Calcification（可疑钙化）
+        3 = Asymmetry_Distortion（不对称 / 结构扭曲 / Skin_Other，优先级最低）
+
+      条件分类模式（positive_only=True，3 类，仅阳性图像）：
+        0 = Mass
+        1 = Calcification
+        2 = Asymmetry_Distortion
+        （No Finding 图像被过滤掉；标签从原始 1/2/3 重新映射为 0/1/2）
 
     若一张图像有多种病变，按上述优先级取最高者。
     """
@@ -487,6 +495,11 @@ def build_lesion_type_df(
             img_df = img_df[img_df["fold"] == fold_val]
         else:
             img_df = img_df[img_df["fold"] != fold_val]
+
+    if positive_only:
+        img_df = img_df[img_df["label"] != 0].copy()
+        # 标签重映射：1→0 (Mass), 2→1 (Calc), 3→2 (Asym)
+        img_df["label"] = img_df["label"] - 1
 
     bbox_cols = ["patient_id", "image_id", "xmin", "ymin", "xmax", "ymax"]
     bbox_df = (

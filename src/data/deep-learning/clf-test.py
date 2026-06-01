@@ -40,6 +40,8 @@ python src/data/deep-learning/clf-test.py \
 --output-csv tmp/clf_preds.csv
     保存每张测试图的 patient_id、image_id、GT 标签和预测概率，
     供后续分析（如 ROC 曲线、最优阈值搜索）使用。
+    **若需要将 Stage 1 结果送入 Stage 2（clf2-test.py --stage1-pred-csv），
+    必须显式传入此参数；默认不生成 CSV。**
 
 --gradcam-output-dir tmp/clf_gradcam
     对得分 ≥ --gradcam-score-threshold 的图生成 GradCAM 叠加可视化。

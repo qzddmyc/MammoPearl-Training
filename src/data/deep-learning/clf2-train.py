@@ -77,8 +77,8 @@ from dataset import (
 # 模型
 # ──────────────────────────────────────────────────────────────────────────────
 
-NUM_CLASSES = 4
-CLASS_NAMES = {0: "None", 1: "Mass", 2: "Calc", 3: "Asym"}
+NUM_CLASSES = 3
+CLASS_NAMES = {0: "Mass", 1: "Calc", 2: "Asym"}
 
 
 def build_stage2_model(pretrained: bool = True, num_classes: int = NUM_CLASSES) -> nn.Module:
@@ -148,8 +148,8 @@ def evaluate_stage2(
         results[c] = dict(tp=tp, fp=fp, fn=fn, n=tp + fn, prec=prec, recall=rec, f1=f1)
 
     results["macro_f1"]     = sum(results[c]["f1"] for c in range(NUM_CLASSES)) / NUM_CLASSES
-    # 目标指标：病变类型 1/2/3 的 macro F1（排除 No Finding）
-    results["target_score"] = sum(results[c]["f1"] for c in range(1, NUM_CLASSES)) / (NUM_CLASSES - 1)
+    # 条件分类器：所有类均为病变类，target_score = macro F1(Mass/Calc/Asym)
+    results["target_score"] = results["macro_f1"]
     return results
 
 
@@ -229,7 +229,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--amp",          action="store_true")
 
     # 模型
-    p.add_argument("--save-path",    default="models/clf2_efficientnet_b4.pth")
+    p.add_argument("--save-path",    default="models/clf2_cond_efficientnet_b4.pth")
 
     # 其他
     p.add_argument("--num-workers",        type=int, default=4)
@@ -247,15 +247,16 @@ def main() -> None:
 
     # ── 数据集 ──────────────────────────────────────────────────────────────
     train_df, _ = build_lesion_type_df(args.csv_path, split="training",
-                                       fold_val=args.fold_val, is_val=False)
+                                       fold_val=args.fold_val, is_val=False,
+                                       positive_only=True)
     val_df,   _ = build_lesion_type_df(args.csv_path, split="training",
-                                       fold_val=args.fold_val, is_val=True)
+                                       fold_val=args.fold_val, is_val=True,
+                                       positive_only=True)
 
     def _dist(df: pd.DataFrame) -> str:
-        return (f"none={int((df['label']==0).sum())}  "
-                f"mass={int((df['label']==1).sum())}  "
-                f"calc={int((df['label']==2).sum())}  "
-                f"asym={int((df['label']==3).sum())}")
+        return (f"mass={int((df['label']==0).sum())}  "
+                f"calc={int((df['label']==1).sum())}  "
+                f"asym={int((df['label']==2).sum())}")
 
     print(f"Train: {len(train_df)}  ({_dist(train_df)})")
     print(f"Val:   {len(val_df)}    ({_dist(val_df)})")
@@ -338,7 +339,7 @@ def main() -> None:
             )
         macro  = results["macro_f1"]
         target = results["target_score"]
-        print(f"  Macro F1={macro:.4f}  |  Target (macro F1 of lesion types)={target:.4f}", flush=True)
+        print(f"  Macro F1={macro:.4f}  |  Target (macro F1 Mass/Calc/Asym)={target:.4f}", flush=True)
 
         epoch_log = {
             "epoch": epoch,

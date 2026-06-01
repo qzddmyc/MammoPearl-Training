@@ -1,29 +1,29 @@
 r"""
-MammoPearl Deep-Learning -- Stage 2 测试集评估脚本
+MammoPearl Deep-Learning -- Stage 2 条件分类器测试集评估脚本
 
-对测试集进行四分类病变类型评估，可选：
-  1. 结合 Stage 1 预测 CSV，只评估 Stage 1 通过的图像
+对测试集阳性图像（有病变）进行 3 类条件病变类型评估，可选：
+  1. 结合 Stage 1 预测 CSV，只评估 Stage 1 通过的阳性图像
   2. 保存每张图的预测结果 CSV
 
-类别：0=No Finding, 1=Mass, 2=Calcification, 3=Asymmetry_Distortion
+类别（条件分类器，仅阳性图像）：0=Mass, 1=Calcification, 2=Asymmetry_Distortion
 
 ------------------------------------------------------------------
-运行命令（基础，全量评估）：
+运行命令（基础，全量阳性图评估）：
 
 python src/data/deep-learning/clf2-test.py \
-    --ckpt-path models/clf2_efficientnet_b4.pth
+    --ckpt-path models/clf2_cond_efficientnet_b4.pth
 
 结合 Stage 1 过滤（推荐，模拟完整流水线）：
 
 python src/data/deep-learning/clf2-test.py \
-    --ckpt-path models/clf2_efficientnet_b4.pth \
+    --ckpt-path models/clf2_cond_efficientnet_b4.pth \
     --stage1-pred-csv tmp/clf_preds.csv \
     --stage1-threshold 0.1
 
 附带预测 CSV 输出：
 
 python src/data/deep-learning/clf2-test.py \
-    --ckpt-path models/clf2_efficientnet_b4.pth \
+    --ckpt-path models/clf2_cond_efficientnet_b4.pth \
     --output-csv tmp/clf2_preds.csv
 
 ------------------------------------------------------------------
@@ -32,8 +32,8 @@ python src/data/deep-learning/clf2-test.py \
 --stage1-pred-csv tmp/clf_preds.csv
     Stage 1 预测 CSV（由 clf-test.py --output-csv 生成）。
     包含列：patient_id, image_id, label, prob
-    提供后脚本只评估 prob >= --stage1-threshold 的图像，
-    模拟完整 Stage 1 -> Stage 2 流水线。
+    提供后脚本只评估 prob >= --stage1-threshold 且本身有病变的图像，
+    模拟完整 Stage 1 -> Stage 2 流水线中 Stage 2 的分类性能。
 
 --stage1-threshold 0.1
     Stage 1 过滤阈值，默认 0.1（高召回）。
@@ -41,6 +41,7 @@ python src/data/deep-learning/clf2-test.py \
 
 --output-csv tmp/clf2_preds.csv
     保存每张图的预测类别和各类别概率，供后续分析使用。
+    列：gt_type, pred_type, prob_mass, prob_calc, prob_asym
 
 ------------------------------------------------------------------
 """
@@ -163,7 +164,7 @@ def main() -> None:
         )
     print(
         f"  Macro F1={results['macro_f1']:.4f}  |  "
-        f"Macro F1(lesion types)={results['target_score']:.4f}"
+        f"Target (macro F1 Mass/Calc/Asym)={results['target_score']:.4f}"
     )
     print(_SEP)
 
@@ -202,10 +203,9 @@ def _save_pred_csv(
                 "image_id":    row["image_id"],
                 "gt_type":     int(label),
                 "pred_type":   pred_class,
-                "prob_none":   float(probs[0]),
-                "prob_mass":   float(probs[1]),
-                "prob_calc":   float(probs[2]),
-                "prob_asym":   float(probs[3]),
+                "prob_mass":   float(probs[0]),
+                "prob_calc":   float(probs[1]),
+                "prob_asym":   float(probs[2]),
             })
 
     with open(output_path, "w", newline="") as f:

@@ -19,16 +19,15 @@
   └─ 疑似阳性（prob ≥ 阈值）→ 进入 Stage 2
   │
   ▼
-[Stage 2] 四分类病变类型识别
-  ├─ 0: No Finding（Stage 1 误报被纠正，或确为阴性）
-  ├─ 1: Mass（肿块）
-  ├─ 2: Calcification（可疑钙化）
-  └─ 3: Asymmetry_Distortion（不对称/结构扭曲，含 Skin_Other）
+[Stage 2] 3 类条件病变类型分类（仅对阳性图像）
+  ├─ 0: Mass（肿块）
+  ├─ 1: Calcification（可疑钙化）
+  └─ 2: Asymmetry_Distortion（不对称/结构扭曲，含 Skin_Other）
 ```
 
 设计原则：
 - **Stage 1 高召回优先**：宁可多报也不漏，@阈值 0.10 时召回率 ≥ 95%。
-- **Stage 2 精细分类**：在 Stage 1 通过的图像上区分病变类型，也能纠正 Stage 1 误报（No Finding 类）。
+- **Stage 2 条件分类**：仅在阳性图像上区分 3 种病变类型（Mass/Calc/Asym），不含 No Finding 类；模型只见阳性样本，类别平衡更好，特征空间不被无病变图像占据。
 - **两个模型独立训练**：Stage 2 不依赖 Stage 1 的权重，仅在推理/测试时通过预测 CSV 串联。
 
 ---
@@ -51,14 +50,13 @@
 | 0（阴性） | ~14,600 | 3,616 |
 | 1（阳性） | ~1,400  | 384   |
 
-**Stage 2 标签分布（4 类，图像级聚合）**
+**Stage 2 标签分布（3 类，仅阳性图像）**
 
-| 标签 | 含义 | 训练集 | 测试集 |
-|------|------|--------|--------|
-| 0 | No Finding | ~14,600 | 3,643 |
-| 1 | Mass | 817 | 197 |
-| 2 | Calcification | 217 | 74 |
-| 3 | Asymmetry_Distortion | 377 | 86 |
+| 标签 | 含义 | 训练集（fold 0 out） | 验证集（fold 0） | 测试集 |
+|------|------|----------------------|-----------------|--------|
+| 0 | Mass | 614 | 203 | 197 |
+| 1 | Calcification | 147 | 70 | 74 |
+| 2 | Asymmetry_Distortion | 300 | 77 | 86 |
 
 多病变图像采用优先级规则取主要类型：**Mass > Calcification > Asymmetry_Distortion**。
 
@@ -80,7 +78,7 @@ src/data/deep-learning/
 | 函数 | 用途 |
 |------|------|
 | `build_image_label_df(csv, split, fold_val, is_val)` | Stage 1 二分类 DataFrame（label=0/1，来自 `has_lesion`） |
-| `build_lesion_type_df(csv, split, fold_val, is_val)` | Stage 2 四分类 DataFrame（label=0/1/2/3，来自 `finding_categories`） |
+| `build_lesion_type_df(csv, split, fold_val, is_val, positive_only)` | Stage 2 病变类型 DataFrame（`positive_only=False` 时 4 类 0/1/2/3；`positive_only=True` 时 3 类 0/1/2，过滤无病变图） |
 | `build_risk_label_df(csv, split, fold_val, is_val)` | BI-RADS 三分类 DataFrame（备用，来自 `breast_birads`） |
 | `compute_sample_weights(img_df)` | Stage 1 WeightedRandomSampler 权重 |
 | `compute_sample_weights_multiclass(img_df)` | Stage 2 WeightedRandomSampler 权重（任意类数） |
@@ -109,21 +107,23 @@ src/data/deep-learning/
 
 ### 3.4 `clf2-train.py`（Stage 2）
 
-**模型**：EfficientNet-B4，输出 4 个 logits（CrossEntropyLoss，uniform weight）
+**模型**：EfficientNet-B4，输出 3 个 logits（CrossEntropyLoss，uniform weight）
 
 **关键设计**：
-- `WeightedRandomSampler` 平衡 4 类；不额外使用 class weight（避免双重过补偿）
-- Checkpoint 判据：类别 1/2/3（Mass/Calc/Asym）的 macro F1
-- No Finding（类别 0）不参与 Checkpoint 判据，避免被多数类主导
+- 仅加载阳性图像训练（`positive_only=True`），彻底消除无病变图像对特征空间的影响
+- 类别标签：0=Mass，1=Calcification，2=Asymmetry_Distortion
+- `WeightedRandomSampler` 平衡 3 类；不额外使用 class weight（避免双重过补偿）
+- Checkpoint 判据：全部 3 类的 macro F1（所有类均为病变类）
 
 **定义的函数（供 clf2-test.py 动态导入）**：
-- `build_stage2_model(pretrained, num_classes)` → EfficientNet-B4 with 4-class head
+- `build_stage2_model(pretrained, num_classes)` → EfficientNet-B4 with 3-class head
 - `evaluate_stage2(model, loader, device, amp)` → per-class TP/FP/FN/Recall/Prec/F1 + target_score
 
 ### 3.5 `clf2-test.py`（Stage 2 测试）
 
 - 动态导入 `clf2-train.py` 以获取 `build_stage2_model`、`evaluate_stage2`
-- 可选 Stage 1 过滤（`--stage1-pred-csv`）
+- 测试集默认只包含阳性图像（`positive_only=True`）
+- 可选 Stage 1 过滤（`--stage1-pred-csv`）：在阳性图中仅保留 Stage 1 预测通过的子集
 - 可选预测 CSV 输出（`--output-csv`）
 
 ---
@@ -147,14 +147,14 @@ graph TB
 
     subgraph "Stage 2 训练（独立）"
         S2T["clf2-train.py<br/>（直接读原始 CSV，不依赖 Stage 1）"]
-        S2M["models/clf2_efficientnet_b4.pth"]
+        S2M["models/clf2_cond_efficientnet_b4.pth"]
         S2T --> S2M
     end
 
     subgraph "Stage 2 测试"
         S2Full["clf2-test.py --ckpt S2M<br/>（全量，不过滤）"]
         S2Filter["clf2-test.py --ckpt S2M<br/>--stage1-pred-csv clf_preds.csv<br/>（只测 Stage 1 通过的）"]
-        S2CSV["tmp/clf2_preds.csv<br/>(patient_id, image_id,<br/>gt_type, pred_type,<br/>prob_none/mass/calc/asym)"]
+        S2CSV["tmp/clf2_preds.csv<br/>(patient_id, image_id,<br/>gt_type, pred_type,<br/>prob_mass/calc/asym)"]
         S2M --> S2Full
         S2M --> S2Filter
         S1CSV -.->|可选依赖| S2Filter
@@ -163,7 +163,7 @@ graph TB
     end
 ```
 
-> 实线箭头为必要依赖，虚线为可选依赖（仅在使用 `--stage1-pred-csv` 时需要）。
+> 实线箭头为数据/文件的输入输出关系，虚线为可选依赖（仅在使用 `--stage1-pred-csv` 时需要）。
 
 **源码级依赖**（import 关系）：
 
@@ -223,18 +223,18 @@ python src/data/deep-learning/clf2-train.py \
     --input-w 512 \
     --fold-val 0 \
     --patience 10 \
-    --save-path models/clf2_efficientnet_b4.pth \
+    --save-path models/clf2_cond_efficientnet_b4.pth \
     --amp \
     --augment
 
-# ── 测试（全量评估，不依赖 Stage 1）─────────────────────────────────────────
+# ── 测试（全量阳性图评估，不依赖 Stage 1）────────────────────────────────────
 python src/data/deep-learning/clf2-test.py \
-    --ckpt-path models/clf2_efficientnet_b4.pth \
+    --ckpt-path models/clf2_cond_efficientnet_b4.pth \
     --output-csv tmp/clf2_preds.csv
 
-# ── 测试（模拟完整流水线：仅评估 Stage 1 通过的图像）──────────────────────────
+# ── 测试（模拟完整流水线：仅评估 Stage 1 通过的阳性图像）──────────────────────
 python src/data/deep-learning/clf2-test.py \
-    --ckpt-path models/clf2_efficientnet_b4.pth \
+    --ckpt-path models/clf2_cond_efficientnet_b4.pth \
     --stage1-pred-csv tmp/clf_preds.csv \
     --stage1-threshold 0.1 \
     --output-csv tmp/clf2_preds.csv
@@ -262,12 +262,12 @@ python src/data/deep-learning/clf2-train.py \
     --epochs 30 --batch-size 16 --lr 1e-4 \
     --encoder-lr-multiplier 0.1 --input-h 512 --input-w 512 \
     --fold-val 0 --patience 10 \
-    --save-path models/clf2_efficientnet_b4.pth \
+    --save-path models/clf2_cond_efficientnet_b4.pth \
     --amp --augment
 
 # Step 4: Stage 2 测试（模拟完整流水线）
 python src/data/deep-learning/clf2-test.py \
-    --ckpt-path models/clf2_efficientnet_b4.pth \
+    --ckpt-path models/clf2_cond_efficientnet_b4.pth \
     --stage1-pred-csv tmp/clf_preds.csv \
     --stage1-threshold 0.1 \
     --output-csv tmp/clf2_preds.csv
@@ -284,11 +284,11 @@ python src/data/deep-learning/clf2-test.py \
 |-----------|----------|----------|
 | `models/clf_efficientnet_b4.pth` | Stage 1 训练 | 最优 val F2 的 Stage 1 checkpoint |
 | `models/clf_efficientnet_b4.history.json` | Stage 1 训练 | 每轮 loss/lr/val 指标历史 |
-| `models/clf2_efficientnet_b4.pth` | Stage 2 训练 | 最优 lesion macro F1 的 Stage 2 checkpoint |
-| `models/clf2_efficientnet_b4.history.json` | Stage 2 训练 | 每轮 loss/lr/val 指标历史 |
+| `models/clf2_cond_efficientnet_b4.pth` | Stage 2 训练 | 最优 lesion macro F1 的 Stage 2 条件分类器 checkpoint |
+| `models/clf2_cond_efficientnet_b4.history.json` | Stage 2 训练 | 每轮 loss/lr/val 指标历史 |
 | `tmp/clf_preds.csv` | Stage 1 测试 | 每张测试图的预测概率（patient_id, image_id, label, prob） |
 | `tmp/gradcam/*.jpg`（可选） | Stage 1 测试 | GradCAM 热力图可视化（高置信度预测） |
-| `tmp/clf2_preds.csv` | Stage 2 测试 | 每张测试图的预测类型（patient_id, image_id, gt_type, pred_type, prob_none, prob_mass, prob_calc, prob_asym） |
+| `tmp/clf2_preds.csv` | Stage 2 测试 | 每张测试图的预测类型（patient_id, image_id, gt_type, pred_type, prob_mass, prob_calc, prob_asym） |
 
 ---
 
@@ -300,13 +300,13 @@ python src/data/deep-learning/clf2-test.py \
 | | Stage 1 | Stage 2 |
 |--|---------|---------|
 | 输入通道 | 3（RGB）或 4（RGB + GT mask） | 3（RGB） |
-| 分类头输出 | 1 logit | 4 logits |
+| 分类头输出 | 1 logit | 3 logits |
 | 损失函数 | BCEWithLogitsLoss（pos_weight=1.0） | CrossEntropyLoss（uniform weight） |
 | 类别平衡 | WeightedRandomSampler | WeightedRandomSampler |
 | 输入尺寸 | 512×512（letterbox 缩放） | 512×512（letterbox 缩放） |
 | 优化器 | AdamW（backbone lr × 0.1，head 全速 lr） | AdamW（backbone lr × 0.1，head 全速 lr） |
 | 调度器 | CosineAnnealingLR | CosineAnnealingLR |
-| Checkpoint 判据 | 动态最优阈值下的 val F2（过滤全正退化态） | 病变类型（类别 1/2/3）macro F1 |
+| Checkpoint 判据 | 动态最优阈值下的 val F2（过滤全正退化态） | Mass/Calc/Asym 全部 3 类的 macro F1 |
 
 ---
 
@@ -330,12 +330,17 @@ python src/data/deep-learning/clf2-test.py \
 
 ## 九、常见问题
 
-### Q1：为什么 Stage 2 要训练在全部图像上，而不只是 Stage 1 阳性图像？
+### Q1：为什么 Stage 2 只用阳性图像训练？
 
-Stage 2 包含 No Finding（类别 0）类。如果只训练在阳性图像上，
-Stage 2 将永远无法将 Stage 1 误报归还为 No Finding，
-会把所有进入 Stage 2 的图像强行分为 Mass/Calc/Asym 三类之一。
-训练在全部图像上使 Stage 2 具备"纠正误报"的能力。
+Stage 2 是**条件分类器**：它的输入前提已经是"Stage 1 判断为疑似阳性"的图像，
+任务只是区分 Mass / Calcification / Asymmetry_Distortion 三种病变类型。
+
+用全部图像（含 ~91% No Finding）训练会导致：
+1. No Finding 样本占据绝大多数特征空间，病变类特征学习不足；
+2. Softmax 中 No Finding 的高置信度会系统性地压制所有病变类概率；
+3. 少数病变类（Calc 仅 147 张）无论怎样上采样，特征层仍然欠拟合。
+
+仅用阳性图像训练后，三类样本数比为 614:147:300，类别平衡问题大幅改善。
 
 ### Q2：`--use-gt-mask` 为什么没有在 Stage 2 中使用？
 
