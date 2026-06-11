@@ -24,6 +24,7 @@
 !/src/data/recognition-traditional/output/reports/.gitkeep
 
 /tmp/
+/tmp_for_download_dataset/
 
 .vscode/
 

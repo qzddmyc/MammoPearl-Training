@@ -8,11 +8,10 @@ python ./src/init/download-dataset.py || exit 1
 
 echo "Start moving files..."
 mkdir -p ./data/raw/images_png || exit 1
-mv ./tmp/images_png/* ./data/raw/images_png/ || exit 1
+mv ./tmp_for_download_dataset/images_png/* ./data/raw/images_png/ || exit 1
 
 echo "Start removing unused directory..."
-rm -rf ./tmp/images_png || exit 1
-rm -rf ./tmp/.complete || exit 1
+rm -rf ./tmp_for_download_dataset || exit 1
 
 # echo "Checking sha-256 for dataset..."
 # cd ./data/raw/images_png
