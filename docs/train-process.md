@@ -57,7 +57,7 @@ python src/data/recognition-traditional/run_pipeline.py
 
 基于 EfficientNet-B4（ImageNet 预训练）和两阶段流水线，实现了端到端的全图乳腺 X 光病变筛查与类型分类系统。与传统方法的核心区别在于：输入是完整的乳腺 X 光图（512×512），无需预先知道病灶位置，由模型自行在图像级别判断。
 
-代码位于 `src/data/deep-learning/`，详细说明（数据分布、训练命令、测试结果、推理接口说明）请参见 [docs/deep-learning.md](./deep-learning.md)。
+代码位于 `src/data/deep-learning/`。详细说明（数据分布、训练命令、测试结果、推理接口说明）请参见 [docs/deep-learning.md](./deep-learning.md)；训练历程与路线总结参见 [docs/what-i-did-in-deep-learning.md](./what-i-did-in-deep-learning.md)。
 
 **Stage 1（二分类筛查）**：判断整张图像是否含有病变。模型输出一个概率值，在高召回工作点（阈值 0.10）下测试集召回率达到 95.5%，仅漏检 16 张（总 357 张阳性）。
 

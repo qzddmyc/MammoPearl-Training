@@ -1,6 +1,8 @@
 r"""
 MammoPearl 推理接口（use.py）
 
+* 需要说明的是，这份文件的所有内容是直接基于预处理后的数据进行的；在真实环境使用时，需要对图像添加预处理步骤。
+
 两阶段乳腺 X 光病变检测：
   Stage 1：全图二分类（有无病变，BCEWithLogitsLoss 单 logit）
   Stage 2：条件病变类型分类（Mass / Calcification / Asymmetry_Distortion，
