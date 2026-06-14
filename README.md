@@ -47,6 +47,10 @@ MammoPearl-Training/
 bash ./build_dataset.sh
 ```
 
+## 数据集概况
+
+详见：[docs/dataset-overview.md](./docs/dataset-overview.md)。
+
 ## 项目详细描述文档
 
 详见：[docs/train-process.md](./docs/train-process.md)。
