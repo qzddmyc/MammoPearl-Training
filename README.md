@@ -121,3 +121,9 @@ patch 采样 + 手工特征提取
 ```
 
 **设计逻辑**：Stage 1 负责高召回筛查，尽量少漏检；Stage 2 只在阳性图像上细分病变类型。
+
+---
+
+## 下游推理仓库
+
+本仓库深度学习流程训练得到的模型权重，已集成到下游推理仓库 [MammoPearl-IBCDS](https://github.com/qzddmyc/MammoPearl-IBCDS) 加载使用。
